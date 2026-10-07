@@ -149,3 +149,128 @@ pub fn is_ntag424_dna(version_frame1: &[u8]) -> bool {
         && version_frame1[5] == 0x11
         && version_frame1[6] == 0x05
 }
+
+/// Extracted SUN (Secure Unique NFC) mirror parameters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SunParams {
+    /// 7-byte card UID.
+    pub uid: [u8; 7],
+    /// SUN read/tap counter.
+    pub counter: u32,
+    /// 16-byte AES-CMAC.
+    pub cmac: [u8; 16],
+}
+
+/// Errors returned when parsing SUN URL query parameters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParseError {
+    /// No query string delimiter (`?`) found in URL.
+    MissingQueryString,
+    /// The `uid` parameter is missing.
+    MissingUid,
+    /// The `c` or `ctr` counter parameter is missing.
+    MissingCounter,
+    /// The `cmac` parameter is missing.
+    MissingCmac,
+    /// A parameter's hex representation contains an invalid character.
+    InvalidHexChar,
+    /// A hex parameter has an odd or invalid length.
+    InvalidLength,
+    /// A counter parameter could not be parsed as a decimal u32.
+    InvalidCounter,
+}
+
+/// Helper function to convert a single ASCII hex character into its 4-bit nibble value.
+fn hex_val(b: u8) -> Result<u8, ParseError> {
+    match b {
+        b'0'..=b'9' => Ok(b - b'0'),
+        b'a'..=b'f' => Ok(b - b'a' + 10),
+        b'A'..=b'F' => Ok(b - b'A' + 10),
+        _ => Err(ParseError::InvalidHexChar),
+    }
+}
+
+/// Decode exactly `N` hex bytes (from `2 * N` ASCII hex bytes) into `out`.
+fn decode_hex_exact<const N: usize>(hex_str: &str, out: &mut [u8; N]) -> Result<(), ParseError> {
+    let bytes = hex_str.as_bytes();
+    if bytes.len() != N * 2 {
+        return Err(ParseError::InvalidLength);
+    }
+    for i in 0..N {
+        let hi = hex_val(bytes[i * 2])?;
+        let lo = hex_val(bytes[i * 2 + 1])?;
+        out[i] = (hi << 4) | lo;
+    }
+    Ok(())
+}
+
+/// Parse a decimal string into a `u32` without panic or overflow.
+fn parse_decimal_u32(s: &str) -> Result<u32, ParseError> {
+    if s.is_empty() {
+        return Err(ParseError::InvalidCounter);
+    }
+    let mut val: u32 = 0;
+    for &b in s.as_bytes() {
+        if !b.is_ascii_digit() {
+            return Err(ParseError::InvalidCounter);
+        }
+        let digit = (b - b'0') as u32;
+        val = val
+            .checked_mul(10)
+            .and_then(|v| v.checked_add(digit))
+            .ok_or(ParseError::InvalidCounter)?;
+    }
+    Ok(val)
+}
+
+/// Parse SUN mirror parameters (`uid`, `c`/`ctr`, `cmac`) from an NDEF URL.
+///
+/// Example: `https://access.10bit.works/?uid=04112233445566&c=000008&cmac=505C41A335A9B7DEF29D5959936FE7FE`
+///
+/// Features:
+/// - Fixed-size, zero allocation (`no_std` compatible, no heap, no regex).
+/// - Case-insensitive hex decoding (accepts upper/lowercase).
+/// - Accepts either `c` or `ctr` for the tap counter.
+/// - Validates UID length (14 hex chars -> 7 bytes) and CMAC length (32 hex chars -> 16 bytes).
+pub fn parse_sun_url(url: &str) -> Result<SunParams, ParseError> {
+    let query = match url.split_once('?') {
+        Some((_, q)) => q,
+        None => return Err(ParseError::MissingQueryString),
+    };
+
+    let mut uid_str: Option<&str> = None;
+    let mut counter_str: Option<&str> = None;
+    let mut cmac_str: Option<&str> = None;
+
+    for param in query.split('&') {
+        if param.is_empty() {
+            continue;
+        }
+        let (key, val) = match param.split_once('=') {
+            Some((k, v)) => (k, v),
+            None => (param, ""),
+        };
+
+        if key == "uid" {
+            uid_str = Some(val);
+        } else if key == "c" || key == "ctr" {
+            counter_str = Some(val);
+        } else if key == "cmac" {
+            cmac_str = Some(val);
+        }
+    }
+
+    let uid_raw = uid_str.ok_or(ParseError::MissingUid)?;
+    let counter_raw = counter_str.ok_or(ParseError::MissingCounter)?;
+    let cmac_raw = cmac_str.ok_or(ParseError::MissingCmac)?;
+
+    let mut uid = [0u8; 7];
+    decode_hex_exact(uid_raw, &mut uid)?;
+
+    let counter = parse_decimal_u32(counter_raw)?;
+
+    let mut cmac = [0u8; 16];
+    decode_hex_exact(cmac_raw, &mut cmac)?;
+
+    Ok(SunParams { uid, counter, cmac })
+}
