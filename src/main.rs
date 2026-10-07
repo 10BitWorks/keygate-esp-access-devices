@@ -26,6 +26,7 @@ use core::fmt::Write;
 
 mod ntag424;
 mod nfc;
+mod config;
 
 // Provide the application descriptor for the second-stage bootloader
 esp_bootloader_esp_idf::esp_app_desc!();
