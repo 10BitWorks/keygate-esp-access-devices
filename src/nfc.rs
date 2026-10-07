@@ -92,7 +92,7 @@ impl CountDown for Pn532Delay {
 /// Returns an initialized Pn532 instance ready for tag polling.
 pub fn init_pn532<I2C, E>(
     i2c: I2C,
-) -> Result<Pn532<I2CInterface<I2C>, Pn532Delay, 32>, NfcError>
+) -> Result<Pn532<I2CInterface<I2C>, Pn532Delay, 300>, NfcError>
 where
     I2C: embedded_hal::i2c::I2c<Error = E>,
     E: core::fmt::Debug,
