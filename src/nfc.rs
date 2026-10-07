@@ -4,7 +4,8 @@
 //! and identification for the XIAO-C6 NFC node.
 
 use core::fmt;
-use pn532::{i2c::I2CInterface, requests::SAMMode, Pn532, Request, CountDown};
+use embassy_time::{Duration, Instant};
+use pn532::{i2c::I2CInterface, requests::SAMMode, CountDown, Pn532, Request};
 
 /// Detected NFC tag information
 pub struct TagInfo {
@@ -56,18 +57,33 @@ pub enum NfcError {
     Timeout,
 }
 
-/// Blocking timer wrapper implementing `pn532::CountDown` via `esp_hal::delay::Delay`
+/// Non-blocking countdown timer wrapper implementing `pn532::CountDown` via `embassy_time::Instant`.
+///
+/// In `pn532 0.5`, wait loops in `_process` and `_process_no_response` iterate synchronously:
+/// ```text
+/// while self.interface.wait_ready()?.is_pending() {
+///     if self.timer.wait().is_ok() {
+///         return Err(Error::Timeout...);
+///     }
+/// }
+/// ```
+/// `Pn532Delay` tracks deadline expiration using `embassy_time::Instant`. Each invocation
+/// of `wait()` checks `Instant::now() >= deadline`. If not expired, it returns
+/// `Err(nb::Error::WouldBlock)`, allowing the wait loop to continue without blocking the CPU.
+/// The outer caller (`poll_tag`, `init_pn532`) remains responsive, avoiding continuous busy delays.
 pub struct Pn532Delay {
-    delay: esp_hal::delay::Delay,
-    duration_ms: u32,
+    deadline: Option<Instant>,
 }
 
 impl Pn532Delay {
-    pub fn new() -> Self {
-        Self {
-            delay: esp_hal::delay::Delay::new(),
-            duration_ms: 0,
-        }
+    pub const fn new() -> Self {
+        Self { deadline: None }
+    }
+}
+
+impl Default for Pn532Delay {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -78,12 +94,21 @@ impl CountDown for Pn532Delay {
     where
         T: Into<Self::Time>,
     {
-        self.duration_ms = count.into().ticks();
+        let ms = count.into().ticks() as u64;
+        self.deadline = Some(Instant::now() + Duration::from_millis(ms));
     }
 
     fn wait(&mut self) -> Result<(), nb::Error<core::convert::Infallible>> {
-        self.delay.delay_millis(self.duration_ms);
-        Ok(())
+        if let Some(deadline) = self.deadline {
+            if Instant::now() >= deadline {
+                self.deadline = None;
+                Ok(())
+            } else {
+                Err(nb::Error::WouldBlock)
+            }
+        } else {
+            Ok(())
+        }
     }
 }
 
