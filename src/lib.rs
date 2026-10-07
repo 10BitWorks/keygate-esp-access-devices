@@ -24,7 +24,7 @@ mod tests {
     //
     // Counter 7 CMAC = AES-CMAC(TagKey, uid || counter_bytes)
     //                = AES-CMAC(3e4b77c570b54fc178a25c1cbcf38435, 04112233445566 || 000007)
-    //                = ab1bbcf0b411ed026214151fc0cb6064
+    //                = e343397b4d690772fc61d0a7611d6c08
 
     // Counter 8 CMAC (from access-control-verifier tests)
     // uid = 04112233445566, counter = 8
@@ -33,12 +33,12 @@ mod tests {
 
     #[test]
     fn test_parse_sun_url_c7_c_param() {
-        let url = "https://access.10bit.works/?uid=04112233445566&c=000007&cmac=ab1bbcf0b411ed026214151fc0cb6064";
+        let url = "https://access.10bit.works/?uid=04112233445566&c=000007&cmac=e343397b4d690772fc61d0a7611d6c08";
         let res = parse_sun_url(url).expect("valid c7 URL");
         
         assert_eq!(res.uid, [0x04, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66]);
         assert_eq!(res.counter, 7);
-        assert_eq!(res.cmac, [0xab, 0x1b, 0xbc, 0xf0, 0xb4, 0x11, 0xed, 0x02, 0x62, 0x14, 0x15, 0x1f, 0xc0, 0xcb, 0x60, 0x64]);
+        assert_eq!(res.cmac, [0xe3, 0x43, 0x39, 0x7b, 0x4d, 0x69, 0x07, 0x72, 0xfc, 0x61, 0xd0, 0xa7, 0x61, 0x1d, 0x6c, 0x08]);
     }
 
     #[test]
