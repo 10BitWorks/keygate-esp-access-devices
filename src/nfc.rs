@@ -5,7 +5,11 @@
 
 use core::fmt;
 use embassy_time::{Duration, Instant};
-use pn532::{i2c::I2CInterface, requests::SAMMode, CountDown, Pn532, Request};
+use pn532::{
+    i2c::I2CInterface,
+    requests::{BorrowedRequest, Command, SAMMode},
+    CountDown, Pn532, Request,
+};
 
 /// Detected NFC tag information
 pub struct TagInfo {
@@ -49,12 +53,18 @@ impl fmt::Display for UidHex<'_> {
 
 /// Error type for NFC operations
 #[allow(dead_code)]
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NfcError {
     /// PN532 communication or protocol error
     Pn532,
     /// Timeout waiting for response
     Timeout,
+    /// APDU payload too large for internal buffer
+    ApduTooLarge,
+    /// InDataExchange response was empty
+    EmptyResponse,
+    /// Target returned an RF error status byte
+    RfError(u8),
 }
 
 /// Non-blocking countdown timer wrapper implementing `pn532::CountDown` via `embassy_time::Instant`.
@@ -184,5 +194,58 @@ where
     }
     None
 }
+
+/// Send an ISO-DEP (ISO 14443-4) APDU to a target via PN532 `InDataExchange`.
+///
+/// Prepares `[target, ...apdu]` payload and dispatches `Command::InDataExchange`.
+/// Unwraps the PN532 response, checks the 1-byte status header (`0x00` indicates success),
+/// strips the status byte, and returns the response slice containing card response bytes
+/// including trailing SW1 and SW2 status words.
+///
+/// Returns `NfcError::EmptyResponse` if the response frame contains no data, or
+/// `NfcError::RfError(status)` if the target status byte indicates an error.
+pub fn in_data_exchange<'a, I2C, T, const N: usize>(
+    pn532: &'a mut Pn532<I2CInterface<I2C>, T, N>,
+    target: u8,
+    apdu: &[u8],
+) -> Result<&'a [u8], NfcError>
+where
+    I2C: embedded_hal::i2c::I2c,
+    T: CountDown<Time = fugit::MillisDurationU32>,
+{
+    // Maximum APDU payload supported by stack buffer in `no_std` without heap allocation.
+    // 265 bytes accommodates standard ISO-DEP frame caps.
+    let mut tx_buf = [0u8; 265];
+    if 1 + apdu.len() > tx_buf.len() {
+        return Err(NfcError::ApduTooLarge);
+    }
+    tx_buf[0] = target;
+    tx_buf[1..1 + apdu.len()].copy_from_slice(apdu);
+
+    let req = BorrowedRequest::new(Command::InDataExchange, &tx_buf[..1 + apdu.len()]);
+
+    // PN532 buffer constraint: N - 9 >= max(response_len, M).
+    // With N=300, max response_len can safely be up to 265 bytes (265 + 9 = 274 <= 300).
+    // ISO-DEP card operations on NTAG 424 can take 10-30ms; 50ms timeout is safe and bounded.
+    let resp = pn532
+        .process(req, 265, fugit::MillisDurationU32::from_ticks(50))
+        .map_err(|e| match e {
+            pn532::Error::TimeoutAck | pn532::Error::TimeoutResponse => NfcError::Timeout,
+            _ => NfcError::Pn532,
+        })?;
+
+    if resp.is_empty() {
+        return Err(NfcError::EmptyResponse);
+    }
+
+    let status = resp[0];
+    if status != 0x00 {
+        return Err(NfcError::RfError(status));
+    }
+
+    // Strip the 1-byte PN532 status header, returning card response including SW1 SW2
+    Ok(&resp[1..])
+}
+
 
 
