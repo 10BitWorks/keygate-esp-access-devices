@@ -67,10 +67,11 @@ pub enum NfcError {
 ///     }
 /// }
 /// ```
-/// `Pn532Delay` tracks deadline expiration using `embassy_time::Instant`. Each invocation
-/// of `wait()` checks `Instant::now() >= deadline`. If not expired, it returns
-/// `Err(nb::Error::WouldBlock)`, allowing the wait loop to continue without blocking the CPU.
-/// The outer caller (`poll_tag`, `init_pn532`) remains responsive, avoiding continuous busy delays.
+/// Because `CountDown::wait()` is a synchronous trait method (`fn wait(&mut self) -> nb::Result<(), Infallible>`),
+/// it cannot `.await` on an Embassy timer internally. Each iteration performs an I2C read status check
+/// (~100µs at 100kHz) and an `Instant::now()` deadline comparison without artificial blocking sleep.
+/// If `wait_ready()` remains pending when no tag or ACK is present, the CPU executes this check loop
+/// until the configured timeout expires (20ms for `init_pn532`, 30ms for `poll_tag`).
 pub struct Pn532Delay {
     deadline: Option<Instant>,
 }
@@ -126,12 +127,14 @@ where
     let timer = Pn532Delay::new();
     let mut pn532 = Pn532::new(interface, timer);
 
-    // Configure SAM (Security Access Module) to normal mode
+    // Configure SAM (Security Access Module) to normal mode.
+    // PN532 SAMConfiguration typical response latency is <2ms; 20ms timeout is generous
+    // while bounding worst-case unready spin duration.
     pn532
         .process(
             &Request::sam_configuration(SAMMode::Normal, false),
             0,
-            fugit::MillisDurationU32::from_ticks(50),
+            fugit::MillisDurationU32::from_ticks(20),
         )
         .map_err(|_| NfcError::Pn532)?;
 
@@ -146,11 +149,14 @@ where
     I2C: embedded_hal::i2c::I2c,
     T: CountDown<Time = fugit::MillisDurationU32>,
 {
-    // INLIST_ONE_ISO_A_TARGET: poll for 1 target at 106 kbps Type A
+    // INLIST_ONE_ISO_A_TARGET: poll for 1 target at 106 kbps Type A.
+    // When no tag is in the RF field, PN532 responds with NbTg=0 in ~12-18ms.
+    // A 30ms timeout accommodates valid target discovery while tightening the worst-case
+    // pending spin loop bound (down from 100ms) to minimize executor impact.
     if let Ok(res) = pn532.process(
         &Request::INLIST_ONE_ISO_A_TARGET,
         20,
-        fugit::MillisDurationU32::from_ticks(100),
+        fugit::MillisDurationU32::from_ticks(30),
     ) {
         if res.is_empty() || res[0] == 0 {
             return None;
