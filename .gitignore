@@ -1,1 +1,7 @@
 /target
+manifest.scm
+esp-idf.scm
+run-in-rust-container.sh
+start-shell.sh
+rustup/
+cargo/
