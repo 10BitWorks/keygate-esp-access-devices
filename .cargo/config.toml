@@ -1,0 +1,10 @@
+[target.riscv32imac-unknown-none-elf]
+runner = "espflash flash --monitor"
+rustflags = [
+  "-C", "link-arg=-Tlinkall.x",
+]
+
+[build]
+target = "riscv32imac-unknown-none-elf"
+# esp-hal provides its own linker scripts; no memory.x needed
+
