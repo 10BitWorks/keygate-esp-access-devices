@@ -334,11 +334,14 @@ async fn main(spawner: Spawner) -> ! {
                                                     &mut payload,
                                                 ) {
                                                     Ok(()) => {
-                                                        let tag = tag_opt.as_ref().unwrap();
-                                                        println!(
-                                                            "auth: {} uid={} ctr={}",
-                                                            tag.tag_type(), tag.uid_hex(), sun.counter
-                                                        );
+                                                        if let Some(tag) = tag_opt.as_ref() {
+                                                            println!(
+                                                                "auth: {} uid:{} ctr:{}",
+                                                                tag.tag_type(),
+                                                                tag.uid_hex(),
+                                                                sun.counter
+                                                            );
+                                                        }
                                                         let pkt = Publication::new(
                                                             auth_topic.as_str(),
                                                             payload.as_str(),
