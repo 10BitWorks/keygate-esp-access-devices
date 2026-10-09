@@ -18,9 +18,6 @@ use embassy_time::{Duration, Instant};
 /// Continuous absence required to re-arm the reader for a new tap (500 ms).
 pub const REMOVAL_DEBOUNCE: Duration = Duration::from_millis(500);
 
-/// Bounce suppression window for RF jitter / brief contact loss (100 ms).
-pub const BOUNCE_WINDOW: Duration = Duration::from_millis(100);
-
 /// State of tag presence on the reader.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum State {
@@ -64,11 +61,6 @@ pub struct TagObservation<'a> {
 }
 
 impl<'a> TagObservation<'a> {
-    /// Construct from raw UID slice and SAK.
-    pub const fn new(uid: &'a [u8], sak: u8) -> Self {
-        Self { uid, sak }
-    }
-
     /// Helper to construct from `nfc::TagInfo`.
     pub fn from_tag_info(tag: &'a crate::nfc::TagInfo) -> Self {
         let len = (tag.uid_len as usize).min(tag.uid.len());
@@ -91,13 +83,9 @@ impl TagDebounce {
     }
 
     /// Current internal state.
+    #[allow(dead_code)]
     pub fn state(&self) -> State {
         self.state
-    }
-
-    /// Reset state machine back to `Idle` (armed).
-    pub fn reset(&mut self) {
-        self.state = State::Idle;
     }
 
     /// Observe current sensor reading at time `now`.

@@ -18,6 +18,7 @@ pub struct CmdMessage<'a> {
 ///
 /// Operates in `no_std` without heap allocation by borrowing string slices
 /// directly from the input JSON buffer.
+#[allow(dead_code)]
 pub fn parse_cmd<'a>(json: &'a str) -> Result<CmdMessage<'a>, serde_json_core::de::Error> {
     let (msg, _bytes) = serde_json_core::from_str::<CmdMessage<'a>>(json)?;
     Ok(msg)

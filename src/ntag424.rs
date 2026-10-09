@@ -274,3 +274,257 @@ pub fn parse_sun_url(url: &str) -> Result<SunParams, ParseError> {
 
     Ok(SunParams { uid, counter, cmac })
 }
+
+// ---------------------------------------------------------------------------
+// NDEF / SUN transport (T9): read the NDEF message over ISO-DEP and extract
+// the URI, so the firmware can obtain the UID/counter/CMAC for authentication.
+// ---------------------------------------------------------------------------
+
+/// ISO 7816-4 SELECT by DF name for the NTAG 424 DNA NDEF application.
+///
+/// `00 A4 04 00 07 D2 76 00 00 85 01 01 00`
+pub const SELECT_NDEF_APP_APDU: [u8; 13] = [
+    0x00, 0xA4, 0x04, 0x00, 0x07, 0xD2, 0x76, 0x00, 0x00, 0x85, 0x01, 0x01, 0x00,
+];
+
+/// ISO 7816-4 SELECT by file ID for NDEF File 02.
+///
+/// `00 A4 00 0C 02 02 00`
+pub const SELECT_NDEF_FILE_02_APDU: [u8; 7] = [0x00, 0xA4, 0x00, 0x0C, 0x02, 0x02, 0x00];
+
+/// ISO 7816-4 READ BINARY instruction byte (INS=0xB0).
+pub const READ_BINARY_INS: u8 = 0xB0;
+
+/// Errors returned while reading or parsing an NTAG 424 DNA NDEF message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NdefError {
+    /// The ISO-DEP transport failed.
+    Transport,
+    /// The card returned an unexpected status word `(SW1, SW2)`.
+    Status(u8, u8),
+    /// A response frame was shorter than required.
+    ShortRead,
+    /// The NDEF length field was zero or otherwise inconsistent.
+    InvalidLength,
+    /// The caller-provided output buffer was too small.
+    BufferTooSmall,
+    /// The first NDEF record was not a URI (`U`) record.
+    NotUriRecord,
+    /// The URI payload was not valid UTF-8.
+    InvalidUtf8,
+}
+
+/// Verify an ISO 7816-4 status word of `90 00` (success).
+fn check_status(resp: &[u8]) -> Result<(), NdefError> {
+    if resp.len() < 2 {
+        return Err(NdefError::ShortRead);
+    }
+    let sw1 = resp[resp.len() - 2];
+    let sw2 = resp[resp.len() - 1];
+    if sw1 == 0x90 && sw2 == 0x00 {
+        Ok(())
+    } else {
+        Err(NdefError::Status(sw1, sw2))
+    }
+}
+
+/// Read the NDEF message off an NTAG 424 DNA tag.
+///
+/// Sequence (each step an ISO 7816-4 APDU):
+/// 1. SELECT NDEF application (`D2 76 00 00 85 01 01`)
+/// 2. SELECT NDEF File 02
+/// 3. READ BINARY 2 bytes at offset 0 -> NLEN (big-endian)
+/// 4. READ BINARY in <=255-byte chunks until `NLEN` bytes are read
+///
+/// `exchange` sends one APDU and writes the card response (data plus the
+/// trailing SW1/SW2) into the supplied output slice, returning its length.
+/// Keeping transport out of this routine makes it host-testable.
+///
+/// The decoded NDEF message is written into `buf`; the number of bytes written
+/// is returned.
+pub fn read_ndef_message<F>(exchange: &mut F, buf: &mut [u8]) -> Result<usize, NdefError>
+where
+    F: FnMut(&[u8], &mut [u8]) -> Result<usize, NdefError>,
+{
+    let mut resp = [0u8; 258];
+
+    // 1) Select the NDEF application.
+    let n = exchange(&SELECT_NDEF_APP_APDU, &mut resp)?;
+    check_status(&resp[..n])?;
+
+    // 2) Select NDEF File 02.
+    let n = exchange(&SELECT_NDEF_FILE_02_APDU, &mut resp)?;
+    check_status(&resp[..n])?;
+
+    // 3) Read the 2-byte NLEN at file offset 0.
+    let n = exchange(&[0x00, READ_BINARY_INS, 0x00, 0x00, 0x02], &mut resp)?;
+    check_status(&resp[..n])?;
+    let nlen_frame = n.checked_sub(2).ok_or(NdefError::ShortRead)?;
+    if nlen_frame < 2 {
+        return Err(NdefError::ShortRead);
+    }
+    let nlen = ((resp[0] as usize) << 8) | (resp[1] as usize);
+    if nlen == 0 {
+        return Err(NdefError::InvalidLength);
+    }
+    if nlen > buf.len() {
+        return Err(NdefError::BufferTooSmall);
+    }
+
+    // 4) Read the NDEF body (file offset 2), in <=255-byte chunks.
+    let mut offset = 2usize;
+    let mut written = 0usize;
+    while written < nlen {
+        let chunk = (nlen - written).min(0xFF);
+        let apdu = [
+            0x00,
+            READ_BINARY_INS,
+            (offset >> 8) as u8,
+            (offset & 0xFF) as u8,
+            chunk as u8,
+        ];
+        let n = exchange(&apdu, &mut resp)?;
+        check_status(&resp[..n])?;
+        let data_len = n.checked_sub(2).ok_or(NdefError::ShortRead)?;
+        if data_len < chunk {
+            return Err(NdefError::ShortRead);
+        }
+        buf[written..written + chunk].copy_from_slice(&resp[..chunk]);
+        written += chunk;
+        offset += chunk;
+    }
+
+    Ok(written)
+}
+
+/// Extract the URI payload from a decoded NDEF message.
+///
+/// Supports a single Well-Known `U` (URI) record with either a short
+/// (<=255-byte) or long payload, as produced by the NTAG 424 DNA SUN mirror
+/// configuration. Only the first record is considered, and its TYPE field must
+/// be `'U'`.
+pub fn extract_ndef_uri(ndef: &[u8]) -> Result<&str, NdefError> {
+    if ndef.len() < 3 {
+        return Err(NdefError::ShortRead);
+    }
+
+    let header = ndef[0];
+    let type_len = ndef[1] as usize;
+    let short_record = header & 0x10 != 0;
+
+    let (payload_len, mut idx) = if short_record {
+        (ndef[2] as usize, 3usize)
+    } else {
+        if ndef.len() < 6 {
+            return Err(NdefError::ShortRead);
+        }
+        (
+            u32::from_be_bytes([ndef[2], ndef[3], ndef[4], ndef[5]]) as usize,
+            6usize,
+        )
+    };
+
+    // TYPE field (must be a single 'U' byte for a URI record).
+    let type_end = idx.checked_add(type_len).ok_or(NdefError::ShortRead)?;
+    if type_end > ndef.len() {
+        return Err(NdefError::ShortRead);
+    }
+    if type_len != 1 || ndef[idx] != b'U' {
+        return Err(NdefError::NotUriRecord);
+    }
+    idx = type_end;
+
+    let payload_end = idx.checked_add(payload_len).ok_or(NdefError::ShortRead)?;
+    if payload_end > ndef.len() {
+        return Err(NdefError::ShortRead);
+    }
+    if payload_len < 1 {
+        return Err(NdefError::InvalidLength);
+    }
+
+    // First payload byte is the URI identifier code prefix; skip it.
+    let uri_body = &ndef[idx + 1..payload_end];
+    core::str::from_utf8(uri_body).map_err(|_| NdefError::InvalidUtf8)
+}
+
+#[cfg(test)]
+mod ndef_tests {
+    use super::*;
+
+    /// Canonical SUN URI matching the verifier test vectors.
+    const URI: &[u8] =
+        b"access.10bit.works/?uid=04112233445566&c=000008&cmac=505C41A335A9B7DEF29D5959936FE7FE";
+
+    /// Build a minimal NTAG NDEF file image: `[NLEN_hi, NLEN_lo] || message`.
+    fn build_ndef_file(uri: &[u8]) -> heapless::Vec<u8, 320> {
+        let payload_len = 1 + uri.len();
+        let msg_len = 4 + payload_len;
+        let mut file: heapless::Vec<u8, 320> = heapless::Vec::new();
+        file.push((msg_len >> 8) as u8).unwrap();
+        file.push((msg_len & 0xFF) as u8).unwrap();
+        file.extend_from_slice(&[0xD1, 0x01, payload_len as u8, b'U'])
+            .unwrap();
+        file.push(0x04).unwrap(); // URI identifier code: https://
+        file.extend_from_slice(uri).unwrap();
+        file
+    }
+
+    #[test]
+    fn test_read_ndef_message_and_extract_uri() {
+        let file = build_ndef_file(URI);
+
+        let mut mock = |apdu: &[u8], out: &mut [u8]| -> Result<usize, NdefError> {
+            if apdu == &SELECT_NDEF_APP_APDU[..] || apdu == &SELECT_NDEF_FILE_02_APDU[..] {
+                out[0] = 0x90;
+                out[1] = 0x00;
+                return Ok(2);
+            }
+            if apdu.len() == 5 && apdu[0] == 0x00 && apdu[1] == READ_BINARY_INS {
+                let off = ((apdu[2] as usize) << 8) | (apdu[3] as usize);
+                let le = apdu[4] as usize;
+                if off > file.len() {
+                    out[0] = 0x6B;
+                    out[1] = 0x00;
+                    return Ok(2);
+                }
+                let end = (off + le).min(file.len());
+                let data = &file[off..end];
+                out[..data.len()].copy_from_slice(data);
+                out[data.len()] = 0x90;
+                out[data.len() + 1] = 0x00;
+                return Ok(data.len() + 2);
+            }
+            Err(NdefError::Transport)
+        };
+
+        let mut buf = [0u8; 256];
+        let n = read_ndef_message(&mut mock, &mut buf).expect("read NDEF");
+        let uri = extract_ndef_uri(&buf[..n]).expect("extract URI");
+        assert_eq!(uri, core::str::from_utf8(URI).unwrap());
+
+        let sun = parse_sun_url(uri).expect("parse SUN");
+        assert_eq!(sun.counter, 8);
+        assert_eq!(sun.uid, [0x04, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66]);
+    }
+
+    #[test]
+    fn test_read_ndef_message_rejects_bad_status() {
+        let mut mock = |_apdu: &[u8], out: &mut [u8]| -> Result<usize, NdefError> {
+            out[0] = 0x6A;
+            out[1] = 0x82;
+            Ok(2)
+        };
+        let mut buf = [0u8; 64];
+        assert_eq!(
+            read_ndef_message(&mut mock, &mut buf),
+            Err(NdefError::Status(0x6A, 0x82))
+        );
+    }
+
+    #[test]
+    fn test_extract_ndef_uri_rejects_non_uri() {
+        // Well-known record of type 'T' (text) is not a URI.
+        let ndef = [0xD1, 0x01, 0x03, b'T', 0x02, b'h', b'i'];
+        assert_eq!(extract_ndef_uri(&ndef), Err(NdefError::NotUriRecord));
+    }
+}
