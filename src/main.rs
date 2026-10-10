@@ -13,28 +13,24 @@
 extern crate alloc;
 
 use esp_backtrace as _;
-use esp_hal::{
-    clock::CpuClock,
-    gpio::{Level, Output, OutputConfig},
-    i2c::master::{Config as I2cConfig, I2c},
-    time::Rate,
-};
+use esp_hal::clock::CpuClock;
 use esp_println::println;
 
 use core::fmt::Write;
 use embassy_executor::Spawner;
-use embassy_net::{tcp::TcpSocket, StackResources};
+use embassy_net::tcp::TcpSocket;
 use embassy_time::{Duration, Instant, Timer};
 use minimq::{
     Buffers, ConfigBuilder, ConnectEvent, Publication, Session, TopicFilter, Will,
 };
-use static_cell::StaticCell;
 
 mod auth_msg;
+mod board;
 mod cmd;
 mod config;
 mod nfc;
 mod ntag424;
+mod platform;
 mod relay;
 mod status_led;
 mod tag_debounce;
@@ -58,75 +54,21 @@ async fn main(spawner: Spawner) -> ! {
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
     let peripherals = esp_hal::init(config);
 
-    // 3. Initialize the RTOS scheduler.
-    let timg0 = esp_hal::timer::timg::TimerGroup::new(peripherals.TIMG0);
-    let sw_interrupt =
-        esp_hal::interrupt::software::SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
-    esp_rtos::start(timg0.timer0, sw_interrupt.software_interrupt0);
+    // 3. Initialize board and platform seams.
+    let setup = board::setup(peripherals);
 
-    println!("XIAO-C6 NFC node starting...");
-
-    // 4. Spawn the status LED (GPIO15, active-low) and relay (GPIO1) tasks.
+    // 4. Spawn the status LED and relay tasks.
     //    Each task takes ownership of its pin.
-    let led = Output::new(peripherals.GPIO15, Level::High, OutputConfig::default());
-    let relay_pin = Output::new(peripherals.GPIO1, Level::High, OutputConfig::default());
-    spawner.spawn(status_led::status_led_task(led).unwrap());
-    spawner.spawn(relay::relay_task(relay_pin).unwrap());
+    spawner.spawn(status_led::status_led_task(setup.led_pin).unwrap());
+    spawner.spawn(relay::relay_task(setup.relay_pin).unwrap());
 
-    // 5. Initialize Wi-Fi.
-    println!("Configuring WiFi...");
-    let (mut wifi_controller, interfaces) = esp_radio::wifi::new(
-        peripherals.WIFI,
-        esp_radio::wifi::ControllerConfig::default(),
-    )
-    .unwrap();
+    // 5. Spawn the Embassy network runner task.
+    spawner.spawn(net_task(setup.net_runner).unwrap());
 
-    let station_config = esp_radio::wifi::Config::Station(
-        esp_radio::wifi::sta::StationConfig::default()
-            .with_ssid(config::WIFI_SSID)
-            .with_password(config::WIFI_PASS.into()),
-    );
-    wifi_controller.set_config(&station_config).unwrap();
-
-    // 6. Initialize the network stack.
-    let rng = esp_hal::rng::Rng::new();
-    let seed = ((rng.random() as u64) << 32) | (rng.random() as u64);
-
-    static RESOURCES: StaticCell<StackResources<5>> = StaticCell::new();
-    let resources = RESOURCES.init(StackResources::<5>::new());
-
-    let (stack, runner) = embassy_net::new(
-        interfaces.station,
-        embassy_net::Config::dhcpv4(Default::default()),
-        resources,
-        seed,
-    );
-
-    spawner.spawn(net_task(runner).unwrap());
-
-    // 7. Initialize I2C for the PN532.
-    //    XIAO ESP32-C6 pinout: D4 = GPIO2 (SDA), D5 = GPIO3 (SCL).
-    let i2c = I2c::new(
-        peripherals.I2C0,
-        I2cConfig::default().with_frequency(Rate::from_khz(100)),
-    )
-    .unwrap()
-    .with_sda(peripherals.GPIO2)
-    .with_scl(peripherals.GPIO3);
-
-    println!("I2C initialized on GPIO2 (SDA) / GPIO3 (SCL)");
-
-    // PN532 init is non-fatal: Wi-Fi/MQTT proceed regardless.
-    let mut pn532 = match nfc::init_pn532(pn532::i2c::I2CInterface { i2c }) {
-        Ok(p) => {
-            println!("PN532 initialized successfully!");
-            Some(p)
-        }
-        Err(e) => {
-            println!("PN532 init failed: {:?} — continuing without NFC", e);
-            None
-        }
-    };
+    let mut wifi_controller = setup.wifi_controller;
+    let stack = setup.stack;
+    let mut pn532 = setup.pn532;
+    let _reader_reset = setup.reader_reset;
 
     // 8. Persistent MQTT/TCP buffers and topic names.
     let mut mqtt_rx_buf = [0u8; 1024];
