@@ -6,7 +6,6 @@
 use core::fmt;
 use embassy_time::{Duration, Instant};
 use pn532::{
-    i2c::I2CInterface,
     requests::{BorrowedRequest, Command, SAMMode},
     CountDown, Pn532, Request,
 };
@@ -123,17 +122,13 @@ impl CountDown for Pn532Delay {
     }
 }
 
-/// Initialize the PN532 in normal SAM mode over I2C.
+/// Initialize the PN532 in normal SAM mode over any supported interface.
 ///
 /// Returns an initialized Pn532 instance ready for tag polling.
-pub fn init_pn532<I2C, E>(
-    i2c: I2C,
-) -> Result<Pn532<I2CInterface<I2C>, Pn532Delay, 300>, NfcError>
-where
-    I2C: embedded_hal::i2c::I2c<Error = E>,
-    E: core::fmt::Debug,
-{
-    let interface = I2CInterface { i2c };
+// Interface-agnostic: pass I2CInterface or SPIInterfaceWithIrq; SPI builds rely on the crate's `msb-spi` feature (PN532 is LSB-first).
+pub fn init_pn532<I: pn532::Interface>(
+    interface: I,
+) -> Result<Pn532<I, Pn532Delay, 300>, NfcError> {
     let timer = Pn532Delay::new();
     let mut pn532 = Pn532::new(interface, timer);
 
@@ -152,13 +147,9 @@ where
 }
 
 /// Poll for a single NFC tag. Returns `Some(TagInfo)` if a tag is present.
-pub fn poll_tag<I2C, T, const N: usize>(
-    pn532: &mut Pn532<I2CInterface<I2C>, T, N>,
-) -> Option<TagInfo>
-where
-    I2C: embedded_hal::i2c::I2c,
-    T: CountDown<Time = fugit::MillisDurationU32>,
-{
+pub fn poll_tag<I: pn532::Interface, T: CountDown<Time = fugit::MillisDurationU32>, const N: usize>(
+    pn532: &mut Pn532<I, T, N>,
+) -> Option<TagInfo> {
     // INLIST_ONE_ISO_A_TARGET: poll for 1 target at 106 kbps Type A.
     // When no tag is in the RF field, PN532 responds with NbTg=0 in ~12-18ms.
     // A 30ms timeout accommodates valid target discovery while tightening the worst-case
@@ -204,15 +195,11 @@ where
 ///
 /// Returns `NfcError::EmptyResponse` if the response frame contains no data, or
 /// `NfcError::RfError(status)` if the target status byte indicates an error.
-pub fn in_data_exchange<'a, I2C, T, const N: usize>(
-    pn532: &'a mut Pn532<I2CInterface<I2C>, T, N>,
+pub fn in_data_exchange<'a, I: pn532::Interface, T: CountDown<Time = fugit::MillisDurationU32>, const N: usize>(
+    pn532: &'a mut Pn532<I, T, N>,
     target: u8,
     apdu: &[u8],
-) -> Result<&'a [u8], NfcError>
-where
-    I2C: embedded_hal::i2c::I2c,
-    T: CountDown<Time = fugit::MillisDurationU32>,
-{
+) -> Result<&'a [u8], NfcError> {
     // Maximum APDU payload supported by stack buffer in `no_std` without heap allocation.
     // 265 bytes accommodates standard ISO-DEP frame caps.
     let mut tx_buf = [0u8; 265];

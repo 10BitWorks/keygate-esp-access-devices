@@ -117,7 +117,7 @@ async fn main(spawner: Spawner) -> ! {
     println!("I2C initialized on GPIO2 (SDA) / GPIO3 (SCL)");
 
     // PN532 init is non-fatal: Wi-Fi/MQTT proceed regardless.
-    let mut pn532 = match nfc::init_pn532(i2c) {
+    let mut pn532 = match nfc::init_pn532(pn532::i2c::I2CInterface { i2c }) {
         Ok(p) => {
             println!("PN532 initialized successfully!");
             Some(p)
