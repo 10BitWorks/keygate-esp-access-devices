@@ -79,3 +79,45 @@ The firmware must be compiled for the RISC-V `riscv32imac-unknown-none-elf` targ
 # (assuming the ESP32-C6 is connected over USB serial)
 ./run-in-rust-container.sh cargo run --release
 ```
+
+## Building for the ESP32 Door Board
+
+The codebase supports both the default Seeed Studio XIAO ESP32-C6 node (`KEYGATE_CHIP=c6`) and the classic ESP32 door prototype board (`KEYGATE_CHIP=esp32`, Xtensa architecture).
+
+### One-Time Xtensa Toolchain Bootstrap
+
+Classic ESP32 uses the Xtensa architecture (`xtensa-esp32-none-elf`), which requires the Espressif `esp` Rust fork installed via `espup`. In this repository, `rustup/` and `cargo/` are shared and persisted locally across container invocations.
+
+To bootstrap the Xtensa toolchain for the container, run:
+
+```bash
+# 1. Install espup into the shared cargo/bin inside the container
+./run-in-rust-container.sh cargo install espup
+
+# 2. Install the Xtensa toolchain and GCC into the shared rustup/ directory
+./run-in-rust-container.sh bash -c 'export PATH="$HOME/.cargo/bin:$PATH"; espup install --targets esp32'
+
+# 3. Verify that the 'esp' toolchain is registered
+./run-in-rust-container.sh rustup toolchain list
+```
+
+### Compiling for ESP32
+
+To build for the ESP32 door board, set `KEYGATE_CHIP=esp32`:
+
+```bash
+# Debug build (invokes linker to produce ELF)
+KEYGATE_CHIP=esp32 ./run-in-rust-container.sh cargo build
+
+# Release build
+KEYGATE_CHIP=esp32 ./run-in-rust-container.sh cargo build --release
+```
+
+When `KEYGATE_CHIP=esp32` is set, `run-in-rust-container.sh` automatically:
+- Sets `RUSTUP_TOOLCHAIN=esp`.
+- Injects `--target xtensa-esp32-none-elf` and `-Zbuild-std=core,alloc`.
+- Injects `--no-default-features --features chip-esp32,board-esp32-devkit-door` (unless custom feature flags are supplied).
+- Sources `.env` first, followed by `.env.esp32` if present (allowing board/fleet credential overrides where `.env.$KEYGATE_CHIP` takes precedence).
+
+> **Note:** Acceptance gates verify using `cargo build`, not `cargo check`. `cargo check` does not invoke the linker, so `-Tlinkall.x`, build-std linkage, and Xtensa runtime objects are only verified by `cargo build`.
+
