@@ -45,8 +45,10 @@ Adding a new board target requires two additions:
   - MOSI → GPIO23
   - CS → GPIO5
   - IRQ → GPIO4 (pull-up enabled)
-  - RSTO → GPIO21 (hardware reset line connected to PN532 RSTPDN)
-  - DIP switches: SPI mode
+   - RSTO → GPIO21 (hardware reset line connected to PN532 RSTPDN)
+   - DIP switches: SPI mode = **OFF,ON** (SEL0=OFF, SEL1=ON)
+     - The PN532 latches its interface mode only at power-on or a RSTPDN rising edge. Pressing the devkit's EN button does **not** relatch it — after changing the DIPs, power-cycle the module (unplug USB and verify the module's power LED goes dark before replugging; the module can back-feed through signal lines and fake a power cycle).
+     - Do not leave RSTPDN floating on this board: firmware drives RSTO high from boot to keep the reader out of reset.
 - **Relay Strike:** GPIO13 (active-low default)
   - *Design note:* Relay uses GPIO13 rather than D12. GPIO12 is the ESP32 MTDI strapping pin controlling internal SPI flash voltage (VDD_SDIO 3.3V vs 1.8V) at boot. Connecting relay circuitry or pull-downs to GPIO12 risks boot failure and flash read errors.
 - **Status LED:** GPIO2 (onboard LED, active-low default)
@@ -131,6 +133,46 @@ When `KEYGATE_CHIP=esp32` is set, `run-in-rust-container.sh` automatically:
 - Injects `--target xtensa-esp32-none-elf` and `-Zbuild-std=core,alloc`.
 - Injects `--no-default-features --features chip-esp32,board-esp32-devkit-door`.
 - Sources `.env` first, followed by `.env.esp32` if present.
+
+### Interactive Bench Flash (classic ESP32 door board)
+
+Flashing runs **host-side** (the build container has no `/dev` access) via `scripts/bench-flash.sh`:
+
+```bash
+KEYGATE_CHIP=esp32 ./run-in-rust-container.sh cargo build --release   # build in container
+./scripts/bench-flash.sh                                              # flash + capture on host
+```
+
+The script is Zenity-gated: every step that needs hands on the board pops a dialog and waits, then runs a **20-second** serial window.
+
+**Proven espflash recipe** (this devkit's CH340 adapter is flaky; these parameters are not optional):
+
+```bash
+espflash flash --chip esp32 --port /dev/ttyUSB0 \
+    --before no-reset -B 57600 --no-verify \
+    target/xtensa-esp32-none-elf/release/keygate-esp-access-devices
+```
+
+- `--before no-reset`: the auto-reset DTR/RTS path is unreliable on this board.
+- `-B 57600` + stub mode (no `--no-stub`): 115200 ROM mode stalls in `FlashDeflData`; the RAM stub recovers from link hiccups that the ROM cannot.
+- `--no-verify`: skipped read-back halves the time; a partial write from a killed attempt is completed by the next attempt (already-written segments print "not changed, skipping").
+
+**BOOT dance timing** (the critical part — do it *after* clicking OK on the dialog):
+
+1. Click OK in the dialog.
+2. `Connecting...` appears.
+3. **HOLD BOOT → TAP EN → KEEP HOLDING BOOT ~5 s → RELEASE.**
+
+IO0 is sampled at reset release, so BOOT must already be held when EN is tapped; the 5-second hold covers the host's sync window, which this adapter misses if the dance is done too early. If an attempt fails to connect or dies mid-write, just repeat the dance for the next attempt — the script's retry loop gates each retry on a fresh dialog.
+
+**Serial capture** (no espflash — raw read of the running app):
+
+```bash
+stty -F /dev/ttyUSB0 115200 cs8 -cstopb -parenb raw -echo
+timeout 20 cat /dev/ttyUSB0
+```
+
+`espflash monitor` insists on bootloader sync and will hang on this board; a raw `cat` of the port after an EN press is the reliable way to watch the running firmware.
 
 ### One-Time Xtensa Toolchain Bootstrap
 
