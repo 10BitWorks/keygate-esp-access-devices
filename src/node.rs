@@ -166,6 +166,7 @@ pub async fn run<I: pn532::Interface>(
                 let mut debounce = tag_debounce::TagDebounce::new();
                 let mut ndef_buf = [0u8; 256];
                 let mut policy = ResetPolicy::new();
+                let mut no_nfc_logged = false;
 
                 loop {
                     // Drive MQTT with a bounded wait so NFC polling keeps flowing.
@@ -198,6 +199,7 @@ pub async fn run<I: pn532::Interface>(
 
                     // Poll NFC and run the edge-triggered debounce state machine.
                     if let Some(ref mut pn) = pn532 {
+                        no_nfc_logged = false;
                         let now = Instant::now();
                         let now_ms = now.as_millis() as u64;
 
@@ -309,6 +311,12 @@ pub async fn run<I: pn532::Interface>(
                                 }
                             }
                         }
+                    } else {
+                        if !no_nfc_logged {
+                            println!("[nfc] no reader initialized — idling NFC polling");
+                            no_nfc_logged = true;
+                        }
+                        Timer::after(Duration::from_secs(1)).await;
                     }
 
                     // Cooperative yield to keep the executor responsive.
