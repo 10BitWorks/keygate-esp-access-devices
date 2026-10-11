@@ -238,6 +238,15 @@ impl SpiDevice for DoorSoftSpiDevice {
             core::hint::spin_loop();
         }
         let _ = self.cs.set_high();
+
+        // Inter-transaction CS-high idle delay: ~1 ms at 240 MHz (240_000 spin iterations).
+        // Gives the PN532's 80C51 core quiet bus time to process commands without
+        // being starved by back-to-back SPI status-poll transactions (Adafruit uses delay(1)
+        // post-write and delay(10) between polls).
+        for _ in 0..240_000 {
+            core::hint::spin_loop();
+        }
+
         Ok(())
     }
 }
@@ -398,7 +407,7 @@ pub fn setup(peripherals: esp_hal::peripherals::Peripherals) -> Setup<DoorNfcIfa
     platform::start_rtos(timg0.timer0, sw_interrupt.software_interrupt0);
 
     println!("ESP32 door node starting...");
-    println!("door build: pn532 soft-SPI wake2ms (sck5 mosi22 miso18 cs17)");
+    println!("door build: pn532 soft-SPI paced 1ms (sck5 mosi22 miso18 cs17)");
 
     // 4. Spawn the status LED (GPIO2 onboard, active-low) and relay (GPIO13) tasks.
     //    GPIO13 chosen to avoid GPIO12/MTDI strapping pin issues.

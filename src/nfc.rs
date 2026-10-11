@@ -151,7 +151,7 @@ pub fn soft_reinit<I: pn532::Interface>(
     pn.process(
         &Request::sam_configuration(SAMMode::Normal, false),
         0,
-        fugit::MillisDurationU32::from_ticks(20),
+        fugit::MillisDurationU32::from_ticks(500),
     )
     .map_err(|_e| {
         // Boot classification: TimeoutAck/BadAck = module not hearing SPI (wiring / mode switch / power);
