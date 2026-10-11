@@ -175,7 +175,7 @@ pub fn setup(peripherals: esp_hal::peripherals::Peripherals) -> Setup<DoorNfcIfa
     platform::start_rtos(timg0.timer0, sw_interrupt.software_interrupt0);
 
     println!("ESP32 door node starting...");
-    println!("door build: pn532 SPI STATUS-poll (sck26 mosi27 cs22 miso25)");
+    println!("door build: pn532 SPI3 STATUS-poll (sck26 mosi27 cs22 miso25)");
 
     // 4. Spawn the status LED (GPIO2 onboard, active-low) and relay (GPIO13) tasks.
     //    GPIO13 chosen to avoid GPIO12/MTDI strapping pin issues.
@@ -195,9 +195,10 @@ pub fn setup(peripherals: esp_hal::peripherals::Peripherals) -> Setup<DoorNfcIfa
 
     // 7. Initialize SPI master and device for PN532.
     //    Door pinout: SCK=GPIO26, MOSI=GPIO27, MISO=GPIO25, CS=GPIO22 (GPIO18/23/5 abandoned — 5V-excursion damage suspects).
+    //    Driven by SPI3/HSPI — SPI2/VSPI condemned after 5 V excursion on GPIO19 (its default MISO pad).
     //    Conservative 1 MHz clock, Mode 0.
     let spi = Spi::new(
-        peripherals.SPI2,
+        peripherals.SPI3,
         SpiConfig::default()
             .with_frequency(Rate::from_khz(1000))
             .with_mode(Mode::_0),
