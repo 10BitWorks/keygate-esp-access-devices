@@ -175,12 +175,13 @@ pub fn poll_tag<I: pn532::Interface, T: CountDown<Time = fugit::MillisDurationU3
 ) -> Result<Option<TagInfo>, NfcError> {
     // INLIST_ONE_ISO_A_TARGET: poll for 1 target at 106 kbps Type A.
     // When no tag is in the RF field, PN532 responds with NbTg=0 after its internal scan.
-    // 200ms accommodates the default passive-activation retry window if no target present.
+    // 1000ms matches Adafruit's readPassiveTargetID timeout: RF field ramp-up plus the
+    // passive-activation scan can exceed 200ms on cold modules or sagging supply rails.
     let res = pn532
         .process(
             &Request::INLIST_ONE_ISO_A_TARGET,
             20,
-            fugit::MillisDurationU32::from_ticks(200),
+            fugit::MillisDurationU32::from_ticks(1000),
         )
         .map_err(|e| {
             #[cfg(target_arch = "xtensa")]
