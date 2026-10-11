@@ -176,6 +176,20 @@ timeout 20 cat /dev/ttyUSB0
 
 `espflash monitor` insists on bootloader sync and will hang on this board; a raw `cat` of the port after an EN press is the reliable way to watch the running firmware.
 
+### F3 Live Drill (one-click)
+
+`scripts/f3-drill.sh` runs the end-to-end bench drill. It gates on a Zenity dialog
+(tag provisioning key + door power instructions — the per-tag key is read from
+`$F3_TAG_KEY` or `/tmp/opencode/tagkey.txt`, never committed), then monitors the
+broker's `access/<device>/presence|auth|cmd` topics for: the door coming online,
+a SUN tap tuple, and the verifier's grant decision. Exit 0 = grant received
+(confirm the relay clicked physically). Diagnostics for each failure mode are in
+the result dialog; see `docs/PN532-SPI-NOTES.md` for the underlying context.
+
+```bash
+./scripts/f3-drill.sh    # env: EMQX_BROKER, DOOR_DEVICE_ID, DRILL_WINDOW, DRILL_LOG
+```
+
 ### One-Time Xtensa Toolchain Bootstrap
 
 Classic ESP32 uses the Xtensa architecture (`xtensa-esp32-none-elf`), which requires the Espressif `esp` Rust fork installed via `espup`. To bootstrap the Xtensa toolchain for the container:
