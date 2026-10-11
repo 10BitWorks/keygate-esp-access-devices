@@ -10,7 +10,8 @@
 - Bench pins: SCK=GPIO5, MOSI=GPIO22, MISO=GPIO18, CS=GPIO17, RSTO=GPIO19.
   (Documented pinout 18/23/19/5/21 was never re-tested with the working soft-SPI driver —
   revert is planned; pins are proven good, see "Failed experiments".)
-- Module VCC on **VIN (5 V)** — this module has an onboard regulator; 3.3 V also works.
+- Module VCC on **VIN (5 V)** — onboard regulator; 3.3 V is probably also viable but
+  unverified with the fixed firmware (see "3.3 V vs 5 V" under "The module").
 - DIP switches **1:OFF, 2:ON = SPI**.
 - Timeouts: SAMConfig 500 ms, InListPassiveTarget 3000 ms, InDataExchange 500 ms.
 - `sam_configuration(SAMMode::Normal, /* use_irq_pin */ true)` — the IRQ byte must be 0x01.
@@ -29,6 +30,14 @@ Facts established empirically:
 - **Onboard regulator**: VCC accepts 3.3–5 V; SPI logic levels stay 3.3 V either way.
   The module ran at 5 V for hours with zero damage — an early "3.3 V only, no regulator"
   belief (from the Waveshare constraint) was wrong for this board.
+- **3.3 V vs 5 V**: the move to 5 V was motivated by the RF-brownout theory, which is
+  dead — the "init OK at 3.3 V but RF dead" symptom is fully explained by the SAMConfig
+  IRQ byte (root cause 3), and 5 V empirically did not fix RF. Every confirmed-working
+  capture ran at 5 V; 3.3 V with the fixed firmware was never re-tested. On an LDO
+  board, 3.3 V input leaves the chip at ~3.0–3.1 V after dropout (in spec, less RF
+  headroom); 5 V gives the regulator proper margin. Verdict: 3.3 V almost certainly
+  works; 5 V is the slightly safer rail; a 2-minute VCC A/B settles it if it ever
+  matters. A BadAck cluster under RF load is the symptom that would implicate supply.
 - **DIP switch mapping** (SET0/SET1, silkscreen "0 1", empirically confirmed):
   - `OFF,OFF` = HSU (UART)
   - `ON,OFF` = I2C
@@ -49,12 +58,17 @@ starting 2026-10-10, after the module's VCC was briefly moved to 5 V. The 5 V mo
 red herring — the timing coincidence of a broken build being flashed is what actually
 started the outage. Four independent causes, each masking the next:
 
-1. **Hardware-SPI frame delivery never worked** (esp-hal `Spi` + `pn532` crate
+1. **Hardware-SPI never got a fair trial** (esp-hal `Spi` + `pn532` crate
    `SPIInterface` + our `DoorSpiDevice` wrapper). Symptom: STATUS byte stuck at 0x00
-   forever — the module never processed a single command frame. Never fully root-caused;
-   bypassed by bit-banging. *Caveat: the HW wrapper's CS settle/hold delays were also
-   collapsed by bug 2 below, so a hardware-SPI retry with real delays is a plausible
-   optimization — it was never retested with working delays.*
+   forever — the module never processed a command frame. At the time this was read as
+   "HW-SPI frame delivery broken"; in hindsight every HW-SPI test ran with ALL FOUR root
+   causes present: no wake pulse (the crate has none; ours was written only after the
+   soft-SPI switch), CS settle/hold delays collapsed by bug 2, no pacing, IRQ byte 0x00,
+   and 20 ms timeouts. None of the four fixes is transport-specific (wake = CS-low
+   duration, settle/pacing = wrapper delays, IRQ byte and timeouts = protocol layer),
+   and Ray's sketch (next section) is an existence proof of hardware SPI on this exact
+   module and wiring. HW-SPI is expected to work with the current fixes — it was
+   bypassed by bit-banging, not beaten.
 2. **`core::hint::spin_loop()` delay loops are deleted by LLVM in release builds** — they
    are side-effect-free hints. Every ms-scale delay (wake pulse, CS settle/hold, 1 ms
    inter-transaction pacing, half-bit timing) silently became a no-op. STATUS polls ran at
@@ -109,6 +123,49 @@ started the outage. Four independent causes, each masking the next:
 - **Adafruit-stock 1000 ms poll timeout** — loses the race on this module ~50% of the time
   with a tag present.
 
+## The control experiment: Ray's Arduino sketch
+
+The user's friend Ray read tags on this exact module and board with stock Arduino code —
+`adafruit/Adafruit PN532@^1.3.4`, hardware SPI, documented pins. His sketch (lightly
+trimmed) is the control experiment the elimination matrix never had:
+
+```cpp
+#include <SPI.h>
+#include <Adafruit_PN532.h>
+
+#define PN532_SS 5
+Adafruit_PN532 nfc(PN532_SS);          // hardware SPI, SCK=18 MISO=19 MOSI=23 SS=5
+
+void setup() {
+    nfc.begin();                        // = wakeup() + getFirmwareVersion()
+    uint32_t version = nfc.getFirmwareVersion();
+    nfc.SAMConfig();                    // sends mode=normal, IRQ byte = 0x01
+}
+
+void loop() {
+    uint8_t uid[7]; uint8_t uidLength;
+    if (nfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, uid, &uidLength)) {
+        // tag found — relay on GPIO12
+    }
+    delay(1000);
+}
+```
+
+What it proves, line by line:
+
+- `SPI.h` + documented pins — **hardware SPI works on this module and wiring** (the
+  esp-hal + pn532-crate failure was our stack, not the transport).
+- `nfc.begin()` = wakeup + firmware check before `SAMConfig()` — the wake pulse we were
+  missing.
+- `SAMConfig()` sends IRQ byte **0x01** — root cause 3, verbatim.
+- `readPassiveTargetID` = `InListPassiveTarget, MaxTg=1, BrTy=0x00` with a 1000 ms
+  timeout — same command, generous timeout.
+- No IRQ pin, no RSTPDN wired — both float, and it works (confirms our RSTPDN tests).
+- His relay is on **GPIO12 (MTDI strapping pin)** — works because strapping is sampled
+  only at reset and his load doesn't pull it low at boot. Our GPIO13 choice remains the
+  safer one; don't copy GPIO12.
+
+
 ## Protocol truth (Adafruit_PN532 audit, 2026-10-11)
 
 The `pn532` crate (0.5) diverges from Adafruit_PN532 in ways that matter on this rig:
@@ -147,8 +204,14 @@ Observed command bytes (write-spy, logical/unreversed): SAMConfig frame
   that halves detection latency. Measure, don't guess.
 - **`spin_delay` calibration**: iteration cost is assumed ~2–4 cycles; a cycle-counter
   measurement (or GPIO+scope) would make the constants exact.
-- **Hardware SPI retry** with real (black_box) settle/hold delays + wake pulse — root
-  cause 1 was never isolated, and its delays were collapsed by bug 2 at the time.
+- **Hardware SPI retry** — expected to work, not just plausible: every HW-SPI failure is
+  explained by the four transport-agnostic bugs, and Ray's sketch (see above) proves the
+  transport on this exact module and wiring. Swap `DoorSoftSpiDevice` for the retained
+  `DoorSpiDevice` (hardware `Spi`, keep the `spin_delay`-based settle/hold + add wake +
+  pacing in its wrapper), keep the current timeouts and IRQ byte. ~30 lines, one bench
+  test to confirm; buys a faster bus and frees the CPU during transfers. Residual risk:
+  esp-hal multi-op `transaction()` descriptor gaps (audit item 4) — our wrapper holds CS
+  across all ops, so the risk is byte-level gaps between `Operation`s at 1 MHz; low.
 - Timeout tuning once the above are done: 3000 ms poll → 1500 ms if pacing improves.
 
 ## Debug tooling: the `nfc-spy` feature
