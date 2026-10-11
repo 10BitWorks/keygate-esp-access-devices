@@ -288,7 +288,21 @@ pub async fn run<I: pn532::Interface>(
                                                 }
                                             },
                                             Err(e) => {
-                                                println!("NDEF read error: {:?}", e);
+                                                // ISO-7816 status-word hints from the
+                                                // bench session (docs/PN532-SPI-NOTES.md).
+                                                let hint = match &e {
+                                                    ntag424::NdefError::Status(0x6A, 0x82) => {
+                                                        " — NDEF file not found: tag is BLANK/unprovisioned (expected on unwritten NTAG 424s)"
+                                                    }
+                                                    ntag424::NdefError::Status(0x69, 0x82) => {
+                                                        " — security status not satisfied: tag requires authentication first"
+                                                    }
+                                                    ntag424::NdefError::Status(0x6A, 0x86) => {
+                                                        " — APDU parameters wrong (protocol mismatch)"
+                                                    }
+                                                    _ => "",
+                                                };
+                                                println!("NDEF read error: {:?}{}", e, hint);
                                                 status_led::set_state(
                                                     status_led::LedState::DeniedOrOffline,
                                                 );

@@ -80,7 +80,10 @@ fn spin_delay(iterations: u32) {
     }
 }
 
+// Spy counter fields are only exercised under the `nfc-spy` feature; silence dead-code
+// lints for production builds. See docs/PN532-SPI-NOTES.md for spy output semantics.
 #[cfg(feature = "board-esp32-devkit-door")]
+#[cfg_attr(not(feature = "nfc-spy"), allow(dead_code))]
 pub struct DoorSoftSpiDevice {
     sck: esp_hal::gpio::Output<'static>,
     mosi: esp_hal::gpio::Output<'static>,
@@ -199,7 +202,8 @@ impl SpiDevice for DoorSoftSpiDevice {
                     }
                     // Frame spy: dump the ACK/response frames fetched via DATAREAD
                     // (crate sends Write([0xC0]) immediately before the Read op).
-                    // 12 dumps cover init exchanges plus several poll commands.
+                    // 80 dumps cover init exchanges plus a full tag-tap sequence.
+                    #[cfg(feature = "nfc-spy")]
                     if self.frame_read_pending && self.read_dump_count < 80 {
                         self.frame_read_pending = false;
                         esp_println::print!("[softspi] frame rd ({} B) wire: ", words.len());
@@ -216,6 +220,7 @@ impl SpiDevice for DoorSoftSpiDevice {
                     }
                 }
                 Operation::Write(words) => {
+                    #[cfg(feature = "nfc-spy")]
                     if self.write_count < 400 {
                         esp_println::print!("[softspi] write[{}]: ", words.len());
                         for b in words.iter().take(32) {
@@ -230,6 +235,7 @@ impl SpiDevice for DoorSoftSpiDevice {
                         self.write_count += 1;
                     }
                     // DATAREAD selector (wire 0xC0) marks the next Read op as a frame fetch.
+                    #[cfg(feature = "nfc-spy")]
                     if words.len() == 1 && words[0] == 0xC0 {
                         self.frame_read_pending = true;
                     }
@@ -253,26 +259,33 @@ impl SpiDevice for DoorSoftSpiDevice {
                     }
                 }
                 Operation::TransferInPlace(words) => {
-                    let is_status_read = words.len() == 2 && words[0] == 0x40;
                     for byte in words.iter_mut() {
                         *byte = self.transfer_byte(*byte);
                     }
                     // Status spy: logs every STATUS VALUE CHANGE (bounded), not every poll.
                     // Reveals the ready-timeline during long RF commands — e.g. whether
                     // the module ever flips to ready (0x80) inside InListPassiveTarget's
-                    // 1000 ms window, flips back, or asserts garbage (BadAck hunting).
+                    // window, flips back, or asserts garbage (BadAck hunting).
                     // 0x40 = as_lsb(0x02) = PN532_SPI_STATREAD under msb-spi pre-reversal.
-                    if is_status_read {
-                        if self.status_print_count < 400 && self.last_status != Some(words[1]) {
-                            esp_println::println!(
-                                "[softspi] status poll #{} -> 0x{:02X}",
-                                self.status_poll_count,
-                                words[1]
-                            );
-                            self.last_status = Some(words[1]);
-                            self.status_print_count += 1;
+                    // Semantics: 0xFF = MISO not driven (mode/wiring), 0x80 = ready,
+                    // 0x00 = driving but not ready. See docs/PN532-SPI-NOTES.md.
+                    #[cfg(feature = "nfc-spy")]
+                    {
+                        let is_status_read = words.len() == 2 && words[0] == 0x40;
+                        if is_status_read {
+                            if self.status_print_count < 400
+                                && self.last_status != Some(words[1])
+                            {
+                                esp_println::println!(
+                                    "[softspi] status poll #{} -> 0x{:02X}",
+                                    self.status_poll_count,
+                                    words[1]
+                                );
+                                self.last_status = Some(words[1]);
+                                self.status_print_count += 1;
+                            }
+                            self.status_poll_count += 1;
                         }
-                        self.status_poll_count += 1;
                     }
                 }
                 Operation::DelayNs(ns) => {
@@ -443,7 +456,10 @@ pub fn setup(peripherals: esp_hal::peripherals::Peripherals) -> Setup<DoorNfcIfa
     platform::start_rtos(timg0.timer0, sw_interrupt.software_interrupt0);
 
     println!("ESP32 door node starting...");
-    println!("door build: pn532 soft-SPI heartbeat spy (sck5 mosi22 miso18 cs17)");
+    #[cfg(feature = "nfc-spy")]
+    println!("door build: pn532 soft-SPI SPY (sck5 mosi22 miso18 cs17)");
+    #[cfg(not(feature = "nfc-spy"))]
+    println!("door build: pn532 soft-SPI (sck5 mosi22 miso18 cs17)");
 
     // 4. Spawn the status LED (GPIO2 onboard, active-low) and relay (GPIO13) tasks.
     //    GPIO13 chosen to avoid GPIO12/MTDI strapping pin issues.

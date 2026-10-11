@@ -40,6 +40,9 @@ chip-esp32c6 = ["dep:esp-hal", "esp-hal/esp32c6", "dep:esp-backtrace", "esp-back
 chip-esp32 = ["dep:esp-hal", "esp-hal/esp32", "dep:esp-backtrace", "esp-backtrace/esp32", "dep:esp-println", "esp-println/esp32", "dep:esp-radio", "esp-radio/esp32", "dep:esp-rtos", "esp-rtos/esp32", "dep:esp-bootloader-esp-idf", "esp-bootloader-esp-idf/esp32"]
 board-xiao-c6 = []
 board-esp32-devkit-door = []
+# Bench diagnostics: wire-level spy (write frames, STATUS transitions, response dumps,
+# poll heartbeat) on the door soft-SPI driver. See docs/PN532-SPI-NOTES.md. Not default.
+nfc-spy = []
 
 [target.'cfg(any(target_arch = "riscv32", target_arch = "xtensa"))'.dependencies]
 # ESP32 HAL and runtime

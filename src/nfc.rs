@@ -155,10 +155,18 @@ pub fn soft_reinit<I: pn532::Interface>(
         fugit::MillisDurationU32::from_ticks(500),
     )
     .map_err(|_e| {
-        // Boot classification: TimeoutAck/BadAck = module not hearing SPI (wiring / mode switch / power);
-        // TimeoutResponse = ACKed but no answer (module-side).
+        // Symptom-based diagnostics from the 2026-10-10/11 bench session
+        // (see docs/PN532-SPI-NOTES.md, "Symptom → diagnosis table").
         #[cfg(target_arch = "xtensa")]
-        esp_println::println!("[nfc] sam_configuration err: {:?}", _e);
+        {
+            let hint = match &_e {
+                pn532::Error::TimeoutAck => "PN532 not ACKing. Check: DIP switches = 1:OFF 2:ON (SPI on this module family); power-cycle the MODULE after any DIP change (interface mode latches at power-on only, EN button does NOT relatch); SCK/MOSI/CS wiring; VCC.",
+                pn532::Error::TimeoutResponse => "PN532 ACKed but never answered. Module-side stall — power-cycle the module; check supply stability.",
+                pn532::Error::BadAck => "PN532 returned garbage for the ACK frame — mid-recovery/brownout signature. Power-cycle the module; check VCC current.",
+                _ => "SPI interface error — check wiring.",
+            };
+            esp_println::println!("[nfc] SAMConfig failed ({:?}): {}", _e, hint);
+        }
         NfcError::Pn532
     })?;
 
@@ -186,8 +194,18 @@ pub fn poll_tag<I: pn532::Interface, T: CountDown<Time = fugit::MillisDurationU3
             fugit::MillisDurationU32::from_ticks(3000),
         )
         .map_err(|e| {
+            // Symptom-based diagnostics from the bench session
+            // (see docs/PN532-SPI-NOTES.md, "Symptom → diagnosis table").
             #[cfg(target_arch = "xtensa")]
-            esp_println::println!("[nfc] poll process err: {:?}", e);
+            {
+                let hint = match &e {
+                    pn532::Error::TimeoutAck => "PN532 stopped ACKing mid-run — check wiring/connectors.",
+                    pn532::Error::TimeoutResponse => "RF response timeout — tag responses on this module run 240ms-3s (slow RF front-end). Hold the tag flat on the antenna; if this persists with NO tag nearby, check antenna/module.",
+                    pn532::Error::BadAck => "Garbage frame where ACK expected — recovery signature; power-cycle the module if repeated.",
+                    _ => "SPI interface error.",
+                };
+                esp_println::println!("[nfc] poll err ({:?}): {}", e, hint);
+            }
             match e {
                 pn532::Error::TimeoutAck | pn532::Error::TimeoutResponse => NfcError::Timeout,
                 _ => NfcError::Pn532,
@@ -197,12 +215,14 @@ pub fn poll_tag<I: pn532::Interface, T: CountDown<Time = fugit::MillisDurationU3
     if res.is_empty() || res[0] == 0 {
         // Heartbeat: log the first 100 poll results so bench captures can tell
         // "loop alive, no tag" (nbtg=0) from "loop hung" (no lines at all).
-        static POLL_LOG: core::sync::atomic::AtomicU32 =
-            core::sync::atomic::AtomicU32::new(0);
-        let n = POLL_LOG.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        #[cfg(target_arch = "xtensa")]
-        if n < 100 {
-            esp_println::println!("[nfc] poll #{} nbtg=0", n);
+        #[cfg(all(target_arch = "xtensa", feature = "nfc-spy"))]
+        {
+            static POLL_LOG: core::sync::atomic::AtomicU32 =
+                core::sync::atomic::AtomicU32::new(0);
+            let n = POLL_LOG.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            if n < 100 {
+                esp_println::println!("[nfc] poll #{} nbtg=0", n);
+            }
         }
         return Ok(None);
     }
