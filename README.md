@@ -55,6 +55,8 @@ Adding a new board target requires two additions:
 
 ### PN532 Lockup Supervisor & RSTO Recovery
 
+> **Debugging the door PN532 over SPI?** Read [`docs/PN532-SPI-NOTES.md`](docs/PN532-SPI-NOTES.md) first — it contains the full post-mortem of the 2026-10-10/11 session (four stacked root causes, symptom → diagnosis table, DIP switch mapping, timing measurements, and the failed experiments not to retry), plus the `nfc-spy` bench-diagnostic feature usage.
+
 Field deployments under sustained heat can experience PN532 transport lockups where the reader stops acknowledging bus transactions.
 - **Door board recovery:** The supervisor monitors tag poll results. When 8 consecutive poll failures occur (~200 ms of transport/protocol errors), the supervisor pulses RSTO (GPIO21) low for 10 ms, waits 100 ms for reader boot, and runs `soft_reinit()` to restore SAM configuration. A 5-second cooldown re-arms subsequent hardware reset cycles to prevent bus thrashing.
 - **XIAO ESP32-C6 recovery:** The XIAO board lacks a dedicated hardware reset line (`reader_reset = None`). When 8 consecutive errors occur, it logs that no hardware reset line is wired and performs `soft_reinit()` on the active I2C interface.

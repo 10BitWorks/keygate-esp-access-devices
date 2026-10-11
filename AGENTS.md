@@ -7,8 +7,9 @@
 ## Hardware
 - **PN532 Connection:**
   - `board-xiao-c6`: I2C mode. SDA=GPIO2, SCL=GPIO3. Soft re-init recovery only.
-  - `board-esp32-devkit-door`: SPI mode. SCK=GPIO18, MISO=GPIO19, MOSI=GPIO23, CS=GPIO5, IRQ=GPIO4, RSTO=GPIO21 (hardware reset line). Relay on GPIO13.
-- **PN532 Power:** 3.3V only (same constraint as Waveshare board).
+  - `board-esp32-devkit-door`: SPI mode (DIPs 1:OFF 2:ON). Documented pins: SCK=GPIO18, MISO=GPIO19, MOSI=GPIO23, CS=GPIO5, IRQ=GPIO4, RSTO=GPIO21 (hardware reset line). Relay on GPIO13. Current bench wiring: SCK=5, MOSI=22, MISO=18, CS=17, RSTO=19 (soft-SPI driver).
+- **PN532 Power:** Door module (Elechouse V3 form factor) accepts 3.3–5 V via onboard regulator; bench runs it at VIN (5 V). C6's Waveshare module remains 3.3 V only.
+- **Before debugging the door PN532, read `docs/PN532-SPI-NOTES.md`** — root-cause post-mortem, symptom table, and the list of failed experiments not to retry.
 
 ## Architecture
 - **No LVGL/Display:** This is a headless NFC reader node.

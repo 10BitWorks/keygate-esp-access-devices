@@ -1,0 +1,193 @@
+# PN532 SPI on the ESP32 Door Board — Field Notes & Post-Mortem
+
+> **Read this before debugging the door PN532.** Everything below was learned on the bench
+> over a ~14-hour session (2026-10-10/11). Several of these experiments cost hours and were
+> wrong turns — the "Failed experiments" section exists so nobody retries them.
+
+## TL;DR — the working configuration
+
+- Soft-SPI bit-bang (`DoorSoftSpiDevice` in `src/board.rs`), NOT hardware SPI.
+- Bench pins: SCK=GPIO5, MOSI=GPIO22, MISO=GPIO18, CS=GPIO17, RSTO=GPIO19.
+  (Documented pinout 18/23/19/5/21 was never re-tested with the working soft-SPI driver —
+  revert is planned; pins are proven good, see "Failed experiments".)
+- Module VCC on **VIN (5 V)** — this module has an onboard regulator; 3.3 V also works.
+- DIP switches **1:OFF, 2:ON = SPI**.
+- Timeouts: SAMConfig 500 ms, InListPassiveTarget 3000 ms, InDataExchange 500 ms.
+- `sam_configuration(SAMMode::Normal, /* use_irq_pin */ true)` — the IRQ byte must be 0x01.
+- Proven chain (commit `c805dfe`): wake → SAMConfig → tag detection (UID/SAK/ATS) →
+  ISO-DEP activation → SELECT NDEF app (SW 9000) → SELECT NDEF file (6A82 on blank tag,
+  which is correct — blanks have no NDEF file).
+
+## The module
+
+Elechouse V3 **form-factor** PN532 breakout. Clone suspected: RF command latencies run
+5–30× slower than Adafruit-class modules (see "Timing measurements"). Identification is by
+form factor and behavior; we cannot confirm genuine vs clone.
+
+Facts established empirically:
+
+- **Onboard regulator**: VCC accepts 3.3–5 V; SPI logic levels stay 3.3 V either way.
+  The module ran at 5 V for hours with zero damage — an early "3.3 V only, no regulator"
+  belief (from the Waveshare constraint) was wrong for this board.
+- **DIP switch mapping** (SET0/SET1, silkscreen "0 1", empirically confirmed):
+  - `OFF,OFF` = HSU (UART)
+  - `ON,OFF` = I2C
+  - `OFF,ON` = **SPI**
+- **Interface mode latches at power-on / RSTPDN rising edge only.** Pressing the ESP32's
+  EN button does NOT relatch. After changing DIPs, power-cycle the module.
+- **Back-feed gotcha**: with the bench wired, pulling the module's VCC jumper does NOT
+  power it off — the module back-feeds through signal lines (CS/RSTO idle HIGH through
+  input protection diodes). The power LED stays lit and no relatch happens. A valid power
+  cycle on a wired bench = pull the USB cable and **verify the module LED goes dark**.
+- Both PN532 modules in the shop were proven alive via the user's C6 HSU test code; the
+  door board's silicon was proven fine by the working soft-SPI driver on "condemned" pins.
+
+## The four stacked root causes (all software/config)
+
+The failure presented as `PN532 init failed` / `TimeoutAck` / `TimeoutResponse` storms
+starting 2026-10-10, after the module's VCC was briefly moved to 5 V. The 5 V move was a
+red herring — the timing coincidence of a broken build being flashed is what actually
+started the outage. Four independent causes, each masking the next:
+
+1. **Hardware-SPI frame delivery never worked** (esp-hal `Spi` + `pn532` crate
+   `SPIInterface` + our `DoorSpiDevice` wrapper). Symptom: STATUS byte stuck at 0x00
+   forever — the module never processed a single command frame. Never fully root-caused;
+   bypassed by bit-banging. *Caveat: the HW wrapper's CS settle/hold delays were also
+   collapsed by bug 2 below, so a hardware-SPI retry with real delays is a plausible
+   optimization — it was never retested with working delays.*
+2. **`core::hint::spin_loop()` delay loops are deleted by LLVM in release builds** — they
+   are side-effect-free hints. Every ms-scale delay (wake pulse, CS settle/hold, 1 ms
+   inter-transaction pacing, half-bit timing) silently became a no-op. STATUS polls ran at
+   ~121 kHz (~8 µs/poll) instead of ~1 kHz. A diagnostic build "fixed" init purely because
+   its serial prints accidentally supplied real milliseconds. Fix: `spin_delay()` using
+   `core::hint::black_box(i)` per iteration. **Never trust bare spin loops for timing in
+   optimized builds.**
+3. **SAMConfig's IRQ byte must be 0x01** (Adafruit sends `01 14 01`). With `use_irq_pin =
+   false` (byte 0x00), every bus command (GetGeneralStatus, SAMConfig) completed fine, but
+   the first RF command (InListPassiveTarget) ACKed and then never responded —
+   `TimeoutResponse` forever. This one byte was the difference between "RF completely
+   dead" and "reader works".
+4. **The module's RF latencies are slow and variable**: tag-present InListPassiveTarget
+   responses measured 240 ms to >3 s (cold re-activation after field release is the slow
+   part). Stock timeouts (20/200/50 ms) and even Adafruit's 1000 ms lose the race.
+   Current: poll 3000 ms, APDU 500 ms. With a tag held, roughly every other poll still
+   exceeds 3 s — a 3–5 s effective detection latency. Acceptable for a door; annoying.
+
+## Symptom → diagnosis table
+
+| Symptom | Meaning | First checks |
+|---|---|---|
+| `TimeoutAck` at init | Module never saw/processed the command frame | DIPs (SPI = 1:OFF 2:ON); true module power-cycle after DIP change; SCK/MOSI/CS wiring; VCC |
+| STATUS byte `0xFF` | MISO not driven — wrong mode, wiring, or dead input | DIPs; MISO line |
+| STATUS byte `0x00` forever | Module driving MISO but frame never processed | Frame corrupted on wire (bit order, CS timing); wake pulse missing |
+| STATUS byte `0x80` | Ready — module alive and talking | (healthy) |
+| `TimeoutResponse` (ACK ok, no response) | RF command died mid-flight | Historically: SAMConfig IRQ byte 0x00; slow RF (hold tag); if permanent on bus commands too, power-cycle module |
+| `BadAck` | Module asserted ready but the frame read back as garbage | Mid-recovery/brownout signature; power-cycle module; check supply |
+| `NDEF read error: Status(106, 130)` | SW=6A82: NDEF file not found | **Blank/unprovisioned tag** — expected when tapping unwritten NTAG 424s |
+| `PN532 init failed` but boot/WiFi/MQTT fine | Init-time only | Same as TimeoutAck row; the firmware runs without NFC rather than hanging |
+
+## Failed experiments — do NOT retry these
+
+- **"GPIO pins fried by the 5 V excursion"** — disproven. GPIO18 (ex-SCK) now reads MISO
+  correctly; GPIO19 (ex-MISO, the prime suspect) now drives RSTO fine. Hours were lost to
+  MISO remaps, full SPI repins (26/27/22/25), and SPI3 swaps. The board was never damaged.
+- **"Devkit die condemned"** — retracted twice. The elimination matrix that "proved" it
+  (2 DIP modes × 3 RSTPDN states × 2 SPI peripherals × 2 pin runs, all TimeoutAck) had a
+  constant: our firmware. The user's Ray's-C++-read-tags observation was the missing
+  control experiment. **Lesson: when a matrix says "everything is broken," suspect the one
+  thing you never varied.**
+- **"GPIO21 RSTPDN driver died LOW, holding the module in reset"** — disproven (floating
+  and 3V3-tied legs both failed identically).
+- **"RF burst brownout at 3.3 V"** — moving VCC to 5 V changed nothing (either direction).
+  The module has a regulator; RF responses were slow at both rails.
+- **`SPIInterfaceWithIrq`** (IRQ pin as readiness signal) — init times out; IRQ signaling
+  on this rig is unreliable. STATUS polling works.
+- **DIP `ON,OFF` as SPI** — that's I2C on this module family. SPI is `OFF,ON`.
+- **EN-press after DIP change as a "relatch"** — does nothing (see latching above).
+- **VCC-jumper pull as a "power cycle"** — invalid on a wired bench (back-feed).
+- **Bare `spin_loop` timing loops** — optimized out (root cause 2).
+- **Adafruit-stock 1000 ms poll timeout** — loses the race on this module ~50% of the time
+  with a tag present.
+
+## Protocol truth (Adafruit_PN532 audit, 2026-10-11)
+
+The `pn532` crate (0.5) diverges from Adafruit_PN532 in ways that matter on this rig:
+
+| Aspect | Adafruit (works) | pn532 crate | Our mitigation |
+|---|---|---|---|
+| SPI wake | CS LOW ≥2 ms, no clock, before first command | **missing** | `DoorSoftSpiDevice::wake()` (150k spin_delay ≈ 2 ms) |
+| Post-write delay | `delay(1)` after command write | none | 1 ms CS-high pacing in `transaction()` |
+| Status poll pacing | `delay(10)` between polls | tight loop | ~1–2.4 ms CS-high pacing |
+| Read dummy byte | `0xFF` | `0x00` | soft-SPI clocks `0xFF` |
+| Bit order | hardware LSB-first | software reversal via `msb-spi` feature | equivalent on wire — verified by write-spy |
+| SAMConfig data | `01 14 01` (IRQ=1) | parameterized | **must pass `use_irq_pin = true`** |
+| ACK frame | exactly `00 00 FF 00 FF 00` | same | — |
+
+Observed command bytes (write-spy, logical/unreversed): SAMConfig frame
+`00 00 FF 05 FB D4 14 01 00 01 16 00`; InListPassiveTarget `... D4 4A 01 00 ...`
+(MaxTg=1, BrTy=106 kbps Type A); InDataExchange `D4 40 <tg> <APDU>`. Response prefixes:
+`D5 15` (SAMConfig), `D5 4B` (InListPassiveTarget), `D5 41` (InDataExchange).
+
+## Timing measurements (2026-10-11 bench)
+
+- STATUS poll, unpaced (spin-collapsed build): **~8 µs** → ~121 kHz hammer.
+- STATUS poll, paced (`spin_delay(75_000)`): **~2.4 ms**.
+- ACK after any command: immediate (~1 poll).
+- Tag-present InListPassiveTarget response: **240 ms** (at 121 kHz polling) to
+  **~890 ms** (at 2.4 ms pacing), sometimes >3 s. No-tag response: well under 1 s.
+- APDU (InDataExchange) once target activated: 1–2 polls.
+- DHCP on the bench SSID: 20–85 s (multiple retries) — eats serial capture windows;
+  MQTT-gate any tap captures (see `scripts/bench-flash.sh`).
+
+### Optimization leads (deliberately not done yet)
+
+- **Poll rate vs module response speed**: the tag response arrived in ~240 ms under 8 µs
+  polling but ~890 ms under 2.4 ms polling — as if the clone's firmware progresses its RF
+  state machine on SPI activity. If real, there's a pacing sweet spot (try 100–500 µs)
+  that halves detection latency. Measure, don't guess.
+- **`spin_delay` calibration**: iteration cost is assumed ~2–4 cycles; a cycle-counter
+  measurement (or GPIO+scope) would make the constants exact.
+- **Hardware SPI retry** with real (black_box) settle/hold delays + wake pulse — root
+  cause 1 was never isolated, and its delays were collapsed by bug 2 at the time.
+- Timeout tuning once the above are done: 3000 ms poll → 1500 ms if pacing improves.
+
+## Debug tooling: the `nfc-spy` feature
+
+The wire-level spy from the debug session is kept behind a cargo feature:
+
+```bash
+# bench build with spy (write frames, STATUS transitions, response dumps, poll heartbeat)
+KEYGATE_CHIP=esp32 ./run-in-rust-container.sh cargo build --release \
+    --no-default-features --features chip-esp32,board-esp32-devkit-door,nfc-spy
+
+# production build (spy compiled out)
+KEYGATE_CHIP=esp32 ./run-in-rust-container.sh cargo build --release
+```
+
+Spy output (all bounded; boot banner shows `SPY` when enabled):
+
+- `[softspi] write[N] … / unreversed:` — outgoing frame bytes, wire + logical order.
+- `[softspi] status poll #N -> 0xXX` — STATUS transitions (0x00/0x80/0xFF semantics above).
+- `[softspi] frame rd (N B) …` — ACK/response frames fetched via DATAREAD.
+- `[nfc] poll #N nbtg=0` — poll heartbeat (loop-alive proof; `nbtg=1` paths print `auth:`).
+
+Cost when enabled: bounded print volume only (counters cap at 400 writes / 400
+transitions / 80 frames / 100 heartbeats). When disabled: all spy code is `cfg`'d out —
+zero runtime cost, small flash cost for the feature plumbing. Downside of keeping it:
+none observed; just don't ship a spy build to a door (the banner tells you).
+
+## Flashing & capture workflow
+
+See `scripts/bench-flash.sh` and the "Interactive Bench Flash" section of the README:
+zenity-gated, stub mode + 57600 baud, BOOT dance AFTER "Connecting..." appears
+(hold BOOT → tap EN → hold ~5 s → release), raw `cat` capture (espflash monitor hangs on
+this CH340), 20–30 s capture windows, MQTT-gated tap captures.
+
+## Open items
+
+- Revert bench pins to the documented pinout (18/23/19/5/21) and re-verify — pins are
+  proven good; only the soft-SPI driver has never run on that wiring.
+- Full F3 drill needs a provisioned NTAG 424 (SUN written via the verifier) and refreshed
+  EMQX credentials — blanks correctly stop at SW 6A82.
+- Determine which physical module is on the door (the C6's module was borrowed during
+  testing and may not have been returned).
