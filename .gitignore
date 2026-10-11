@@ -6,3 +6,5 @@ start-shell.sh
 rustup/
 cargo/
 .env
+.env.*
+!.env.sample
