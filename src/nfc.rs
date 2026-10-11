@@ -146,10 +146,11 @@ pub fn soft_reinit<I: pn532::Interface>(
     // Configure SAM (Security Access Module) to normal mode.
     // PN532 SAMConfiguration typical response latency is <2ms; 20ms timeout is generous
     // while bounding worst-case unready spin duration.
-    // `use_irq_pin = false` because readiness is STATUS-polled over SPI (crate notes
-    // the flag appears to have no effect anyway).
+    // `use_irq_pin = true` matches Adafruit's SAMConfig byte (0x01). Readiness is still
+    // STATUS-polled over SPI; the byte only configures P70_IRQ signaling, but some
+    // module firmwares treat 0x00 as a reduced mode.
     pn.process(
-        &Request::sam_configuration(SAMMode::Normal, false),
+        &Request::sam_configuration(SAMMode::Normal, true),
         0,
         fugit::MillisDurationU32::from_ticks(500),
     )

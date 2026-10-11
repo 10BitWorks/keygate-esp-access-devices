@@ -74,7 +74,11 @@ pub struct DoorSoftSpiDevice {
     miso: esp_hal::gpio::Input<'static>,
     cs: esp_hal::gpio::Output<'static>,
     status_poll_count: u32,
+    status_print_count: u32,
+    last_status: Option<u8>,
     write_count: u32,
+    read_dump_count: u32,
+    frame_read_pending: bool,
 }
 
 #[cfg(feature = "board-esp32-devkit-door")]
@@ -91,7 +95,11 @@ impl DoorSoftSpiDevice {
             miso,
             cs,
             status_poll_count: 0,
+            status_print_count: 0,
+            last_status: None,
             write_count: 0,
+            read_dump_count: 0,
+            frame_read_pending: false,
         }
     }
 
@@ -186,9 +194,26 @@ impl SpiDevice for DoorSoftSpiDevice {
                     for byte in words.iter_mut() {
                         *byte = self.transfer_byte(0xFF);
                     }
+                    // Frame spy: dump the ACK/response frames fetched via DATAREAD
+                    // (crate sends Write([0xC0]) immediately before the Read op).
+                    // 12 dumps cover init exchanges plus several poll commands.
+                    if self.frame_read_pending && self.read_dump_count < 12 {
+                        self.frame_read_pending = false;
+                        esp_println::print!("[softspi] frame rd ({} B) wire: ", words.len());
+                        for b in words.iter().take(40) {
+                            esp_println::print!("{:02X} ", b);
+                        }
+                        esp_println::println!("");
+                        esp_println::print!("[softspi] frame logical: ");
+                        for b in words.iter().take(40) {
+                            esp_println::print!("{:02X} ", b.reverse_bits());
+                        }
+                        esp_println::println!("");
+                        self.read_dump_count += 1;
+                    }
                 }
                 Operation::Write(words) => {
-                    if self.write_count < 4 {
+                    if self.write_count < 24 {
                         esp_println::print!("[softspi] write[{}]: ", words.len());
                         for b in words.iter().take(32) {
                             esp_println::print!("{:02X} ", b);
@@ -200,6 +225,10 @@ impl SpiDevice for DoorSoftSpiDevice {
                         }
                         esp_println::println!("");
                         self.write_count += 1;
+                    }
+                    // DATAREAD selector (wire 0xC0) marks the next Read op as a frame fetch.
+                    if words.len() == 1 && words[0] == 0xC0 {
+                        self.frame_read_pending = true;
                     }
                     for &byte in words.iter() {
                         self.write_byte(byte);
@@ -225,17 +254,21 @@ impl SpiDevice for DoorSoftSpiDevice {
                     for byte in words.iter_mut() {
                         *byte = self.transfer_byte(*byte);
                     }
-                    // Status-poll spy: prints raw STATUS bytes returned by PN532.
+                    // Status spy: logs every STATUS VALUE CHANGE (bounded), not every poll.
+                    // Reveals the ready-timeline during long RF commands — e.g. whether
+                    // the module ever flips to ready (0x80) inside InListPassiveTarget's
+                    // 1000 ms window, flips back, or asserts garbage (BadAck hunting).
                     // 0x40 = as_lsb(0x02) = PN532_SPI_STATREAD under msb-spi pre-reversal.
-                    // Spy semantics: 0xFF = module not driving MISO (mode/wiring/input-pin),
-                    // 0x80 = ready (module talking), 0x00 = driving but not ready.
-                    // Bound to first 8 polls only to avoid console flood.
-                    if is_status_read && self.status_poll_count < 8 {
-                        esp_println::println!(
-                            "[softspi] status[{}] = 0x{:02X}",
-                            self.status_poll_count,
-                            words[1]
-                        );
+                    if is_status_read {
+                        if self.status_print_count < 40 && self.last_status != Some(words[1]) {
+                            esp_println::println!(
+                                "[softspi] status poll #{} -> 0x{:02X}",
+                                self.status_poll_count,
+                                words[1]
+                            );
+                            self.last_status = Some(words[1]);
+                            self.status_print_count += 1;
+                        }
                         self.status_poll_count += 1;
                     }
                 }
@@ -422,7 +455,7 @@ pub fn setup(peripherals: esp_hal::peripherals::Peripherals) -> Setup<DoorNfcIfa
     platform::start_rtos(timg0.timer0, sw_interrupt.software_interrupt0);
 
     println!("ESP32 door node starting...");
-    println!("door build: pn532 soft-SPI write-spy (sck5 mosi22 miso18 cs17)");
+    println!("door build: pn532 soft-SPI full-spy irq-sam (sck5 mosi22 miso18 cs17)");
 
     // 4. Spawn the status LED (GPIO2 onboard, active-low) and relay (GPIO13) tasks.
     //    GPIO13 chosen to avoid GPIO12/MTDI strapping pin issues.
