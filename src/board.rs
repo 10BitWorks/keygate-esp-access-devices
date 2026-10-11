@@ -3,12 +3,12 @@
 //! Encapsulates board-level differences (e.g. XIAO ESP32-C6 vs classic ESP32 devkit door)
 //! so the core orchestration in `main.rs` and node logic remain board-agnostic.
 
+use esp_hal::gpio::{Level, Output, OutputConfig};
+#[cfg(feature = "board-xiao-c6")]
 use esp_hal::{
-    gpio::{Level, Output, OutputConfig},
+    i2c::master::{Config as I2cConfig, I2c},
     time::Rate,
 };
-#[cfg(feature = "board-xiao-c6")]
-use esp_hal::i2c::master::{Config as I2cConfig, I2c};
 use esp_println::println;
 use pn532::Pn532;
 
@@ -17,6 +17,9 @@ use embedded_hal::digital::OutputPin;
 #[cfg(feature = "board-esp32-devkit-door")]
 use embedded_hal::spi::{ErrorType, Operation, SpiBus, SpiDevice};
 #[cfg(feature = "board-esp32-devkit-door")]
+use esp_hal::gpio::{Input, InputConfig, Pull};
+#[cfg(feature = "board-esp32-devkit-door")]
+#[allow(unused_imports)]
 use esp_hal::{
     spi::master::{Config as SpiConfig, Spi},
     spi::Mode,
@@ -43,13 +46,170 @@ pub type I2cBus = esp_hal::i2c::master::I2c<'static, esp_hal::Blocking>;
 #[cfg(feature = "board-xiao-c6")]
 pub type XiaoNfcIface = pn532::i2c::I2CInterface<I2cBus>;
 
+/// Bit-banged software SPI device for the door PN532.
+///
+/// Bypasses the esp-hal hardware SPI peripheral by directly driving SCK, MOSI, and CS
+/// as output GPIOs and sampling MISO as an input GPIO.
+///
+/// Bit-bangs SPI Mode 0 (CPOL=0, CPHA=0):
+/// - SCK idles low.
+/// - MOSI is driven while SCK is low, then SCK is pulsed high.
+/// - MISO is sampled while SCK is high.
+/// - Inter-bit half-period delay is ~1 µs (≈240 spins at 240 MHz CPU, ~2 µs full period).
+///   With function calls and loop overhead, effective clock is ~100 kHz.
+///   Math: a 35-byte frame is 280 bits ≈ 3 ms transmission time, well within the 200 ms poll cadence.
+///
+/// CRITICAL bit-order note:
+/// The PN532 communicates LSB-first over the SPI wire. However, the `pn532` crate's `msb-spi`
+/// feature reverses frame bytes BEFORE passing them to `write()`, and pre-reverses the
+/// STATREAD/DATAWRITE/DATAREAD header constants (e.g. PN532_SPI_READY). Therefore, this soft
+/// device must clock each byte MSB-first, exactly like a hardware MSB-first SPI controller.
+/// Do NOT add any extra bit reversal here. In `wait_ready`, `buf[1] == PN532_SPI_READY` expects
+/// the status byte to arrive already-reversed by MSB-first clocking of the PN532's LSB-first
+/// wire stream, matching the pre-reversed constant.
 #[cfg(feature = "board-esp32-devkit-door")]
+pub struct DoorSoftSpiDevice {
+    sck: esp_hal::gpio::Output<'static>,
+    mosi: esp_hal::gpio::Output<'static>,
+    miso: esp_hal::gpio::Input<'static>,
+    cs: esp_hal::gpio::Output<'static>,
+}
+
+#[cfg(feature = "board-esp32-devkit-door")]
+impl DoorSoftSpiDevice {
+    pub fn new(
+        sck: esp_hal::gpio::Output<'static>,
+        mosi: esp_hal::gpio::Output<'static>,
+        miso: esp_hal::gpio::Input<'static>,
+        cs: esp_hal::gpio::Output<'static>,
+    ) -> Self {
+        Self { sck, mosi, miso, cs }
+    }
+
+    #[inline(always)]
+    fn write_byte(&mut self, mut byte: u8) {
+        for _ in 0..8 {
+            if (byte & 0x80) != 0 {
+                let _ = self.mosi.set_high();
+            } else {
+                let _ = self.mosi.set_low();
+            }
+            byte <<= 1;
+            // Half-period delay: ~1 µs at 240 MHz (240 spins).
+            for _ in 0..240 {
+                core::hint::spin_loop();
+            }
+            let _ = self.sck.set_high();
+            // Half-period delay: ~1 µs at 240 MHz (240 spins).
+            for _ in 0..240 {
+                core::hint::spin_loop();
+            }
+            let _ = self.sck.set_low();
+        }
+    }
+
+    #[inline(always)]
+    fn transfer_byte(&mut self, mut write_byte: u8) -> u8 {
+        let mut read_byte = 0u8;
+        for _ in 0..8 {
+            if (write_byte & 0x80) != 0 {
+                let _ = self.mosi.set_high();
+            } else {
+                let _ = self.mosi.set_low();
+            }
+            write_byte <<= 1;
+            // Half-period delay: ~1 µs at 240 MHz (240 spins).
+            for _ in 0..240 {
+                core::hint::spin_loop();
+            }
+            let _ = self.sck.set_high();
+            read_byte <<= 1;
+            if self.miso.is_high() {
+                read_byte |= 1;
+            }
+            // Half-period delay: ~1 µs at 240 MHz (240 spins).
+            for _ in 0..240 {
+                core::hint::spin_loop();
+            }
+            let _ = self.sck.set_low();
+        }
+        read_byte
+    }
+}
+
+#[cfg(feature = "board-esp32-devkit-door")]
+impl ErrorType for DoorSoftSpiDevice {
+    type Error = core::convert::Infallible;
+}
+
+#[cfg(feature = "board-esp32-devkit-door")]
+impl SpiDevice for DoorSoftSpiDevice {
+    fn transaction(&mut self, operations: &mut [Operation<'_, u8>]) -> Result<(), Self::Error> {
+        let _ = self.cs.set_low();
+        // CS settle delay: ~2 µs at 240 MHz (≈480 spin iterations).
+        for _ in 0..480 {
+            core::hint::spin_loop();
+        }
+
+        for op in operations {
+            match op {
+                Operation::Read(words) => {
+                    for byte in words.iter_mut() {
+                        *byte = self.transfer_byte(0x00);
+                    }
+                }
+                Operation::Write(words) => {
+                    for &byte in words.iter() {
+                        self.write_byte(byte);
+                    }
+                }
+                Operation::Transfer(read, write) => {
+                    let len = read.len().min(write.len());
+                    for i in 0..len {
+                        read[i] = self.transfer_byte(write[i]);
+                    }
+                    if write.len() > len {
+                        for &b in &write[len..] {
+                            self.write_byte(b);
+                        }
+                    } else if read.len() > len {
+                        for b in &mut read[len..] {
+                            *b = self.transfer_byte(0x00);
+                        }
+                    }
+                }
+                Operation::TransferInPlace(words) => {
+                    for byte in words.iter_mut() {
+                        *byte = self.transfer_byte(*byte);
+                    }
+                }
+                Operation::DelayNs(ns) => {
+                    // Approximate ~0.24 cycles/ns at 240 MHz (~ns / 4 spin iterations).
+                    for _ in 0..(*ns / 4) {
+                        core::hint::spin_loop();
+                    }
+                }
+            }
+        }
+
+        // CS hold delay: ~2 µs at 240 MHz (≈480 spin iterations) before CS de-assertion.
+        for _ in 0..480 {
+            core::hint::spin_loop();
+        }
+        let _ = self.cs.set_high();
+        Ok(())
+    }
+}
+
+#[cfg(feature = "board-esp32-devkit-door")]
+#[allow(dead_code)]
 pub struct DoorSpiDevice<BUS, CS> {
     bus: BUS,
     cs: CS,
 }
 
 #[cfg(feature = "board-esp32-devkit-door")]
+#[allow(dead_code)]
 impl<BUS, CS> DoorSpiDevice<BUS, CS> {
     pub fn new(bus: BUS, cs: CS) -> Self {
         Self { bus, cs }
@@ -57,6 +217,7 @@ impl<BUS, CS> DoorSpiDevice<BUS, CS> {
 }
 
 #[cfg(feature = "board-esp32-devkit-door")]
+#[allow(dead_code)]
 impl<BUS: ErrorType, CS: OutputPin> ErrorType for DoorSpiDevice<BUS, CS> {
     type Error = BUS::Error;
 }
@@ -67,6 +228,7 @@ impl<BUS: ErrorType, CS: OutputPin> ErrorType for DoorSpiDevice<BUS, CS> {
 // issue #21; ESP-IDF pn532-spi-idf documentation).
 // Classic ESP32 CPU runs at 240 MHz (~240 cycles/µs). ~2400 spin iterations yields ~10 µs.
 #[cfg(feature = "board-esp32-devkit-door")]
+#[allow(dead_code)]
 impl<BUS: SpiBus, CS: OutputPin> SpiDevice for DoorSpiDevice<BUS, CS> {
     fn transaction(&mut self, operations: &mut [Operation<'_, u8>]) -> Result<(), Self::Error> {
         let _ = self.cs.set_low();
@@ -120,11 +282,13 @@ impl<BUS: SpiBus, CS: OutputPin> SpiDevice for DoorSpiDevice<BUS, CS> {
 }
 
 #[cfg(feature = "board-esp32-devkit-door")]
+#[allow(dead_code)]
 pub type Esp32SpiBus = esp_hal::spi::master::Spi<'static, esp_hal::Blocking>;
 #[cfg(feature = "board-esp32-devkit-door")]
+#[allow(dead_code)]
 pub type DoorSpiDeviceImpl = DoorSpiDevice<Esp32SpiBus, esp_hal::gpio::Output<'static>>;
 #[cfg(feature = "board-esp32-devkit-door")]
-pub type DoorNfcIface = pn532::spi::SPIInterface<DoorSpiDeviceImpl>;
+pub type DoorNfcIface = pn532::spi::SPIInterface<DoorSoftSpiDevice>;
 
 #[cfg(feature = "board-xiao-c6")]
 pub fn setup(peripherals: esp_hal::peripherals::Peripherals) -> Setup<XiaoNfcIface> {
@@ -193,7 +357,7 @@ pub fn setup(peripherals: esp_hal::peripherals::Peripherals) -> Setup<DoorNfcIfa
     platform::start_rtos(timg0.timer0, sw_interrupt.software_interrupt0);
 
     println!("ESP32 door node starting...");
-    println!("door build: pn532 SPI STATUS-poll (doc pins, cs-delay)");
+    println!("door build: pn532 SPI soft-bitbang (doc pins, msb-spi)");
 
     // 4. Spawn the status LED (GPIO2 onboard, active-low) and relay (GPIO13) tasks.
     //    GPIO13 chosen to avoid GPIO12/MTDI strapping pin issues.
@@ -211,24 +375,18 @@ pub fn setup(peripherals: esp_hal::peripherals::Peripherals) -> Setup<DoorNfcIfa
     let rng = esp_hal::rng::Rng::new();
     let net_parts = platform::net(peripherals.WIFI, rng);
 
-    // 7. Initialize SPI master and device for PN532.
-    //    Documented door pinout (SPI2/VSPI): SCK=GPIO18, MOSI=GPIO23, MISO=GPIO19, CS=GPIO5,
+    // 7. Initialize bit-banged software SPI device for PN532.
+    //    Documented door pinout: SCK=GPIO18, MOSI=GPIO23, MISO=GPIO19, CS=GPIO5,
     //    IRQ=GPIO4 (unused), RSTO=GPIO21, relay=GPIO13, LED=GPIO2.
-    //    2026-10-11: prior devkit's die condemned after 5V excursion — SPI dead on both peripherals with fresh pins; this pinout targets the replacement board.
-    //    Conservative 1 MHz clock, Mode 0.
-    let spi = Spi::new(
-        peripherals.SPI2,
-        SpiConfig::default()
-            .with_frequency(Rate::from_khz(1000))
-            .with_mode(Mode::_0),
-    )
-    .unwrap()
-    .with_sck(peripherals.GPIO18)
-    .with_mosi(peripherals.GPIO23)
-    .with_miso(peripherals.GPIO19);
-
+    //    Bit-banged Mode 0 over plain GPIOs with ~100 kHz effective clock.
+    let sck = Output::new(peripherals.GPIO18, Level::Low, OutputConfig::default());
+    let mosi = Output::new(peripherals.GPIO23, Level::Low, OutputConfig::default());
+    let miso = Input::new(
+        peripherals.GPIO19,
+        InputConfig::default().with_pull(Pull::Up),
+    );
     let cs = Output::new(peripherals.GPIO5, Level::High, OutputConfig::default());
-    let spi_device = DoorSpiDevice::new(spi, cs);
+    let spi_device = DoorSoftSpiDevice::new(sck, mosi, miso, cs);
 
     // IRQ (GPIO4) intentionally unused: readiness is STATUS-polled over MISO.
     // IRQ-driven interface made init depend solely on the IRQ line and timed out at boot.
