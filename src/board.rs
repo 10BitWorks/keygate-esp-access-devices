@@ -61,10 +61,19 @@ impl<BUS: ErrorType, CS: OutputPin> ErrorType for DoorSpiDevice<BUS, CS> {
     type Error = BUS::Error;
 }
 
+// PN532 requires a CS-to-SCK settle delay after asserting CS low before the first
+// clock edge, as well as hold time before releasing CS. Without this delay, the PN532
+// drops the frame's first byte or responds with garbage/TimeoutAck (WMT-GmbH/pn532
+// issue #21; ESP-IDF pn532-spi-idf documentation).
+// Classic ESP32 CPU runs at 240 MHz (~240 cycles/µs). ~2400 spin iterations yields ~10 µs.
 #[cfg(feature = "board-esp32-devkit-door")]
 impl<BUS: SpiBus, CS: OutputPin> SpiDevice for DoorSpiDevice<BUS, CS> {
     fn transaction(&mut self, operations: &mut [Operation<'_, u8>]) -> Result<(), Self::Error> {
         let _ = self.cs.set_low();
+        // CS settle delay: ~10 µs at 240 MHz (240 cycles/µs * 10 µs = 2400 spins).
+        for _ in 0..2400 {
+            core::hint::spin_loop();
+        }
         let mut res = Ok(());
         for op in operations {
             match op {
@@ -92,10 +101,19 @@ impl<BUS: SpiBus, CS: OutputPin> SpiDevice for DoorSpiDevice<BUS, CS> {
                         break;
                     }
                 }
-                Operation::DelayNs(_) => {}
+                Operation::DelayNs(ns) => {
+                    // Approximate ~0.24 cycles/ns at 240 MHz (~ns / 4 spin iterations).
+                    for _ in 0..(*ns / 4) {
+                        core::hint::spin_loop();
+                    }
+                }
             }
         }
         let _ = self.bus.flush();
+        // CS hold delay: ~10 µs at 240 MHz before CS de-assertion.
+        for _ in 0..2400 {
+            core::hint::spin_loop();
+        }
         let _ = self.cs.set_high();
         res
     }
@@ -175,7 +193,7 @@ pub fn setup(peripherals: esp_hal::peripherals::Peripherals) -> Setup<DoorNfcIfa
     platform::start_rtos(timg0.timer0, sw_interrupt.software_interrupt0);
 
     println!("ESP32 door node starting...");
-    println!("door build: pn532 SPI STATUS-poll (doc pins sck18 mosi23 miso19 cs5)");
+    println!("door build: pn532 SPI STATUS-poll (doc pins, cs-delay)");
 
     // 4. Spawn the status LED (GPIO2 onboard, active-low) and relay (GPIO13) tasks.
     //    GPIO13 chosen to avoid GPIO12/MTDI strapping pin issues.
