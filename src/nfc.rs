@@ -176,13 +176,14 @@ pub fn poll_tag<I: pn532::Interface, T: CountDown<Time = fugit::MillisDurationU3
 ) -> Result<Option<TagInfo>, NfcError> {
     // INLIST_ONE_ISO_A_TARGET: poll for 1 target at 106 kbps Type A.
     // When no tag is in the RF field, PN532 responds with NbTg=0 after its internal scan.
-    // 1000ms matches Adafruit's readPassiveTargetID timeout: RF field ramp-up plus the
-    // passive-activation scan can exceed 200ms on cold modules or sagging supply rails.
+    // 3000ms: measured tag-present responses on this module run 240-900 ms
+    // (RF scan + ISO-DEP activation), highly variable. 1000ms lost the race
+    // roughly half the time; 3 s gives decisive margin.
     let res = pn532
         .process(
             &Request::INLIST_ONE_ISO_A_TARGET,
             20,
-            fugit::MillisDurationU32::from_ticks(1000),
+            fugit::MillisDurationU32::from_ticks(3000),
         )
         .map_err(|e| {
             #[cfg(target_arch = "xtensa")]
@@ -256,9 +257,10 @@ pub fn in_data_exchange<'a, I: pn532::Interface, T: CountDown<Time = fugit::Mill
 
     // PN532 buffer constraint: N - 9 >= max(response_len, M).
     // With N=300, max response_len can safely be up to 265 bytes (265 + 9 = 274 <= 300).
-    // ISO-DEP card operations on NTAG 424 can take 10-30ms; 50ms timeout is safe and bounded.
+    // ISO-DEP card operations on NTAG 424 measured 1-2 status polls once the target
+    // is activated, but this module's RF latencies run high — 500ms bounds worst case.
     let resp = pn532
-        .process(req, 265, fugit::MillisDurationU32::from_ticks(50))
+        .process(req, 265, fugit::MillisDurationU32::from_ticks(500))
         .map_err(|e| match e {
             pn532::Error::TimeoutAck | pn532::Error::TimeoutResponse => NfcError::Timeout,
             _ => NfcError::Pn532,
