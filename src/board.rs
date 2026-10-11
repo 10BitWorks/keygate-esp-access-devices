@@ -175,7 +175,7 @@ pub fn setup(peripherals: esp_hal::peripherals::Peripherals) -> Setup<DoorNfcIfa
     platform::start_rtos(timg0.timer0, sw_interrupt.software_interrupt0);
 
     println!("ESP32 door node starting...");
-    println!("door build: pn532 SPI3 STATUS-poll (sck26 mosi27 cs22 miso25)");
+    println!("door build: pn532 SPI STATUS-poll (doc pins sck18 mosi23 miso19 cs5)");
 
     // 4. Spawn the status LED (GPIO2 onboard, active-low) and relay (GPIO13) tasks.
     //    GPIO13 chosen to avoid GPIO12/MTDI strapping pin issues.
@@ -194,21 +194,22 @@ pub fn setup(peripherals: esp_hal::peripherals::Peripherals) -> Setup<DoorNfcIfa
     let net_parts = platform::net(peripherals.WIFI, rng);
 
     // 7. Initialize SPI master and device for PN532.
-    //    Door pinout: SCK=GPIO26, MOSI=GPIO27, MISO=GPIO25, CS=GPIO22 (GPIO18/23/5 abandoned — 5V-excursion damage suspects).
-    //    Driven by SPI3/HSPI — SPI2/VSPI condemned after 5 V excursion on GPIO19 (its default MISO pad).
+    //    Documented door pinout (SPI2/VSPI): SCK=GPIO18, MOSI=GPIO23, MISO=GPIO19, CS=GPIO5,
+    //    IRQ=GPIO4 (unused), RSTO=GPIO21, relay=GPIO13, LED=GPIO2.
+    //    2026-10-11: prior devkit's die condemned after 5V excursion — SPI dead on both peripherals with fresh pins; this pinout targets the replacement board.
     //    Conservative 1 MHz clock, Mode 0.
     let spi = Spi::new(
-        peripherals.SPI3,
+        peripherals.SPI2,
         SpiConfig::default()
             .with_frequency(Rate::from_khz(1000))
             .with_mode(Mode::_0),
     )
     .unwrap()
-    .with_sck(peripherals.GPIO26)
-    .with_mosi(peripherals.GPIO27)
-    .with_miso(peripherals.GPIO25);
+    .with_sck(peripherals.GPIO18)
+    .with_mosi(peripherals.GPIO23)
+    .with_miso(peripherals.GPIO19);
 
-    let cs = Output::new(peripherals.GPIO22, Level::High, OutputConfig::default());
+    let cs = Output::new(peripherals.GPIO5, Level::High, OutputConfig::default());
     let spi_device = DoorSpiDevice::new(spi, cs);
 
     // IRQ (GPIO4) intentionally unused: readiness is STATUS-polled over MISO.
