@@ -93,6 +93,24 @@ impl DoorSoftSpiDevice {
         }
     }
 
+    /// Wake the PN532 core from LowVbat/Standby mode via SPI.
+    ///
+    /// Per PN532 User Manual §7.1.1, waking the 80C51 core over SPI requires NSS/CS
+    /// held LOW for ≥1 ms with no clocking (Adafruit_PN532::wakeup uses 2 ms).
+    /// The `pn532` crate lacks this wakeup sequence, leaving the sleeping core unable
+    /// to ACK commands while the SPI front-end answers STATUS polls with 0x00 forever.
+    ///
+    /// Timing math:
+    /// Classic ESP32 CPU runs at 240 MHz (240 cycles/µs).
+    /// 2,000 µs × 240 cycles/µs = 480,000 spin iterations (~1 cycle per spin loop iteration).
+    pub fn wake(&mut self) {
+        let _ = self.cs.set_low();
+        for _ in 0..480_000 {
+            core::hint::spin_loop();
+        }
+        let _ = self.cs.set_high();
+    }
+
     #[inline(always)]
     fn write_byte(&mut self, mut byte: u8) {
         for _ in 0..8 {
@@ -161,8 +179,10 @@ impl SpiDevice for DoorSoftSpiDevice {
         for op in operations {
             match op {
                 Operation::Read(words) => {
+                    // Clock out 0xFF read dummy byte per Adafruit convention;
+                    // some PN532 revisions treat MOSI-low read dummies as false frame starts.
                     for byte in words.iter_mut() {
-                        *byte = self.transfer_byte(0x00);
+                        *byte = self.transfer_byte(0xFF);
                     }
                 }
                 Operation::Write(words) => {
@@ -378,7 +398,7 @@ pub fn setup(peripherals: esp_hal::peripherals::Peripherals) -> Setup<DoorNfcIfa
     platform::start_rtos(timg0.timer0, sw_interrupt.software_interrupt0);
 
     println!("ESP32 door node starting...");
-    println!("door build: pn532 SPI soft-bitbang (sck5 mosi22 miso18 cs17 rsto19, msb-spi)");
+    println!("door build: pn532 soft-SPI wake2ms (sck5 mosi22 miso18 cs17)");
 
     // 4. Spawn the status LED (GPIO2 onboard, active-low) and relay (GPIO13) tasks.
     //    GPIO13 chosen to avoid GPIO12/MTDI strapping pin issues.
@@ -412,7 +432,11 @@ pub fn setup(peripherals: esp_hal::peripherals::Peripherals) -> Setup<DoorNfcIfa
         InputConfig::default().with_pull(Pull::Up),
     );
     let cs = Output::new(peripherals.GPIO17, Level::High, OutputConfig::default());
-    let spi_device = DoorSoftSpiDevice::new(sck, mosi, miso, cs);
+    let mut spi_device = DoorSoftSpiDevice::new(sck, mosi, miso, cs);
+
+    // Mirrors Adafruit begin() = reset -> delay -> wakeup -> SAMConfig.
+    // Wake the PN532 core from low-power standby before wrapping spi_device in SPIInterface.
+    spi_device.wake();
 
     // IRQ (GPIO4) intentionally unused: readiness is STATUS-polled over MISO.
     // IRQ-driven interface made init depend solely on the IRQ line and timed out at boot.
