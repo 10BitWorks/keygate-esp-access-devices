@@ -73,6 +73,7 @@ pub struct DoorSoftSpiDevice {
     mosi: esp_hal::gpio::Output<'static>,
     miso: esp_hal::gpio::Input<'static>,
     cs: esp_hal::gpio::Output<'static>,
+    status_poll_count: u32,
 }
 
 #[cfg(feature = "board-esp32-devkit-door")]
@@ -83,7 +84,13 @@ impl DoorSoftSpiDevice {
         miso: esp_hal::gpio::Input<'static>,
         cs: esp_hal::gpio::Output<'static>,
     ) -> Self {
-        Self { sck, mosi, miso, cs }
+        Self {
+            sck,
+            mosi,
+            miso,
+            cs,
+            status_poll_count: 0,
+        }
     }
 
     #[inline(always)]
@@ -179,8 +186,22 @@ impl SpiDevice for DoorSoftSpiDevice {
                     }
                 }
                 Operation::TransferInPlace(words) => {
+                    let is_status_read = words.len() == 2 && words[0] == 0x40;
                     for byte in words.iter_mut() {
                         *byte = self.transfer_byte(*byte);
+                    }
+                    // Status-poll spy: prints raw STATUS bytes returned by PN532.
+                    // 0x40 = as_lsb(0x02) = PN532_SPI_STATREAD under msb-spi pre-reversal.
+                    // Spy semantics: 0xFF = module not driving MISO (mode/wiring/input-pin),
+                    // 0x80 = ready (module talking), 0x00 = driving but not ready.
+                    // Bound to first 8 polls only to avoid console flood.
+                    if is_status_read && self.status_poll_count < 8 {
+                        esp_println::println!(
+                            "[softspi] status[{}] = 0x{:02X}",
+                            self.status_poll_count,
+                            words[1]
+                        );
+                        self.status_poll_count += 1;
                     }
                 }
                 Operation::DelayNs(ns) => {
@@ -357,17 +378,18 @@ pub fn setup(peripherals: esp_hal::peripherals::Peripherals) -> Setup<DoorNfcIfa
     platform::start_rtos(timg0.timer0, sw_interrupt.software_interrupt0);
 
     println!("ESP32 door node starting...");
-    println!("door build: pn532 SPI soft-bitbang (doc pins, msb-spi)");
+    println!("door build: pn532 SPI soft-bitbang (fresh sck33 mosi25 miso32 cs26, msb-spi)");
 
     // 4. Spawn the status LED (GPIO2 onboard, active-low) and relay (GPIO13) tasks.
     //    GPIO13 chosen to avoid GPIO12/MTDI strapping pin issues.
     let led_pin = Output::new(peripherals.GPIO2, Level::High, OutputConfig::default());
     let relay_pin = Output::new(peripherals.GPIO13, Level::High, OutputConfig::default());
 
-    // Hardware reset pin RSTO (GPIO21) wired to PN532 RSTPDN.
+    // Hardware reset pin RSTO moved to GPIO14 (virgin pin, previously GPIO21).
     // RSTPDN is active-low; hold high to keep PN532 out of reset.
+    // User may leave it unwired on bench — driving high is harmless.
     // Returned in Setup.reader_reset for remote lockup recovery in supervisor.
-    let rsto = Output::new(peripherals.GPIO21, Level::High, OutputConfig::default());
+    let rsto = Output::new(peripherals.GPIO14, Level::High, OutputConfig::default());
     let reader_reset = Some(rsto);
 
     // 5 & 6. Initialize Wi-Fi and network stack via platform helpers.
@@ -376,16 +398,17 @@ pub fn setup(peripherals: esp_hal::peripherals::Peripherals) -> Setup<DoorNfcIfa
     let net_parts = platform::net(peripherals.WIFI, rng);
 
     // 7. Initialize bit-banged software SPI device for PN532.
-    //    Documented door pinout: SCK=GPIO18, MOSI=GPIO23, MISO=GPIO19, CS=GPIO5,
-    //    IRQ=GPIO4 (unused), RSTO=GPIO21, relay=GPIO13, LED=GPIO2.
+    //    Fresh pin run (D32/33/25/26 + D14) on the opposite side of devkit:
+    //    SCK=GPIO33, MOSI=GPIO25, MISO=GPIO32, CS=GPIO26, RSTO=GPIO14.
+    //    GPIO19's input buffer remains the prime suspect for damage during the 5V excursion.
     //    Bit-banged Mode 0 over plain GPIOs with ~100 kHz effective clock.
-    let sck = Output::new(peripherals.GPIO18, Level::Low, OutputConfig::default());
-    let mosi = Output::new(peripherals.GPIO23, Level::Low, OutputConfig::default());
+    let sck = Output::new(peripherals.GPIO33, Level::Low, OutputConfig::default());
+    let mosi = Output::new(peripherals.GPIO25, Level::Low, OutputConfig::default());
     let miso = Input::new(
-        peripherals.GPIO19,
+        peripherals.GPIO32,
         InputConfig::default().with_pull(Pull::Up),
     );
-    let cs = Output::new(peripherals.GPIO5, Level::High, OutputConfig::default());
+    let cs = Output::new(peripherals.GPIO26, Level::High, OutputConfig::default());
     let spi_device = DoorSoftSpiDevice::new(sck, mosi, miso, cs);
 
     // IRQ (GPIO4) intentionally unused: readiness is STATUS-polled over MISO.
