@@ -42,7 +42,6 @@ jobs:
       WIFI_PASS: ci
       MQTT_USER: ci
       MQTT_PASSWORD: ci
-      RUSTUP_TOOLCHAIN: esp
     steps:
       - uses: actions/checkout@v4
       - name: Install espup
@@ -50,6 +49,8 @@ jobs:
       - name: Install esp toolchain for ESP32
         run: espup install --targets esp32
       - name: Build classic ESP32 door firmware
+        env:
+          RUSTUP_TOOLCHAIN: esp
         run: |
           . "$HOME/export-esp.sh"
           cargo +esp build --target xtensa-esp32-none-elf -Zbuild-std=core,alloc --no-default-features --features chip-esp32,board-esp32-devkit-door
