@@ -295,9 +295,9 @@ pub async fn run<I: pn532::Interface>(
                                     }
                                 }
                             }
-                            Err(_) => {
+                            Err(e) => {
                                 if policy.observe(true, now_ms) == Action::Recover {
-                                    println!("[nfc] reader unresponsive — pulsing RSTO + reinit");
+                                    println!("[nfc] reader unresponsive ({:?}) — pulsing RSTO + reinit", e);
                                     status_led::set_state(status_led::LedState::DeniedOrOffline);
                                     if let Some(pin) = reader_reset.as_mut() {
                                         pin.set_low();

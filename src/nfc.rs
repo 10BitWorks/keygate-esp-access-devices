@@ -146,8 +146,10 @@ pub fn soft_reinit<I: pn532::Interface>(
     // Configure SAM (Security Access Module) to normal mode.
     // PN532 SAMConfiguration typical response latency is <2ms; 20ms timeout is generous
     // while bounding worst-case unready spin duration.
+    // `use_irq_pin = true` keeps the PN532 asserting P70_IRQ on command completion — required
+    // by SPIInterfaceWithIrq (IRQ is the only readiness signal; no STATUS-readable path).
     pn.process(
-        &Request::sam_configuration(SAMMode::Normal, false),
+        &Request::sam_configuration(SAMMode::Normal, true),
         0,
         fugit::MillisDurationU32::from_ticks(20),
     )
@@ -166,18 +168,21 @@ pub fn poll_tag<I: pn532::Interface, T: CountDown<Time = fugit::MillisDurationU3
     pn532: &mut Pn532<I, T, N>,
 ) -> Result<Option<TagInfo>, NfcError> {
     // INLIST_ONE_ISO_A_TARGET: poll for 1 target at 106 kbps Type A.
-    // When no tag is in the RF field, PN532 responds with NbTg=0 in ~12-18ms.
-    // A 30ms timeout accommodates valid target discovery while tightening the worst-case
-    // pending spin loop bound (down from 100ms) to minimize executor impact.
+    // When no tag is in the RF field, PN532 responds with NbTg=0 after its internal scan.
+    // 200ms accommodates the default passive-activation retry window if no target present.
     let res = pn532
         .process(
             &Request::INLIST_ONE_ISO_A_TARGET,
             20,
-            fugit::MillisDurationU32::from_ticks(30),
+            fugit::MillisDurationU32::from_ticks(200),
         )
-        .map_err(|e| match e {
-            pn532::Error::TimeoutAck | pn532::Error::TimeoutResponse => NfcError::Timeout,
-            _ => NfcError::Pn532,
+        .map_err(|e| {
+            #[cfg(target_arch = "xtensa")]
+            esp_println::println!("[nfc] poll process err: {:?}", e);
+            match e {
+                pn532::Error::TimeoutAck | pn532::Error::TimeoutResponse => NfcError::Timeout,
+                _ => NfcError::Pn532,
+            }
         })?;
 
     if res.is_empty() || res[0] == 0 {
