@@ -87,7 +87,7 @@ fn write_escaped_str<W: Write>(w: &mut W, s: &str) -> Result<(), AuthError> {
 ///
 /// # Arguments
 /// - `reader`: Device/reader ID (e.g., `"keygate1"`). Must not be empty. Escapes quotes/backslashes.
-/// - `sun`: Extracted SUN parameters containing `uid` ([u8; 7]), `counter` (u32), and `cmac` ([u8; 16]).
+/// - `sun`: Extracted SUN parameters containing `uid` ([u8; 7]), `counter` (u32), and `cmac` ([u8; 8]).
 /// - `out`: Mutable reference to `heapless::String<256>` destination buffer.
 ///
 /// # Errors
@@ -139,15 +139,13 @@ mod tests {
         let sun = SunParams {
             uid: [0x04, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66],
             counter: 8,
-            cmac: [
-                0x50, 0x5C, 0x41, 0xA3, 0x35, 0xA9, 0xB7, 0xDE, 0xF2, 0x9D, 0x59, 0x59, 0x93,
-                0x6F, 0xE7, 0xFE,
-            ],
+            cmac: [0x8A, 0x4E, 0x1B, 0x1A, 0x46, 0x97, 0x9F, 0x04],
+            counter_mirror: *b"000008",
         };
         let mut buf = String::<256>::new();
         build_auth_json("keygate1", &sun, &mut buf).expect("serialization failed");
 
-        let expected = "{\"reader\":\"keygate1\",\"uid\":\"04112233445566\",\"counter\":8,\"cmac\":\"505c41a335a9b7def29d5959936fe7fe\"}";
+        let expected = "{\"reader\":\"keygate1\",\"uid\":\"04112233445566\",\"counter\":8,\"cmac\":\"8a4e1b1a46979f04\"}";
         assert_eq!(buf.as_str(), expected);
     }
 
@@ -156,7 +154,8 @@ mod tests {
         let sun = SunParams {
             uid: [0x04; 7],
             counter: 1,
-            cmac: [0xAA; 16],
+            cmac: [0xAA; 8],
+            counter_mirror: *b"000001",
         };
         let mut buf = String::<256>::new();
         let res = build_auth_json("", &sun, &mut buf);
@@ -168,7 +167,8 @@ mod tests {
         let sun = SunParams {
             uid: [0x04; 7],
             counter: 1,
-            cmac: [0xAA; 16],
+            cmac: [0xAA; 8],
+            counter_mirror: *b"000001",
         };
         let mut buf = String::<256>::new();
         let res = build_auth_json("reader\n1", &sun, &mut buf);
@@ -180,7 +180,8 @@ mod tests {
         let sun = SunParams {
             uid: [0x04; 7],
             counter: 1,
-            cmac: [0xAA; 16],
+            cmac: [0xAA; 8],
+            counter_mirror: *b"000001",
         };
         let mut buf = String::<256>::new();
         build_auth_json("key\"gate\\1", &sun, &mut buf).expect("escaped serialization failed");
@@ -192,7 +193,8 @@ mod tests {
         let sun = SunParams {
             uid: [0x04; 7],
             counter: u32::MAX,
-            cmac: [0xAA; 16],
+            cmac: [0xAA; 8],
+            counter_mirror: *b"FFFFFF",
         };
         // 250 characters long reader string will overflow 256 byte buffer
         let long_reader = "a".repeat(250);

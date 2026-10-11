@@ -14,63 +14,67 @@ mod tests {
     use cmd::parse_cmd;
     use heapless::String;
 
-    // From access-control-verifier src/crypto.rs test context
-    // MASTER_KEY: 00112233445566778899aabbccddeeff
-    //
-    // Counter 7 vector generated manually following NXP AN12196 Diversification & CMAC rules
-    // uid = 04112233445566, counter = 7
-    //
-    // TagKey = AES-CMAC(MASTER_KEY, 0x01 || uid) 
-    //        = AES-CMAC(00112233445566778899aabbccddeeff, 0104112233445566)
-    //        = 3e4b77c570b54fc178a25c1cbcf38435
-    //
-    // Counter 7 CMAC = AES-CMAC(TagKey, uid || counter_bytes)
-    //                = AES-CMAC(3e4b77c570b54fc178a25c1cbcf38435, 04112233445566 || 000007)
-    //                = e343397b4d690772fc61d0a7611d6c08
-
-    // Counter 8 CMAC (from access-control-verifier tests)
-    // uid = 04112233445566, counter = 8
-    //                = AES-CMAC(3e4b77c570b54fc178a25c1cbcf38435, 04112233445566 || 000008)
-    //                = 505c41a335a9b7def29d5959936fe7fe
+    // SUN goldens pinned by T1 from the pylibsdm reference oracle
+    // (access-control-verifier/scripts/sun_golden.py, master
+    // 000102030405060708090a0b0c0d0e0f). The mirror field is fixed-width,
+    // zero-padded, case-insensitive hex:
+    //   uid 04112233445566, ctr 000008 (8)  -> cmac 8A4E1B1A46979F04
+    //   uid 04112233445566, ctr 00000B (11) -> cmac 408A4C5B0FB4711F
+    // The earlier hand-computed naive-CMAC vectors were wrong and are gone.
 
     #[test]
-    fn test_parse_sun_url_c7_c_param() {
-        let url = "https://access.10bit.works/?uid=04112233445566&c=000007&cmac=e343397b4d690772fc61d0a7611d6c08";
-        let res = parse_sun_url(url).expect("valid c7 URL");
-        
+    fn test_parse_sun_url_c_param() {
+        let url =
+            "https://access.10bit.works/k?uid=04112233445566&c=000008&cmac=8A4E1B1A46979F04";
+        let res = parse_sun_url(url).expect("valid c URL");
+
         assert_eq!(res.uid, [0x04, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66]);
-        assert_eq!(res.counter, 7);
-        assert_eq!(res.cmac, [0xe3, 0x43, 0x39, 0x7b, 0x4d, 0x69, 0x07, 0x72, 0xfc, 0x61, 0xd0, 0xa7, 0x61, 0x1d, 0x6c, 0x08]);
+        assert_eq!(res.counter, 8);
+        assert_eq!(res.cmac, [0x8A, 0x4E, 0x1B, 0x1A, 0x46, 0x97, 0x9F, 0x04]);
+        assert_eq!(&res.counter_mirror, b"000008");
     }
 
     #[test]
-    fn test_parse_sun_url_c8_ctr_param_mixed_case() {
-        let url = "https://access.10bit.works/?uid=04112233445566&ctr=000008&cmac=505C41A335a9b7def29d5959936FE7FE";
-        let res = parse_sun_url(url).expect("valid c8 URL with ctr and mixed case hex");
-        
+    fn test_parse_sun_url_ctr_param_mixed_case_hex() {
+        // ctr 11 mirrors as fixed-width hex 00000B (not decimal 000011); the
+        // hex field is case-insensitive and the raw bytes are kept verbatim.
+        let url =
+            "https://access.10bit.works/k?uid=04112233445566&ctr=00000b&cmac=408a4c5b0fb4711f";
+        let res = parse_sun_url(url).expect("valid ctr URL with mixed case hex");
+
         assert_eq!(res.uid, [0x04, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66]);
-        assert_eq!(res.counter, 8);
-        assert_eq!(res.cmac, [0x50, 0x5c, 0x41, 0xa3, 0x35, 0xa9, 0xb7, 0xde, 0xf2, 0x9d, 0x59, 0x59, 0x93, 0x6f, 0xe7, 0xfe]);
+        assert_eq!(res.counter, 11);
+        assert_eq!(res.cmac, [0x40, 0x8A, 0x4C, 0x5B, 0x0F, 0xB4, 0x71, 0x1F]);
+        assert_eq!(&res.counter_mirror, b"00000b");
     }
 
     #[test]
     fn test_parse_sun_url_missing_cmac() {
-        let url = "https://access.10bit.works/?uid=04112233445566&c=000008";
+        let url = "https://access.10bit.works/k?uid=04112233445566&c=000008";
         let res = parse_sun_url(url);
         assert_eq!(res, Err(ntag424::ParseError::MissingCmac));
     }
 
     #[test]
     fn test_parse_sun_url_bad_hex() {
-        let url = "https://access.10bit.works/?uid=041122334455XX&c=000008&cmac=505C41A335A9B7DEF29D5959936FE7FE";
+        let url = "https://access.10bit.works/k?uid=041122334455XX&c=000008&cmac=8A4E1B1A46979F04";
         let res = parse_sun_url(url);
         assert_eq!(res, Err(ntag424::ParseError::InvalidHexChar));
     }
 
     #[test]
     fn test_parse_sun_url_corrupted_cmac_length() {
-        // Missing one hex char in CMAC
-        let url = "https://access.10bit.works/?uid=04112233445566&c=000008&cmac=505C41A335A9B7DEF29D5959936FE7F";
+        // 15 hex chars: an odd/short CMAC mirror is rejected.
+        let url = "https://access.10bit.works/k?uid=04112233445566&c=000008&cmac=8A4E1B1A46979F0";
+        let res = parse_sun_url(url);
+        assert_eq!(res, Err(ntag424::ParseError::InvalidLength));
+    }
+
+    #[test]
+    fn test_parse_sun_url_rejects_legacy_32_hex_cmac() {
+        // The old naive 16-byte CMAC mirror (32 hex) is no longer valid: the
+        // real NTAG 424 SUN mirrors an 8-byte truncated CMAC (16 hex only).
+        let url = "https://access.10bit.works/k?uid=04112233445566&c=000008&cmac=505C41A335A9B7DEF29D5959936FE7FE";
         let res = parse_sun_url(url);
         assert_eq!(res, Err(ntag424::ParseError::InvalidLength));
     }
@@ -80,14 +84,15 @@ mod tests {
         let sun = SunParams {
             uid: [0x04, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66],
             counter: 8,
-            cmac: [0x50, 0x5C, 0x41, 0xA3, 0x35, 0xA9, 0xB7, 0xDE, 0xF2, 0x9D, 0x59, 0x59, 0x93, 0x6F, 0xE7, 0xFE],
+            cmac: [0x8A, 0x4E, 0x1B, 0x1A, 0x46, 0x97, 0x9F, 0x04],
+            counter_mirror: *b"000008",
         };
         let mut buf = String::<256>::new();
         build_auth_json("keygate-test", &sun, &mut buf).unwrap();
-        
+
         assert_eq!(
             buf.as_str(),
-            r#"{"reader":"keygate-test","uid":"04112233445566","counter":8,"cmac":"505c41a335a9b7def29d5959936fe7fe"}"#
+            r#"{"reader":"keygate-test","uid":"04112233445566","counter":8,"cmac":"8a4e1b1a46979f04"}"#
         );
     }
 

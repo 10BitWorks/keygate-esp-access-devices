@@ -157,8 +157,12 @@ pub struct SunParams {
     pub uid: [u8; 7],
     /// SUN read/tap counter.
     pub counter: u32,
-    /// 16-byte AES-CMAC.
-    pub cmac: [u8; 16],
+    /// 8-byte truncated AES-CMAC as mirrored by the NTAG 424 SUN (16 hex chars).
+    pub cmac: [u8; 8],
+    /// Exact 6 ASCII bytes of the `c`/`ctr` mirror field as written on the tag
+    /// (T1-pinned fixed-width hex), retained for CMAC-input reconstruction in
+    /// the provisioning read-back (T4).
+    pub counter_mirror: [u8; 6],
 }
 
 /// Errors returned when parsing SUN URL query parameters.
@@ -176,7 +180,7 @@ pub enum ParseError {
     InvalidHexChar,
     /// A hex parameter has an odd or invalid length.
     InvalidLength,
-    /// A counter parameter could not be parsed as a decimal u32.
+    /// A counter parameter was not exactly 6 hex digits (T1-pinned mirror width).
     InvalidCounter,
 }
 
@@ -204,34 +208,44 @@ fn decode_hex_exact<const N: usize>(hex_str: &str, out: &mut [u8; N]) -> Result<
     Ok(())
 }
 
-/// Parse a decimal string into a `u32` without panic or overflow.
-fn parse_decimal_u32(s: &str) -> Result<u32, ParseError> {
-    if s.is_empty() {
+/// Parse the SUN tap-counter mirror field.
+///
+/// T1 pinned the mirror format from the pylibsdm reference oracle
+/// (`access-control-verifier/scripts/sun_golden.py`): the counter is an
+/// exactly-6-character, zero-padded, case-insensitive hex field (`ctr 11 ->
+/// "00000B"`, `ctr 255 -> "0000FF"`), and the verifier signs
+/// `CMAC(UID ‖ "&c=" ‖ <6 hex> ‖ "&cmac=")`. This is ONE rule: exactly 6 hex
+/// digits, big-endian. No decimal leniency — a decimal `c=000011` would decode
+/// as counter 17, the ambiguity T1 removed.
+///
+/// Returns the numeric counter and the verbatim 6 ASCII bytes for later
+/// CMAC-input reconstruction (T4).
+fn parse_counter_mirror(s: &str) -> Result<(u32, [u8; 6]), ParseError> {
+    let bytes = s.as_bytes();
+    if bytes.len() != 6 {
         return Err(ParseError::InvalidCounter);
     }
-    let mut val: u32 = 0;
-    for &b in s.as_bytes() {
-        if !b.is_ascii_digit() {
-            return Err(ParseError::InvalidCounter);
-        }
-        let digit = (b - b'0') as u32;
-        val = val
-            .checked_mul(10)
-            .and_then(|v| v.checked_add(digit))
-            .ok_or(ParseError::InvalidCounter)?;
+    let mut mirror = [0u8; 6];
+    let mut value: u32 = 0;
+    for (i, &b) in bytes.iter().enumerate() {
+        mirror[i] = b;
+        let nibble = hex_val(b).map_err(|_| ParseError::InvalidCounter)?;
+        value = (value << 4) | nibble as u32;
     }
-    Ok(val)
+    Ok((value, mirror))
 }
 
 /// Parse SUN mirror parameters (`uid`, `c`/`ctr`, `cmac`) from an NDEF URL.
 ///
-/// Example: `https://access.10bit.works/?uid=04112233445566&c=000008&cmac=505C41A335A9B7DEF29D5959936FE7FE`
+/// Example: `https://access.10bit.works/k?uid=04112233445566&c=000008&cmac=8A4E1B1A46979F04`
 ///
 /// Features:
 /// - Fixed-size, zero allocation (`no_std` compatible, no heap, no regex).
 /// - Case-insensitive hex decoding (accepts upper/lowercase).
 /// - Accepts either `c` or `ctr` for the tap counter.
-/// - Validates UID length (14 hex chars -> 7 bytes) and CMAC length (32 hex chars -> 16 bytes).
+/// - Validates UID length (14 hex chars -> 7 bytes), CMAC length (16 hex chars
+///   -> 8 bytes) and the counter mirror width (6 hex chars); see
+///   `parse_counter_mirror` for the T1-pinned format.
 pub fn parse_sun_url(url: &str) -> Result<SunParams, ParseError> {
     let query = match url.split_once('?') {
         Some((_, q)) => q,
@@ -267,12 +281,17 @@ pub fn parse_sun_url(url: &str) -> Result<SunParams, ParseError> {
     let mut uid = [0u8; 7];
     decode_hex_exact(uid_raw, &mut uid)?;
 
-    let counter = parse_decimal_u32(counter_raw)?;
+    let (counter, counter_mirror) = parse_counter_mirror(counter_raw)?;
 
-    let mut cmac = [0u8; 16];
+    let mut cmac = [0u8; 8];
     decode_hex_exact(cmac_raw, &mut cmac)?;
 
-    Ok(SunParams { uid, counter, cmac })
+    Ok(SunParams {
+        uid,
+        counter,
+        cmac,
+        counter_mirror,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -451,9 +470,10 @@ pub fn extract_ndef_uri(ndef: &[u8]) -> Result<&str, NdefError> {
 mod ndef_tests {
     use super::*;
 
-    /// Canonical SUN URI matching the verifier test vectors.
+    /// Canonical SUN URI matching the T1 pylibsdm golden (uid 04112233445566,
+    /// ctr 000008 -> cmac 8A4E1B1A46979F04).
     const URI: &[u8] =
-        b"access.10bit.works/?uid=04112233445566&c=000008&cmac=505C41A335A9B7DEF29D5959936FE7FE";
+        b"access.10bit.works/k?uid=04112233445566&c=000008&cmac=8A4E1B1A46979F04";
 
     /// Build a minimal NTAG NDEF file image: `[NLEN_hi, NLEN_lo] || message`.
     fn build_ndef_file(uri: &[u8]) -> heapless::Vec<u8, 320> {
@@ -505,6 +525,8 @@ mod ndef_tests {
         let sun = parse_sun_url(uri).expect("parse SUN");
         assert_eq!(sun.counter, 8);
         assert_eq!(sun.uid, [0x04, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66]);
+        assert_eq!(sun.cmac, [0x8A, 0x4E, 0x1B, 0x1A, 0x46, 0x97, 0x9F, 0x04]);
+        assert_eq!(&sun.counter_mirror, b"000008");
     }
 
     #[test]
