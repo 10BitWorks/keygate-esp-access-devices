@@ -5,6 +5,7 @@ pub mod cmd;
 pub mod auth_msg;
 pub mod reader_supervisor;
 pub mod piezo;
+pub mod provision;
 
 #[cfg(test)]
 mod tests {
