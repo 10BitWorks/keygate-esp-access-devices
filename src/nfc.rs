@@ -125,7 +125,7 @@ impl CountDown for Pn532Delay {
 /// Initialize the PN532 in normal SAM mode over any supported interface.
 ///
 /// Returns an initialized Pn532 instance ready for tag polling.
-// Interface-agnostic: pass I2CInterface or SPIInterfaceWithIrq; SPI builds rely on the crate's `msb-spi` feature (PN532 is LSB-first).
+// Interface-agnostic: pass I2CInterface or SPIInterface; SPI builds rely on the crate's `msb-spi` feature (PN532 is LSB-first).
 pub fn init_pn532<I: pn532::Interface>(
     interface: I,
 ) -> Result<Pn532<I, Pn532Delay, 300>, NfcError> {
@@ -146,14 +146,20 @@ pub fn soft_reinit<I: pn532::Interface>(
     // Configure SAM (Security Access Module) to normal mode.
     // PN532 SAMConfiguration typical response latency is <2ms; 20ms timeout is generous
     // while bounding worst-case unready spin duration.
-    // `use_irq_pin = true` keeps the PN532 asserting P70_IRQ on command completion — required
-    // by SPIInterfaceWithIrq (IRQ is the only readiness signal; no STATUS-readable path).
+    // `use_irq_pin = false` because readiness is STATUS-polled over SPI (crate notes
+    // the flag appears to have no effect anyway).
     pn.process(
-        &Request::sam_configuration(SAMMode::Normal, true),
+        &Request::sam_configuration(SAMMode::Normal, false),
         0,
         fugit::MillisDurationU32::from_ticks(20),
     )
-    .map_err(|_| NfcError::Pn532)?;
+    .map_err(|_e| {
+        // Boot classification: TimeoutAck/BadAck = module not hearing SPI (wiring / mode switch / power);
+        // TimeoutResponse = ACKed but no answer (module-side).
+        #[cfg(target_arch = "xtensa")]
+        esp_println::println!("[nfc] sam_configuration err: {:?}", _e);
+        NfcError::Pn532
+    })?;
 
     Ok(())
 }

@@ -18,7 +18,6 @@ use embedded_hal::digital::OutputPin;
 use embedded_hal::spi::{ErrorType, Operation, SpiBus, SpiDevice};
 #[cfg(feature = "board-esp32-devkit-door")]
 use esp_hal::{
-    gpio::{Input, InputConfig, Pull},
     spi::master::{Config as SpiConfig, Spi},
     spi::Mode,
 };
@@ -107,7 +106,7 @@ pub type Esp32SpiBus = esp_hal::spi::master::Spi<'static, esp_hal::Blocking>;
 #[cfg(feature = "board-esp32-devkit-door")]
 pub type DoorSpiDeviceImpl = DoorSpiDevice<Esp32SpiBus, esp_hal::gpio::Output<'static>>;
 #[cfg(feature = "board-esp32-devkit-door")]
-pub type DoorNfcIface = pn532::spi::SPIInterfaceWithIrq<DoorSpiDeviceImpl, esp_hal::gpio::Input<'static>>;
+pub type DoorNfcIface = pn532::spi::SPIInterface<DoorSpiDeviceImpl>;
 
 #[cfg(feature = "board-xiao-c6")]
 pub fn setup(peripherals: esp_hal::peripherals::Peripherals) -> Setup<XiaoNfcIface> {
@@ -176,6 +175,7 @@ pub fn setup(peripherals: esp_hal::peripherals::Peripherals) -> Setup<DoorNfcIfa
     platform::start_rtos(timg0.timer0, sw_interrupt.software_interrupt0);
 
     println!("ESP32 door node starting...");
+    println!("door build: pn532 SPI STATUS-poll (no irq)");
 
     // 4. Spawn the status LED (GPIO2 onboard, active-low) and relay (GPIO13) tasks.
     //    GPIO13 chosen to avoid GPIO12/MTDI strapping pin issues.
@@ -210,16 +210,9 @@ pub fn setup(peripherals: esp_hal::peripherals::Peripherals) -> Setup<DoorNfcIfa
     let cs = Output::new(peripherals.GPIO5, Level::High, OutputConfig::default());
     let spi_device = DoorSpiDevice::new(spi, cs);
 
-    // IRQ: PN532 IRQ idles high, pulls low when ready to read.
-    let irq_input = Input::new(
-        peripherals.GPIO4,
-        InputConfig::default().with_pull(Pull::Up),
-    );
-
-    let iface = pn532::spi::SPIInterfaceWithIrq {
-        spi: spi_device,
-        irq: irq_input,
-    };
+    // IRQ (GPIO4) intentionally unused: readiness is STATUS-polled over MISO.
+    // IRQ-driven interface made init depend solely on the IRQ line and timed out at boot.
+    let iface = pn532::spi::SPIInterface { spi: spi_device };
 
     // PN532 init is non-fatal: Wi-Fi/MQTT proceed regardless.
     let pn532 = match nfc::init_pn532(iface) {
