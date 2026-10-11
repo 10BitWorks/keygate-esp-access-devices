@@ -67,6 +67,19 @@ pub type XiaoNfcIface = pn532::i2c::I2CInterface<I2cBus>;
 /// Do NOT add any extra bit reversal here. In `wait_ready`, `buf[1] == PN532_SPI_READY` expects
 /// the status byte to arrive already-reversed by MSB-first clocking of the PN532's LSB-first
 /// wire stream, matching the pre-reversed constant.
+/// Real-time busy-wait. Plain `core::hint::spin_loop()` loops are side-effect-free
+/// and LLVM collapses them entirely in release builds — every ms-scale delay in
+/// this driver silently vanished (STATUS polls ran at ~121 kHz instead of ~1 kHz,
+/// starving the PN532's 80C51 core during RF commands). `black_box` per iteration
+/// keeps the loop materialized: ~2-4 cycles per iteration at 240 MHz.
+#[cfg(feature = "board-esp32-devkit-door")]
+#[inline(never)]
+fn spin_delay(iterations: u32) {
+    for i in 0..iterations {
+        core::hint::black_box(i);
+    }
+}
+
 #[cfg(feature = "board-esp32-devkit-door")]
 pub struct DoorSoftSpiDevice {
     sck: esp_hal::gpio::Output<'static>,
@@ -110,14 +123,11 @@ impl DoorSoftSpiDevice {
     /// The `pn532` crate lacks this wakeup sequence, leaving the sleeping core unable
     /// to ACK commands while the SPI front-end answers STATUS polls with 0x00 forever.
     ///
-    /// Timing math:
-    /// Classic ESP32 CPU runs at 240 MHz (240 cycles/µs).
-    /// 2,000 µs × 240 cycles/µs = 480,000 spin iterations (~1 cycle per spin loop iteration).
+    /// Timing: spin_delay materializes at ~2-4 cycles/iteration at 240 MHz;
+    /// 150,000 iterations ≈ 1.5-2 ms of real CS-low time.
     pub fn wake(&mut self) {
         let _ = self.cs.set_low();
-        for _ in 0..480_000 {
-            core::hint::spin_loop();
-        }
+        spin_delay(150_000);
         let _ = self.cs.set_high();
     }
 
@@ -130,15 +140,13 @@ impl DoorSoftSpiDevice {
                 let _ = self.mosi.set_low();
             }
             byte <<= 1;
-            // Half-period delay: ~1 µs at 240 MHz (240 spins).
-            for _ in 0..240 {
-                core::hint::spin_loop();
-            }
+            // Half-period delay: ~1 µs (spin_delay — plain spin_loop was
+            // optimized out entirely in release builds).
+            spin_delay(100);
             let _ = self.sck.set_high();
-            // Half-period delay: ~1 µs at 240 MHz (240 spins).
-            for _ in 0..240 {
-                core::hint::spin_loop();
-            }
+            // Half-period delay: ~1 µs (spin_delay — plain spin_loop was
+            // optimized out entirely in release builds).
+            spin_delay(100);
             let _ = self.sck.set_low();
         }
     }
@@ -153,19 +161,17 @@ impl DoorSoftSpiDevice {
                 let _ = self.mosi.set_low();
             }
             write_byte <<= 1;
-            // Half-period delay: ~1 µs at 240 MHz (240 spins).
-            for _ in 0..240 {
-                core::hint::spin_loop();
-            }
+            // Half-period delay: ~1 µs (spin_delay — plain spin_loop was
+            // optimized out entirely in release builds).
+            spin_delay(100);
             let _ = self.sck.set_high();
             read_byte <<= 1;
             if self.miso.is_high() {
                 read_byte |= 1;
             }
-            // Half-period delay: ~1 µs at 240 MHz (240 spins).
-            for _ in 0..240 {
-                core::hint::spin_loop();
-            }
+            // Half-period delay: ~1 µs (spin_delay — plain spin_loop was
+            // optimized out entirely in release builds).
+            spin_delay(100);
             let _ = self.sck.set_low();
         }
         read_byte
@@ -181,10 +187,7 @@ impl ErrorType for DoorSoftSpiDevice {
 impl SpiDevice for DoorSoftSpiDevice {
     fn transaction(&mut self, operations: &mut [Operation<'_, u8>]) -> Result<(), Self::Error> {
         let _ = self.cs.set_low();
-        // CS settle delay: ~2 µs at 240 MHz (≈480 spin iterations).
-        for _ in 0..480 {
-            core::hint::spin_loop();
-        }
+        spin_delay(200); // CS settle ~2 µs before first clock edge
 
         for op in operations {
             match op {
@@ -273,27 +276,20 @@ impl SpiDevice for DoorSoftSpiDevice {
                     }
                 }
                 Operation::DelayNs(ns) => {
-                    // Approximate ~0.24 cycles/ns at 240 MHz (~ns / 4 spin iterations).
-                    for _ in 0..(*ns / 4) {
-                        core::hint::spin_loop();
-                    }
+                    // ~10-16 ns per spin_delay iteration at 240 MHz.
+                    spin_delay(*ns / 12);
                 }
             }
         }
 
-        // CS hold delay: ~2 µs at 240 MHz (≈480 spin iterations) before CS de-assertion.
-        for _ in 0..480 {
-            core::hint::spin_loop();
-        }
+        spin_delay(200); // CS hold ~2 µs before CS de-assertion
         let _ = self.cs.set_high();
 
-        // Inter-transaction CS-high idle delay: ~1 ms at 240 MHz (240_000 spin iterations).
-        // Gives the PN532's 80C51 core quiet bus time to process commands without
-        // being starved by back-to-back SPI status-poll transactions (Adafruit uses delay(1)
-        // post-write and delay(10) between polls).
-        for _ in 0..240_000 {
-            core::hint::spin_loop();
-        }
+        // Inter-transaction CS-high idle delay: ~1 ms. Gives the PN532's 80C51 core
+        // quiet bus time to process commands (Adafruit uses delay(1) post-write and
+        // delay(10) between polls). THE critical pacing: without a real delay here,
+        // STATUS polling hammers the bus at ~121 kHz and RF commands starve.
+        spin_delay(75_000); // ~0.75-1.2 ms
 
         Ok(())
     }
@@ -330,10 +326,7 @@ impl<BUS: ErrorType, CS: OutputPin> ErrorType for DoorSpiDevice<BUS, CS> {
 impl<BUS: SpiBus, CS: OutputPin> SpiDevice for DoorSpiDevice<BUS, CS> {
     fn transaction(&mut self, operations: &mut [Operation<'_, u8>]) -> Result<(), Self::Error> {
         let _ = self.cs.set_low();
-        // CS settle delay: ~10 µs at 240 MHz (240 cycles/µs * 10 µs = 2400 spins).
-        for _ in 0..2400 {
-            core::hint::spin_loop();
-        }
+        spin_delay(1000); // CS settle ~10 µs
         let mut res = Ok(());
         for op in operations {
             match op {
@@ -362,18 +355,13 @@ impl<BUS: SpiBus, CS: OutputPin> SpiDevice for DoorSpiDevice<BUS, CS> {
                     }
                 }
                 Operation::DelayNs(ns) => {
-                    // Approximate ~0.24 cycles/ns at 240 MHz (~ns / 4 spin iterations).
-                    for _ in 0..(*ns / 4) {
-                        core::hint::spin_loop();
-                    }
+                    // ~10-16 ns per spin_delay iteration at 240 MHz.
+                    spin_delay(*ns / 12);
                 }
             }
         }
         let _ = self.bus.flush();
-        // CS hold delay: ~10 µs at 240 MHz before CS de-assertion.
-        for _ in 0..2400 {
-            core::hint::spin_loop();
-        }
+        spin_delay(1000); // CS hold ~10 µs
         let _ = self.cs.set_high();
         res
     }
@@ -455,7 +443,7 @@ pub fn setup(peripherals: esp_hal::peripherals::Peripherals) -> Setup<DoorNfcIfa
     platform::start_rtos(timg0.timer0, sw_interrupt.software_interrupt0);
 
     println!("ESP32 door node starting...");
-    println!("door build: pn532 soft-SPI full-spy irq-sam (sck5 mosi22 miso18 cs17)");
+    println!("door build: pn532 soft-SPI real-spin pacing spy (sck5 mosi22 miso18 cs17)");
 
     // 4. Spawn the status LED (GPIO2 onboard, active-low) and relay (GPIO13) tasks.
     //    GPIO13 chosen to avoid GPIO12/MTDI strapping pin issues.
