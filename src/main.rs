@@ -21,6 +21,7 @@ mod config;
 mod nfc;
 mod node;
 mod ntag424;
+mod piezo;
 mod platform;
 mod reader_supervisor;
 mod relay;
@@ -53,6 +54,9 @@ async fn main(spawner: Spawner) -> ! {
     //    Each task takes ownership of its pin.
     spawner.spawn(status_led::status_led_task(setup.led_pin).unwrap());
     spawner.spawn(relay::relay_task(setup.relay_pin).unwrap());
+    spawner.spawn(
+        piezo::piezo_task(piezo::PIEZO_CHANNEL.receiver(), setup.piezo_pins).unwrap(),
+    );
 
     // 5. Spawn the Embassy network runner task.
     spawner.spawn(net_task(setup.net_runner).unwrap());

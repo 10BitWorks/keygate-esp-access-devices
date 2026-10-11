@@ -1220,6 +1220,7 @@ version = "0.1.0"
 dependencies = [
  "aes",
  "cmac",
+ "critical-section",
  "embassy-executor",
  "embassy-net",
  "embassy-sync 0.8.0",

@@ -4,6 +4,7 @@ pub mod ntag424;
 pub mod cmd;
 pub mod auth_msg;
 pub mod reader_supervisor;
+pub mod piezo;
 
 #[cfg(test)]
 mod tests {

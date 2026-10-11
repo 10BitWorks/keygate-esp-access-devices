@@ -27,6 +27,7 @@ use esp_hal::{
 
 use crate::{
     nfc::{self, Pn532Delay},
+    piezo,
     platform,
 };
 
@@ -36,10 +37,25 @@ pub struct Setup<I: pn532::Interface> {
     pub reader_reset: Option<esp_hal::gpio::Output<'static>>,
     pub relay_pin: esp_hal::gpio::Output<'static>,
     pub led_pin: esp_hal::gpio::Output<'static>,
+    pub piezo_pins: piezo::PiezoPins,
+    // Consumed by the node feedback hooks (task T7), which receive this sender
+    // through `node::run`. Until those hooks land the field is intentionally
+    // unread; silence the dead-code lint the same way `board.rs` does elsewhere.
+    #[allow(dead_code)]
+    pub piezo_tx: piezo::PiezoSender,
     pub wifi_controller: esp_radio::wifi::WifiController<'static>,
     pub stack: embassy_net::Stack<'static>,
     pub net_runner: embassy_net::Runner<'static, esp_radio::wifi::Interface<'static>>,
 }
+
+/// GPIO legs (A, B) driving the passive piezo disc in bridge mode.
+///
+/// The disc is polarity-free, so leg order is arbitrary. Door unit uses
+/// `(GPIO32, GPIO33)` (user-confirmed free); XIAO-C6 uses `(GPIO9, GPIO10)`.
+#[cfg(feature = "board-esp32-devkit-door")]
+pub const PIEZO_PINS: (u8, u8) = (32, 33);
+#[cfg(feature = "board-xiao-c6")]
+pub const PIEZO_PINS: (u8, u8) = (9, 10);
 
 #[cfg(feature = "board-xiao-c6")]
 pub type I2cBus = esp_hal::i2c::master::I2c<'static, esp_hal::Blocking>;
@@ -404,6 +420,16 @@ pub fn setup(peripherals: esp_hal::peripherals::Peripherals) -> Setup<XiaoNfcIfa
     let led_pin = Output::new(peripherals.GPIO15, Level::High, OutputConfig::default());
     let relay_pin = Output::new(peripherals.GPIO1, Level::High, OutputConfig::default());
 
+    // Passive piezo disc, bridge-driven on GPIO9/GPIO10 (both legs idle low).
+    let piezo_pins = piezo::PiezoPins::new(
+        Output::new(peripherals.GPIO9, Level::Low, OutputConfig::default()),
+        Output::new(peripherals.GPIO10, Level::Low, OutputConfig::default()),
+    );
+    println!(
+        "piezo: bridge on GPIO{} / GPIO{}",
+        PIEZO_PINS.0, PIEZO_PINS.1
+    );
+
     // 5 & 6. Initialize Wi-Fi and network stack via platform helpers.
     let rng = esp_hal::rng::Rng::new();
     let net_parts = platform::net(peripherals.WIFI, rng);
@@ -441,6 +467,8 @@ pub fn setup(peripherals: esp_hal::peripherals::Peripherals) -> Setup<XiaoNfcIfa
         reader_reset,
         relay_pin,
         led_pin,
+        piezo_pins,
+        piezo_tx: piezo::PIEZO_CHANNEL.sender(),
         wifi_controller: net_parts.wifi_controller,
         stack: net_parts.stack,
         net_runner: net_parts.net_runner,
@@ -465,6 +493,16 @@ pub fn setup(peripherals: esp_hal::peripherals::Peripherals) -> Setup<DoorNfcIfa
     //    GPIO13 chosen to avoid GPIO12/MTDI strapping pin issues.
     let led_pin = Output::new(peripherals.GPIO2, Level::High, OutputConfig::default());
     let relay_pin = Output::new(peripherals.GPIO13, Level::High, OutputConfig::default());
+
+    // Passive piezo disc, bridge-driven on GPIO32/GPIO33 (both legs idle low).
+    let piezo_pins = piezo::PiezoPins::new(
+        Output::new(peripherals.GPIO32, Level::Low, OutputConfig::default()),
+        Output::new(peripherals.GPIO33, Level::Low, OutputConfig::default()),
+    );
+    println!(
+        "piezo: bridge on GPIO{} / GPIO{}",
+        PIEZO_PINS.0, PIEZO_PINS.1
+    );
 
     // Hardware reset pin RSTO on GPIO19 (repurposed from MISO).
     // The 8-pin harness was slid one slot up the right column; GPIO19's INPUT buffer is the
@@ -520,6 +558,8 @@ pub fn setup(peripherals: esp_hal::peripherals::Peripherals) -> Setup<DoorNfcIfa
         reader_reset,
         relay_pin,
         led_pin,
+        piezo_pins,
+        piezo_tx: piezo::PIEZO_CHANNEL.sender(),
         wifi_controller: net_parts.wifi_controller,
         stack: net_parts.stack,
         net_runner: net_parts.net_runner,

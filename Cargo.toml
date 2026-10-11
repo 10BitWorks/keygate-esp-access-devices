@@ -11,6 +11,10 @@ path = "src/lib.rs"
 [[bin]]
 name = "keygate-esp-access-devices"
 path = "src/main.rs"
+# The bin is bare-metal only (esp_hal/esp-rtos behind the target cfg) and cannot
+# link on the host. Exclude it from `cargo test` so host unit tests (lib, piezo)
+# can run; chip builds are unaffected.
+test = false
 
 [dependencies]
 # Embedded ecosystem
@@ -59,6 +63,12 @@ embassy-net = { version = "0.9.1", features = ["tcp", "dhcpv4", "medium-ethernet
 embassy-sync = { version = "0.8.0" }
 minimq = { version = "0.12.0", default-features = false }
 static_cell = "2.1.0"
+
+[dev-dependencies]
+# Re-exposed on the host for piezo's overflow test (a real embassy channel is just
+# a data structure here; the std backend makes CriticalSectionRawMutex lockable).
+embassy-sync = "0.8.0"
+critical-section = { version = "1.2", features = ["std"] }
 
 [package.metadata.espflash]
 partition_table = "partitions.csv"
