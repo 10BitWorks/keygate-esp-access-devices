@@ -74,6 +74,7 @@ pub struct DoorSoftSpiDevice {
     miso: esp_hal::gpio::Input<'static>,
     cs: esp_hal::gpio::Output<'static>,
     status_poll_count: u32,
+    write_count: u32,
 }
 
 #[cfg(feature = "board-esp32-devkit-door")]
@@ -90,6 +91,7 @@ impl DoorSoftSpiDevice {
             miso,
             cs,
             status_poll_count: 0,
+            write_count: 0,
         }
     }
 
@@ -186,6 +188,19 @@ impl SpiDevice for DoorSoftSpiDevice {
                     }
                 }
                 Operation::Write(words) => {
+                    if self.write_count < 4 {
+                        esp_println::print!("[softspi] write[{}]: ", words.len());
+                        for b in words.iter().take(32) {
+                            esp_println::print!("{:02X} ", b);
+                        }
+                        esp_println::println!("");
+                        esp_println::print!("[softspi] write[{}] unreversed: ", words.len());
+                        for b in words.iter().take(32) {
+                            esp_println::print!("{:02X} ", b.reverse_bits());
+                        }
+                        esp_println::println!("");
+                        self.write_count += 1;
+                    }
                     for &byte in words.iter() {
                         self.write_byte(byte);
                     }
@@ -407,7 +422,7 @@ pub fn setup(peripherals: esp_hal::peripherals::Peripherals) -> Setup<DoorNfcIfa
     platform::start_rtos(timg0.timer0, sw_interrupt.software_interrupt0);
 
     println!("ESP32 door node starting...");
-    println!("door build: pn532 soft-SPI paced 1ms (sck5 mosi22 miso18 cs17)");
+    println!("door build: pn532 soft-SPI write-spy (sck5 mosi22 miso18 cs17)");
 
     // 4. Spawn the status LED (GPIO2 onboard, active-low) and relay (GPIO13) tasks.
     //    GPIO13 chosen to avoid GPIO12/MTDI strapping pin issues.
