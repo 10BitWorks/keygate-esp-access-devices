@@ -200,7 +200,7 @@ impl SpiDevice for DoorSoftSpiDevice {
                     // Frame spy: dump the ACK/response frames fetched via DATAREAD
                     // (crate sends Write([0xC0]) immediately before the Read op).
                     // 12 dumps cover init exchanges plus several poll commands.
-                    if self.frame_read_pending && self.read_dump_count < 12 {
+                    if self.frame_read_pending && self.read_dump_count < 80 {
                         self.frame_read_pending = false;
                         esp_println::print!("[softspi] frame rd ({} B) wire: ", words.len());
                         for b in words.iter().take(40) {
@@ -216,7 +216,7 @@ impl SpiDevice for DoorSoftSpiDevice {
                     }
                 }
                 Operation::Write(words) => {
-                    if self.write_count < 24 {
+                    if self.write_count < 400 {
                         esp_println::print!("[softspi] write[{}]: ", words.len());
                         for b in words.iter().take(32) {
                             esp_println::print!("{:02X} ", b);
@@ -263,7 +263,7 @@ impl SpiDevice for DoorSoftSpiDevice {
                     // 1000 ms window, flips back, or asserts garbage (BadAck hunting).
                     // 0x40 = as_lsb(0x02) = PN532_SPI_STATREAD under msb-spi pre-reversal.
                     if is_status_read {
-                        if self.status_print_count < 40 && self.last_status != Some(words[1]) {
+                        if self.status_print_count < 400 && self.last_status != Some(words[1]) {
                             esp_println::println!(
                                 "[softspi] status poll #{} -> 0x{:02X}",
                                 self.status_poll_count,
@@ -443,7 +443,7 @@ pub fn setup(peripherals: esp_hal::peripherals::Peripherals) -> Setup<DoorNfcIfa
     platform::start_rtos(timg0.timer0, sw_interrupt.software_interrupt0);
 
     println!("ESP32 door node starting...");
-    println!("door build: pn532 soft-SPI real-spin pacing spy (sck5 mosi22 miso18 cs17)");
+    println!("door build: pn532 soft-SPI heartbeat spy (sck5 mosi22 miso18 cs17)");
 
     // 4. Spawn the status LED (GPIO2 onboard, active-low) and relay (GPIO13) tasks.
     //    GPIO13 chosen to avoid GPIO12/MTDI strapping pin issues.

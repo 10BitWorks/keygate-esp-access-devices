@@ -194,6 +194,15 @@ pub fn poll_tag<I: pn532::Interface, T: CountDown<Time = fugit::MillisDurationU3
         })?;
 
     if res.is_empty() || res[0] == 0 {
+        // Heartbeat: log the first 100 poll results so bench captures can tell
+        // "loop alive, no tag" (nbtg=0) from "loop hung" (no lines at all).
+        static POLL_LOG: core::sync::atomic::AtomicU32 =
+            core::sync::atomic::AtomicU32::new(0);
+        let n = POLL_LOG.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        #[cfg(target_arch = "xtensa")]
+        if n < 100 {
+            esp_println::println!("[nfc] poll #{} nbtg=0", n);
+        }
         return Ok(None);
     }
 
