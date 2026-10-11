@@ -22,6 +22,7 @@ mod nfc;
 mod node;
 mod ntag424;
 mod platform;
+mod reader_supervisor;
 mod relay;
 mod status_led;
 mod tag_debounce;

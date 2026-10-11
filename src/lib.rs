@@ -3,6 +3,7 @@
 pub mod ntag424;
 pub mod cmd;
 pub mod auth_msg;
+pub mod reader_supervisor;
 
 #[cfg(test)]
 mod tests {

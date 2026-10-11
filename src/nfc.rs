@@ -132,58 +132,79 @@ pub fn init_pn532<I: pn532::Interface>(
     let timer = Pn532Delay::new();
     let mut pn532 = Pn532::new(interface, timer);
 
-    // Configure SAM (Security Access Module) to normal mode.
-    // PN532 SAMConfiguration typical response latency is <2ms; 20ms timeout is generous
-    // while bounding worst-case unready spin duration.
-    pn532
-        .process(
-            &Request::sam_configuration(SAMMode::Normal, false),
-            0,
-            fugit::MillisDurationU32::from_ticks(20),
-        )
-        .map_err(|_| NfcError::Pn532)?;
+    soft_reinit(&mut pn532)?;
 
     Ok(pn532)
 }
 
-/// Poll for a single NFC tag. Returns `Some(TagInfo)` if a tag is present.
+/// Re-initialize the PN532 SAM mode on an existing driver instance.
+///
+/// Typically called after hardware RSTO pulse or when soft recovery is triggered.
+pub fn soft_reinit<I: pn532::Interface>(
+    pn: &mut Pn532<I, Pn532Delay, 300>,
+) -> Result<(), NfcError> {
+    // Configure SAM (Security Access Module) to normal mode.
+    // PN532 SAMConfiguration typical response latency is <2ms; 20ms timeout is generous
+    // while bounding worst-case unready spin duration.
+    pn.process(
+        &Request::sam_configuration(SAMMode::Normal, false),
+        0,
+        fugit::MillisDurationU32::from_ticks(20),
+    )
+    .map_err(|_| NfcError::Pn532)?;
+
+    Ok(())
+}
+
+/// Poll for a single NFC tag.
+///
+/// Returns:
+/// - `Ok(Some(TagInfo))` if a tag is present in the RF field.
+/// - `Ok(None)` if no tag is present (NbTg == 0).
+/// - `Err(NfcError)` if communication or protocol failure occurs.
 pub fn poll_tag<I: pn532::Interface, T: CountDown<Time = fugit::MillisDurationU32>, const N: usize>(
     pn532: &mut Pn532<I, T, N>,
-) -> Option<TagInfo> {
+) -> Result<Option<TagInfo>, NfcError> {
     // INLIST_ONE_ISO_A_TARGET: poll for 1 target at 106 kbps Type A.
     // When no tag is in the RF field, PN532 responds with NbTg=0 in ~12-18ms.
     // A 30ms timeout accommodates valid target discovery while tightening the worst-case
     // pending spin loop bound (down from 100ms) to minimize executor impact.
-    if let Ok(res) = pn532.process(
-        &Request::INLIST_ONE_ISO_A_TARGET,
-        20,
-        fugit::MillisDurationU32::from_ticks(30),
-    ) {
-        if res.is_empty() || res[0] == 0 {
-            return None;
-        }
+    let res = pn532
+        .process(
+            &Request::INLIST_ONE_ISO_A_TARGET,
+            20,
+            fugit::MillisDurationU32::from_ticks(30),
+        )
+        .map_err(|e| match e {
+            pn532::Error::TimeoutAck | pn532::Error::TimeoutResponse => NfcError::Timeout,
+            _ => NfcError::Pn532,
+        })?;
 
-        // res[0] = NbTg (number of targets found, should be 1)
-        // res[1] = Tg (target number, typically 1)
-        // res[2..4] = SENS_RES (2 bytes ATQA)
-        // res[4] = SEL_RES (1 byte SAK)
-        // res[5] = NFCIDLength (UID length)
-        // res[6..6+NFCIDLength] = NFCID1 (UID)
-        let sak = res[4];
-        let uid_len = res[5] as usize;
-
-        if res.len() >= 6 + uid_len {
-            let mut uid = [0u8; 7];
-            let copy_len = uid_len.min(7);
-            uid[..copy_len].copy_from_slice(&res[6..6 + copy_len]);
-            return Some(TagInfo {
-                uid,
-                uid_len: copy_len as u8,
-                sak,
-            });
-        }
+    if res.is_empty() || res[0] == 0 {
+        return Ok(None);
     }
-    None
+
+    // res[0] = NbTg (number of targets found, should be 1)
+    // res[1] = Tg (target number, typically 1)
+    // res[2..4] = SENS_RES (2 bytes ATQA)
+    // res[4] = SEL_RES (1 byte SAK)
+    // res[5] = NFCIDLength (UID length)
+    // res[6..6+NFCIDLength] = NFCID1 (UID)
+    let sak = res[4];
+    let uid_len = res[5] as usize;
+
+    if res.len() >= 6 + uid_len {
+        let mut uid = [0u8; 7];
+        let copy_len = uid_len.min(7);
+        uid[..copy_len].copy_from_slice(&res[6..6 + copy_len]);
+        return Ok(Some(TagInfo {
+            uid,
+            uid_len: copy_len as u8,
+            sak,
+        }));
+    }
+
+    Ok(None)
 }
 
 /// Send an ISO-DEP (ISO 14443-4) APDU to a target via PN532 `InDataExchange`.

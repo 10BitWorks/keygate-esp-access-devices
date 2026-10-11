@@ -14,17 +14,19 @@ use minimq::{
 use pn532::Pn532;
 
 use crate::{
-    auth_msg, cmd, config, nfc::{self, Pn532Delay}, ntag424, relay, status_led, tag_debounce,
+    auth_msg, cmd, config,
+    nfc::{self, Pn532Delay},
+    ntag424,
+    reader_supervisor::{Action, ResetPolicy},
+    relay, status_led, tag_debounce,
 };
 
 pub async fn run<I: pn532::Interface>(
     mut pn532: Option<Pn532<I, Pn532Delay, 300>>,
-    reader_reset: Option<esp_hal::gpio::Output<'static>>,
+    mut reader_reset: Option<esp_hal::gpio::Output<'static>>,
     stack: embassy_net::Stack<'static>,
     mut wifi_controller: esp_radio::wifi::WifiController<'static>,
 ) -> ! {
-    // reader_reset is consumed by the lockup supervisor (todo 10).
-    let _reader_reset = reader_reset;
 
     // 8. Persistent MQTT/TCP buffers and topic names.
     let mut mqtt_rx_buf = [0u8; 1024];
@@ -163,6 +165,7 @@ pub async fn run<I: pn532::Interface>(
 
                 let mut debounce = tag_debounce::TagDebounce::new();
                 let mut ndef_buf = [0u8; 256];
+                let mut policy = ResetPolicy::new();
 
                 loop {
                     // Drive MQTT with a bounded wait so NFC polling keeps flowing.
@@ -195,94 +198,114 @@ pub async fn run<I: pn532::Interface>(
 
                     // Poll NFC and run the edge-triggered debounce state machine.
                     if let Some(ref mut pn) = pn532 {
-                        let tag_opt = nfc::poll_tag(pn);
-                        let obs = tag_opt
-                            .as_ref()
-                            .map(tag_debounce::TagObservation::from_tag_info);
                         let now = Instant::now();
+                        let now_ms = now.as_millis() as u64;
 
-                        if let Some(ev) = debounce.observe(now, obs) {
-                            // SAK 0x20 => ISO 14443-4 (DESFire / NTAG 424 DNA).
-                            if ev.sak == 0x20 {
-                                status_led::set_state(status_led::LedState::TagReading);
+                        match nfc::poll_tag(pn) {
+                            Ok(tag_opt) => {
+                                policy.observe(false, now_ms);
 
-                                let read_res = {
-                                    let pn_ref: &mut _ = &mut *pn;
-                                    let mut exchange =
-                                        move |apdu: &[u8], out: &mut [u8]| -> Result<usize, ntag424::NdefError> {
-                                            let resp = nfc::in_data_exchange(pn_ref, 1, apdu)
-                                                .map_err(|_| ntag424::NdefError::Transport)?;
-                                            if out.len() < resp.len() {
-                                                return Err(ntag424::NdefError::BufferTooSmall);
-                                            }
-                                            out[..resp.len()].copy_from_slice(resp);
-                                            Ok(resp.len())
+                                let obs = tag_opt
+                                    .as_ref()
+                                    .map(tag_debounce::TagObservation::from_tag_info);
+
+                                if let Some(ev) = debounce.observe(now, obs) {
+                                    // SAK 0x20 => ISO 14443-4 (DESFire / NTAG 424 DNA).
+                                    if ev.sak == 0x20 {
+                                        status_led::set_state(status_led::LedState::TagReading);
+
+                                        let read_res = {
+                                            let pn_ref: &mut _ = &mut *pn;
+                                            let mut exchange =
+                                                move |apdu: &[u8], out: &mut [u8]| -> Result<usize, ntag424::NdefError> {
+                                                    let resp = nfc::in_data_exchange(pn_ref, 1, apdu)
+                                                        .map_err(|_| ntag424::NdefError::Transport)?;
+                                                    if out.len() < resp.len() {
+                                                        return Err(ntag424::NdefError::BufferTooSmall);
+                                                    }
+                                                    out[..resp.len()].copy_from_slice(resp);
+                                                    Ok(resp.len())
+                                                };
+                                            ntag424::read_ndef_message(&mut exchange, &mut ndef_buf)
                                         };
-                                    ntag424::read_ndef_message(&mut exchange, &mut ndef_buf)
-                                };
 
-                                match read_res {
-                                    Ok(n) => match ntag424::extract_ndef_uri(&ndef_buf[..n]) {
-                                        Ok(uri) => match ntag424::parse_sun_url(uri) {
-                                            Ok(sun) => {
-                                                let mut payload = heapless::String::<256>::new();
-                                                match auth_msg::build_auth_json(
-                                                    config::DEVICE_ID,
-                                                    &sun,
-                                                    &mut payload,
-                                                ) {
-                                                    Ok(()) => {
-                                                        if let Some(tag) = tag_opt.as_ref() {
-                                                            println!(
-                                                                "auth: {} uid:{} ctr:{}",
-                                                                tag.tag_type(),
-                                                                tag.uid_hex(),
-                                                                sun.counter
-                                                            );
-                                                        }
-                                                        let pkt = Publication::new(
-                                                            auth_topic.as_str(),
-                                                            payload.as_str(),
-                                                        );
-                                                        match session.publish(pkt).await {
-                                                            Ok(_) => println!("auth published"),
-                                                            Err(e) => {
-                                                                println!(
-                                                                    "auth publish failed: {:?}",
-                                                                    e
+                                        match read_res {
+                                            Ok(n) => match ntag424::extract_ndef_uri(&ndef_buf[..n]) {
+                                                Ok(uri) => match ntag424::parse_sun_url(uri) {
+                                                    Ok(sun) => {
+                                                        let mut payload = heapless::String::<256>::new();
+                                                        match auth_msg::build_auth_json(
+                                                            config::DEVICE_ID,
+                                                            &sun,
+                                                            &mut payload,
+                                                        ) {
+                                                            Ok(()) => {
+                                                                if let Some(tag) = tag_opt.as_ref() {
+                                                                    println!(
+                                                                        "auth: {} uid:{} ctr:{}",
+                                                                        tag.tag_type(),
+                                                                        tag.uid_hex(),
+                                                                        sun.counter
+                                                                    );
+                                                                }
+                                                                let pkt = Publication::new(
+                                                                    auth_topic.as_str(),
+                                                                    payload.as_str(),
                                                                 );
-                                                                break;
+                                                                match session.publish(pkt).await {
+                                                                    Ok(_) => println!("auth published"),
+                                                                    Err(e) => {
+                                                                        println!(
+                                                                            "auth publish failed: {:?}",
+                                                                            e
+                                                                        );
+                                                                        break;
+                                                                    }
+                                                                }
+                                                            }
+                                                            Err(e) => {
+                                                                println!("auth json error: {:?}", e);
+                                                                status_led::set_state(
+                                                                    status_led::LedState::DeniedOrOffline,
+                                                                );
                                                             }
                                                         }
                                                     }
                                                     Err(e) => {
-                                                        println!("auth json error: {:?}", e);
+                                                        println!("SUN parse error: {:?}", e);
                                                         status_led::set_state(
                                                             status_led::LedState::DeniedOrOffline,
                                                         );
                                                     }
+                                                },
+                                                Err(e) => {
+                                                    println!("NDEF uri error: {:?}", e);
+                                                    status_led::set_state(
+                                                        status_led::LedState::DeniedOrOffline,
+                                                    );
                                                 }
-                                            }
+                                            },
                                             Err(e) => {
-                                                println!("SUN parse error: {:?}", e);
+                                                println!("NDEF read error: {:?}", e);
                                                 status_led::set_state(
                                                     status_led::LedState::DeniedOrOffline,
                                                 );
                                             }
-                                        },
-                                        Err(e) => {
-                                            println!("NDEF uri error: {:?}", e);
-                                            status_led::set_state(
-                                                status_led::LedState::DeniedOrOffline,
-                                            );
                                         }
-                                    },
-                                    Err(e) => {
-                                        println!("NDEF read error: {:?}", e);
-                                        status_led::set_state(
-                                            status_led::LedState::DeniedOrOffline,
-                                        );
                                     }
+                                }
+                            }
+                            Err(_) => {
+                                if policy.observe(true, now_ms) == Action::Recover {
+                                    println!("[nfc] reader unresponsive — pulsing RSTO + reinit");
+                                    status_led::set_state(status_led::LedState::DeniedOrOffline);
+                                    if let Some(pin) = reader_reset.as_mut() {
+                                        pin.set_low();
+                                        Timer::after(Duration::from_millis(10)).await;
+                                        pin.set_high();
+                                        Timer::after(Duration::from_millis(100)).await;
+                                    }
+                                    let _ = nfc::soft_reinit(pn);
                                 }
                             }
                         }
