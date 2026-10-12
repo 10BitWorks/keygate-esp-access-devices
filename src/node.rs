@@ -17,9 +17,12 @@ use crate::{
     auth_msg, cmd, config,
     nfc::{self, Pn532Delay},
     ntag424,
+    provision, provision_flow::{ProvAction, ProvMachine, ProvState},
     reader_supervisor::{Action, ResetPolicy},
     relay, status_led, tag_debounce,
 };
+use crate::piezo::BeepEvent;
+use crate::piezo::PIEZO_CHANNEL as PZ;
 
 pub async fn run<I: pn532::Interface>(
     mut pn532: Option<Pn532<I, Pn532Delay, 300>>,
@@ -37,9 +40,15 @@ pub async fn run<I: pn532::Interface>(
     let mut auth_topic = heapless::String::<96>::new();
     let mut cmd_topic = heapless::String::<96>::new();
     let mut presence_topic = heapless::String::<96>::new();
+    let mut job_topic = heapless::String::<96>::new();
+    let mut claim_topic = heapless::String::<96>::new();
+    let mut done_topic = heapless::String::<96>::new();
     let _ = write!(&mut auth_topic, "access/{}/auth", config::DEVICE_ID);
     let _ = write!(&mut cmd_topic, "access/{}/cmd", config::DEVICE_ID);
     let _ = write!(&mut presence_topic, "access/{}/presence", config::DEVICE_ID);
+    let _ = write!(&mut job_topic, "writer/{}/job", config::DEVICE_ID);
+    let _ = write!(&mut claim_topic, "writer/{}/claim", config::DEVICE_ID);
+    let _ = write!(&mut done_topic, "writer/{}/done", config::DEVICE_ID);
 
     let broker_port: u16 = config::MQTT_PORT.parse().unwrap_or(1883);
     let mut backoff_secs: u64 = 1;
@@ -53,6 +62,89 @@ pub async fn run<I: pn532::Interface>(
         };
         current
     }
+
+/// Provisioning flow helper macro.
+///
+/// A macro (not a fn) because every arm needs `&mut session` with minimq's
+/// concrete session type — inlining dodges the generic-bounds plumbing while
+/// keeping one authoritative implementation of the action semantics.
+macro_rules! handle_prov_action {
+    ($action:expr, $prov:expr, $session:expr, $claim_topic:expr, $done_topic:expr) => {
+        match $action {
+            ProvAction::None => {}
+            ProvAction::Arm => {
+                let _ = PZ.try_send(BeepEvent::ProvisionArmed);
+                println!("[prov] job armed — tap a blank NTAG 424 now");
+            }
+            ProvAction::IgnoreSecond => {
+                let _ = PZ.try_send(BeepEvent::Denied);
+                println!("[prov] second job ignored (busy)");
+            }
+            ProvAction::TapRejected => {
+                let _ = PZ.try_send(BeepEvent::Denied);
+                println!("[prov] tapped uid does not match the job — rejected");
+            }
+            ProvAction::PublishClaim(claim) => {
+                let pkt = Publication::new($claim_topic, claim.as_str())
+                    .qos(minimq::QoS::AtLeastOnce);
+                match $session.publish(pkt).await {
+                    Ok(_) => println!("[prov] claim published — waiting for keyed job"),
+                    Err(e) => println!("[prov] claim publish failed: {:?}", e),
+                }
+            }
+            ProvAction::ProvisionStart => {
+                println!("[prov] provisioning starting");
+            }
+            ProvAction::CompleteOk(job_id, counter) => {
+                let done = crate::provision_flow::build_done_json(job_id.as_str(), true, counter, "");
+                let pkt =
+                    Publication::new($done_topic, done.as_str()).qos(minimq::QoS::AtLeastOnce);
+                if let Err(e) = $session.publish(pkt).await {
+                    println!("[prov] done publish failed: {:?}", e);
+                }
+                let _ = PZ.try_send(BeepEvent::ProvisionOk);
+                println!("[prov] SUCCESS (counter {})", counter);
+            }
+            ProvAction::Fail(job_id, reason) => {
+                let done = crate::provision_flow::build_done_json(job_id.as_str(), false, 0, reason);
+                let pkt =
+                    Publication::new($done_topic, done.as_str()).qos(minimq::QoS::AtLeastOnce);
+                if let Err(e) = $session.publish(pkt).await {
+                    println!("[prov] done publish failed: {:?}", e);
+                }
+                let _ = PZ.try_send(BeepEvent::ProvisionFail);
+                println!("[prov] FAILED: {}", reason);
+            }
+            ProvAction::LapseSilent => {
+                println!("[prov] job window lapsed — going idle");
+            }
+        }
+    };
+}
+
+/// Decode 32 ASCII hex chars into a 16-byte key.
+fn decode_key16(hex: &str, out: &mut [u8; 16]) -> bool {
+    let b = hex.as_bytes();
+    if b.len() != 32 {
+        return false;
+    }
+    let nib = |c: u8| -> Option<u8> {
+        match c {
+            b'0'..=b'9' => Some(c - b'0'),
+            b'a'..=b'f' => Some(c - b'a' + 10),
+            b'A'..=b'F' => Some(c - b'A' + 10),
+            _ => None,
+        }
+    };
+    for i in 0..16 {
+        let (hi, lo) = match (nib(b[2 * i]), nib(b[2 * i + 1])) {
+            (Some(h), Some(l)) => (h, l),
+            _ => return false,
+        };
+        out[i] = (hi << 4) | lo;
+    }
+    true
+}
 
     // 9. Active Wi-Fi / MQTT reconnection loop.
     loop {
@@ -154,8 +246,18 @@ pub async fn run<I: pn532::Interface>(
                     println!("presence publish failed: {:?}", e);
                 }
 
-                // Subscribe to this device's command topic.
-                let filters = [TopicFilter::new(cmd_topic.as_str())];
+                // Provisioning state machine (one instance per MQTT session;
+                // a reconnect drops any in-flight job — the server TTL lapses).
+                let mut prov = ProvMachine::new();
+
+                // Boot beep: the node is fully up.
+                let _ = PZ.try_send(BeepEvent::Boot);
+
+                // Subscribe to commands AND provisioning jobs in one call.
+                let filters = [
+                    TopicFilter::new(cmd_topic.as_str()),
+                    TopicFilter::new(job_topic.as_str()),
+                ];
                 if let Err(e) = session.subscribe(&filters, &[]).await {
                     println!("subscribe failed: {:?}", e);
                     status_led::set_state(status_led::LedState::DeniedOrOffline);
@@ -176,25 +278,64 @@ pub async fn run<I: pn532::Interface>(
                     )
                     .await
                     {
-                        Ok(Ok(Some(msg))) => match cmd::parse_cmd_slice(msg.payload()) {
-                            Ok(c) => {
-                                if c.grant {
-                                    let _ = relay::RELAY_CHANNEL.try_send(c.pulse_ms);
-                                    status_led::set_state(status_led::LedState::Grant);
-                                    println!("GRANT ({} ms): {}", c.pulse_ms, c.reason);
-                                } else {
-                                    status_led::set_state(status_led::LedState::DeniedOrOffline);
-                                    println!("DENY: {}", c.reason);
+                        Ok(Ok(Some(msg))) => {
+                            let topic = msg.topic();
+                            let payload = msg.payload();
+                            if topic == cmd_topic.as_str() {
+                                match cmd::parse_cmd_slice(payload) {
+                                    Ok(c) => {
+                                        if c.grant {
+                                            let _ = relay::RELAY_CHANNEL.try_send(c.pulse_ms);
+                                            let _ = PZ.try_send(BeepEvent::RelayPulse);
+                                            let _ = PZ.try_send(BeepEvent::Granted);
+                                            status_led::set_state(status_led::LedState::Grant);
+                                            println!("GRANT ({} ms): {}", c.pulse_ms, c.reason);
+                                        } else {
+                                            let _ = PZ.try_send(BeepEvent::Denied);
+                                            status_led::set_state(status_led::LedState::DeniedOrOffline);
+                                            println!("DENY: {}", c.reason);
+                                        }
+                                    }
+                                    Err(e) => println!("cmd parse error: {:?}", e),
+                                }
+                            } else if topic == job_topic.as_str() {
+                                // Job payloads: new arming (Idle only) or the
+                                // keyed claim reply (ClaimWait only).
+                                let now_ms = Instant::now().as_millis() as u64;
+                                match core::str::from_utf8(payload) {
+                                    Ok(text) => {
+                                        let was_claim = matches!(prov.state, ProvState::ClaimWait(..));
+                                        let (_, action) = if was_claim {
+                                            (None, prov.on_claim(text, now_ms))
+                                        } else {
+                                            prov.on_job(text, now_ms, config::PROVISION_WINDOW_SECS)
+                                        };
+                                        handle_prov_action!(
+                                            action, &mut prov, &mut session,
+                                            claim_topic.as_str(), done_topic.as_str()
+                                        );
+                                    }
+                                    Err(_) => println!("[prov] job payload not UTF-8"),
                                 }
                             }
-                            Err(e) => println!("cmd parse error: {:?}", e),
-                        },
+                        }
                         Ok(Ok(None)) => {}
                         Ok(Err(e)) => {
                             println!("MQTT poll error: {:?}", e);
                             break;
                         }
                         Err(_) => {} // No inbound packet within the window.
+                    }
+
+                    // Provisioning deadlines tick with the loop cadence
+                    // (~50 ms): arm-window lapse is silent, claim wait fails.
+                    let now_ms = Instant::now().as_millis() as u64;
+                    {
+                        let tick_action = prov.on_tick(now_ms);
+                        handle_prov_action!(
+                            tick_action, &mut prov, &mut session,
+                            claim_topic.as_str(), done_topic.as_str()
+                        );
                     }
 
                     // Poll NFC and run the edge-triggered debounce state machine.
@@ -212,9 +353,31 @@ pub async fn run<I: pn532::Interface>(
                                     .map(tag_debounce::TagObservation::from_tag_info);
 
                                 if let Some(ev) = debounce.observe(now, obs) {
+                                    // Single tap path: only debounce-confirmed
+                                    // sightings beep/provision/auth.
+                                    let _ = PZ.try_send(BeepEvent::TagDetected);
+
                                     // SAK 0x20 => ISO 14443-4 (DESFire / NTAG 424 DNA).
                                     if ev.sak == 0x20 {
                                         status_led::set_state(status_led::LedState::TagReading);
+
+                                        // Provisioning branch: an armed job
+                                        // consumes the tap instead of the
+                                        // auth path.
+                                        if !prov.state.is_idle() {
+                                            if let Some(tag) = tag_opt.as_ref() {
+                                                let action = prov.on_tap(
+                                                    tag.uid,
+                                                    now_ms,
+                                                    config::CLAIM_WAIT_SECS,
+                                                );
+                                                handle_prov_action!(
+                                                    action, &mut prov, &mut session,
+                                                    claim_topic.as_str(),
+                                                    done_topic.as_str()
+                                                );
+                                            }
+                                        } else {
 
                                         let read_res = {
                                             let pn_ref: &mut _ = &mut *pn;
@@ -307,8 +470,71 @@ pub async fn run<I: pn532::Interface>(
                                                     status_led::LedState::DeniedOrOffline,
                                                 );
                                             }
+                                            } // else: provisioning branch consumed the tap
                                         }
                                     }
+                                }
+
+                                // Provisioning execution: a dedicated busy
+                                // window. provision_tag runs to completion
+                                // (~2-8 s, one APDU exchange per RF round) —
+                                // comfortably under the 30 s MQTT keepalive,
+                                // so no step-splitting is needed. Auth
+                                // publishes are impossible during this window
+                                // because the machine leaves Provisioning
+                                // before returning to the auth path.
+                                if let Some((job_id, key_hex)) = prov.pending_context() {
+                                    status_led::set_state(status_led::LedState::TagReading);
+                                    println!("[prov] provisioning tag (job {})…", job_id);
+
+                                    let mut rnda = [0u8; 16];
+                                    let mut rng = esp_hal::rng::Rng::new();
+                                    for chunk in rnda.chunks_mut(4) {
+                                        let w = rng.random().to_le_bytes();
+                                        chunk.copy_from_slice(&w[..chunk.len()]);
+                                    }
+                                    let mut key = [0u8; 16];
+                                    let run = if decode_key16(key_hex.as_str(), &mut key) {
+                                        let mut report =
+                                            provision::ProvisionReport { uid: [0; 7], counter: 0 };
+                                        let pn_ref: &mut _ = &mut *pn;
+                                        let mut exchange =
+                                            move |apdu: &[u8], out: &mut [u8]| -> Result<
+                                                usize,
+                                                ntag424::NdefError,
+                                            > {
+                                                let resp = nfc::in_data_exchange(pn_ref, 1, apdu)
+                                                    .map_err(|_| ntag424::NdefError::Transport)?;
+                                                if out.len() < resp.len() {
+                                                    return Err(ntag424::NdefError::BufferTooSmall);
+                                                }
+                                                out[..resp.len()].copy_from_slice(resp);
+                                                Ok(resp.len())
+                                            };
+                                        provision::provision_tag(
+                                            &mut exchange,
+                                            &rnda,
+                                            &key,
+                                            config::PROVISION_URL_TEMPLATE,
+                                            &mut report,
+                                        )
+                                        .map(|_| report)
+                                    } else {
+                                        Err(provision::ProvisionError::BadTemplate)
+                                    };
+
+                                    let (ok, counter, reason) = match &run {
+                                        Ok(report) => (true, report.counter, ""),
+                                        Err(e) => {
+                                            println!("[prov] sequence error: {:?}", e);
+                                            (false, 0, "provision error")
+                                        }
+                                    };
+                                    let action = prov.on_provision_done(ok, counter, reason);
+                                    handle_prov_action!(
+                                        action, &mut prov, &mut session,
+                                        claim_topic.as_str(), done_topic.as_str()
+                                    );
                                 }
                             }
                             Err(e) => {
@@ -345,3 +571,4 @@ pub async fn run<I: pn532::Interface>(
         }
     }
 }
+

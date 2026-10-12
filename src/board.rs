@@ -484,6 +484,7 @@ pub fn setup(peripherals: esp_hal::peripherals::Peripherals) -> Setup<DoorNfcIfa
     platform::start_rtos(timg0.timer0, sw_interrupt.software_interrupt0);
 
     println!("ESP32 door node starting...");
+    println!("door build: provision+piezo");
     #[cfg(feature = "nfc-spy")]
     println!("door build: pn532 soft-SPI SPY (sck5 mosi22 miso18 cs17)");
     #[cfg(not(feature = "nfc-spy"))]

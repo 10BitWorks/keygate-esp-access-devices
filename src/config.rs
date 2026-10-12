@@ -45,3 +45,11 @@ pub const RELAY_ACTIVE_LOW: &str = match option_env!("RELAY_ACTIVE_LOW") {
 /// offsets from this template. MUST start with `https://` (NDEF URI prefix
 /// code 0x04) and contain `uid=`, `c=` and `cmac=` in that order.
 pub const PROVISION_URL_TEMPLATE: &str = "https://10bitworks.org/k?uid=&c=&cmac=";
+
+/// Provisioning window (T7): how long an armed job stays tap-able before it
+/// silently lapses (the server-side TTL lapses on its own).
+pub const PROVISION_WINDOW_SECS: u64 = 90;
+
+/// Claim wait (T7): how long a wildcard claim waits for the verifier's keyed
+/// re-publish before the job fails explicitly.
+pub const CLAIM_WAIT_SECS: u64 = 15;

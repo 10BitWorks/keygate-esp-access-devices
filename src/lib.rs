@@ -6,6 +6,7 @@ pub mod auth_msg;
 pub mod reader_supervisor;
 pub mod piezo;
 pub mod provision;
+pub mod provision_flow;
 
 #[cfg(test)]
 mod tests {

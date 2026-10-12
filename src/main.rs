@@ -23,6 +23,8 @@ mod node;
 mod ntag424;
 mod piezo;
 mod platform;
+mod provision;
+mod provision_flow;
 mod reader_supervisor;
 mod relay;
 mod status_led;
