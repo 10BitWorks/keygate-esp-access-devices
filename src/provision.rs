@@ -68,6 +68,9 @@ pub enum ProvisionError {
     MacMismatch,
     /// A caller-provided output buffer was too small.
     BufferTooSmall,
+    /// The URL template is malformed (missing/extra mirrors, bad scheme,
+    /// or too long for the 64-byte APDU carrier).
+    BadTemplate,
 }
 
 impl From<NdefError> for ProvisionError {
@@ -320,6 +323,347 @@ fn check_status(resp: &[u8], sw1: u8, sw2: u8) -> Result<(), ProvisionError> {
     } else {
         Err(ProvisionError::Status(a, b))
     }
+}
+
+// ---------------------------------------------------------------------------
+// Full provisioning sequence (T4)
+// ---------------------------------------------------------------------------
+
+/// UPDATE BINARY instruction (ISO 7816-4): write the NDEF file.
+pub const UPDATE_BINARY_INS: u8 = 0xD6;
+
+/// URI prefix code written into the NDEF URI record payload.
+const HTTPS_PREFIX: &str = "https://";
+
+/// Max NDEF file size we will write (NTAG 424 NDEF file is 256 bytes; Lc is
+/// one byte). The APDU carrier is the transport buffer (>=258 B), so a full
+/// 255-byte file still fits one UPDATE BINARY.
+const MAX_FILE_LEN: usize = 255;
+
+/// Successful provisioning outcome: the tag identity as read back through the
+/// active SUN mirrors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProvisionReport {
+    /// 7-byte card UID (from the UID mirror).
+    pub uid: [u8; 7],
+    /// SUN read counter value (from the counter mirror).
+    pub counter: u32,
+}
+
+/// SDM mirror offsets within the NDEF file (byte 0 = first NLEN byte).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SunOffsets {
+    /// First byte of the 14-ASCII-char UID mirror.
+    uid: usize,
+    /// First byte of the 6-ASCII-char read-counter mirror.
+    read_ctr: usize,
+    /// First byte of the CMAC input (= UID mirror start per AN12196 §3.4.4.2.2).
+    mac_input: usize,
+    /// First byte of the 16-ASCII-char CMAC mirror.
+    mac: usize,
+}
+
+fn find_sub(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
+    if needle.is_empty() || hay.len() < needle.len() {
+        return None;
+    }
+    let mut i = from;
+    while i + needle.len() <= hay.len() {
+        if &hay[i..i + needle.len()] == needle {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Build the NDEF file image (NLEN ‖ URI record) from a URL template and
+/// compute the SDM mirror offsets.
+///
+/// The template must start with `https://` (encoded as URI prefix code 0x04,
+/// stripped from the stored body), contain `uid=`, `c=` and `cmac=` in that
+/// order with nothing between the `=` and the following separator. The empty
+/// placeholders are expanded to the mirror widths (uid 14, counter 6, cmac 16
+/// ASCII chars, per AN12196 §3.4) filled with `'0'` dummies — the chip
+/// overwrites them with live values on every read.
+fn ndef_file_from_template(
+    template: &str,
+    file: &mut [u8; 258],
+) -> Result<(usize, SunOffsets), ProvisionError> {
+    let body = template
+        .strip_prefix(HTTPS_PREFIX)
+        .ok_or(ProvisionError::BadTemplate)?;
+
+    let b = body.as_bytes();
+    // "?uid=" marks the UID mirror start; require it so a bare "uid=" in the
+    // host name cannot pass.
+    let i_uid = find_sub(b, b"?uid=", 0).ok_or(ProvisionError::BadTemplate)?;
+    let i_c = find_sub(b, b"&c=", i_uid).ok_or(ProvisionError::BadTemplate)?;
+    // `&c=` must not be the `&cmac=` prefix: the counter placeholder is empty,
+    // so "&c=" is immediately followed by "&".
+    if b.get(i_c + 3) != Some(&b'&') {
+        return Err(ProvisionError::BadTemplate);
+    }
+    let i_mac = find_sub(b, b"&cmac=", i_c + 3).ok_or(ProvisionError::BadTemplate)?;
+    // Placeholders must be empty: "&cmac=" directly follows "&c=".
+    if i_mac != i_c + 3 {
+        return Err(ProvisionError::BadTemplate);
+    }
+
+    // Expanded body: static parts + mirror-width dummy placeholders.
+    const UID_W: usize = 14;
+    const CTR_W: usize = 6;
+    const MAC_W: usize = 16;
+    let exp_len = b.len() + UID_W + CTR_W + MAC_W;
+    // NLEN(2) + [D1,TL,PL,Type](4) + [Prefix](1) + expanded body
+    let file_len = 7 + exp_len;
+    if file_len > MAX_FILE_LEN {
+        return Err(ProvisionError::BadTemplate);
+    }
+
+    // NLEN = NDEF message length after NLEN = 4 header bytes + payload
+    // (prefix byte + expanded body).
+    let nlen = 4 + 1 + exp_len;
+    file[0] = (nlen >> 8) as u8;
+    file[1] = (nlen & 0xFF) as u8;
+    file[2] = 0xD1; // MB|ME|SR|TNF=1 (well-known)
+    file[3] = 0x01; // type length
+    file[4] = (1 + exp_len) as u8; // payload length (prefix byte + body)
+    file[5] = b'U';
+    file[6] = 0x04; // URI identifier code: "https://"
+
+    // Splice: static-head + 14 dummies + "&c=" + 6 dummies + "&cmac=" + 16 dummies.
+    let mut w = 7;
+    file[w..w + i_uid + 5].copy_from_slice(&b[..i_uid + 5]);
+    w += i_uid + 5;
+    let o_uid = w;
+    file[w..w + UID_W].fill(b'0');
+    w += UID_W;
+    file[w..w + (i_c + 3) - (i_uid + 5)].copy_from_slice(&b[i_uid + 5..i_c + 3]);
+    w += (i_c + 3) - (i_uid + 5);
+    let o_ctr = w;
+    file[w..w + CTR_W].fill(b'0');
+    w += CTR_W;
+    file[w..w + (i_mac + 6) - (i_c + 3)].copy_from_slice(&b[i_c + 3..i_mac + 6]);
+    w += (i_mac + 6) - (i_c + 3);
+    let o_mac = w;
+    file[w..w + MAC_W].fill(b'0');
+    w += MAC_W;
+    debug_assert_eq!(w, file_len);
+
+    let offsets = SunOffsets {
+        uid: o_uid,
+        read_ctr: o_ctr,
+        mac_input: o_uid,
+        mac: o_mac,
+    };
+    // Mirror windows must not overlap and must end inside the file.
+    if offsets.uid + UID_W > offsets.read_ctr
+        || offsets.read_ctr + CTR_W > offsets.mac
+        || offsets.mac + MAC_W > file_len
+    {
+        return Err(ProvisionError::BadTemplate);
+    }
+    Ok((file_len, offsets))
+}
+
+/// Serialize the 18-byte SDM ChangeFileSettings settings block.
+///
+/// Wire order per pylibsdm `structs.py FileSettings::to_bytes` (NTAG 424
+/// datasheet table 73): file_option, access_rights(2), sdm_options,
+/// sdm_access_rights(2), then the enabled 3-byte-LE offsets in the fixed
+/// order uid, read_ctr, mac_input, mac.
+fn sdm_settings_bytes(o: &SunOffsets) -> [u8; 18] {
+    let mut s = [0u8; 18];
+    s[0] = 0x40; // FileOption: SDM enabled (bit6) | CommMode.PLAIN (0)
+    s[1] = 0xEF; // AccessRights: read=0xE (free), write=0xF (no access)
+    s[2] = 0xF0; //               read_write=0xF, change=0x0 (key 0)
+    s[3] = 0xC1; // SDMOptions: uid(128) | read_ctr(64) | ascii(1)
+    s[4] = 0xFE; // SDMAccessRights b1: RFU(0xF) | ctr_ret=0xE (free)
+    s[5] = 0xE1; //                   b2: meta_read=0xE (free) | file_read=0x1 (key 1)
+    let le3 = |v: usize| [v as u8, (v >> 8) as u8, (v >> 16) as u8];
+    s[6..9].copy_from_slice(&le3(o.uid));
+    s[9..12].copy_from_slice(&le3(o.read_ctr));
+    s[12..15].copy_from_slice(&le3(o.mac_input));
+    s[15..18].copy_from_slice(&le3(o.mac));
+    s
+}
+
+/// SUN SDM session key: `AES-CMAC(tag_key, SV2)` with
+/// `SV2 = 3CC3 0001 0080 ‖ uid(7B) ‖ counter(3B LSB-first)` (AN12196 §3.3).
+///
+/// Distinct from the AUTH session SV2 (`0x5AA5 …`) in `ntag424`.
+pub fn sun_session_key(
+    tag_key: &[u8; 16],
+    uid: &[u8; 7],
+    counter: u32,
+) -> [u8; 16] {
+    let c = counter.to_le_bytes();
+    let sv2: [u8; 16] = [
+        0x3c, 0xc3, 0x00, 0x01, 0x00, 0x80, //
+        uid[0], uid[1], uid[2], uid[3], uid[4], uid[5], uid[6], //
+        c[0], c[1], c[2],
+    ];
+    aes_cmac(tag_key, &sv2)
+}
+
+/// MACt: SUN CMAC = odd-index bytes (`[1::2]`) of the full 16-byte digest.
+fn sun_trunc_mac(full: &[u8; 16]) -> [u8; 8] {
+    let mut out = [0u8; 8];
+    for (i, o) in out.iter_mut().enumerate() {
+        *o = full[2 * i + 1];
+    }
+    out
+}
+
+/// Compute the SUN CMAC the tag mirrors: odd-byte truncation of
+/// `AES-CMAC(sun_session_key(tag_key, uid, ctr), mac_input)` where mac_input
+/// is the exact ASCII the tag signs (`uid14&c=ctr6&cmac=`).
+fn sun_tag_cmac(tag_key: &[u8; 16], uid: &[u8; 7], counter: u32, mac_input: &[u8]) -> [u8; 8] {
+    let session = sun_session_key(tag_key, uid, counter);
+    sun_trunc_mac(&aes_cmac(&session, mac_input))
+}
+
+/// Select NDEF app + file 02 (plain, expect SW 9000).
+fn select_ndef<F>(exchange: &mut F) -> Result<(), ProvisionError>
+where
+    F: FnMut(&[u8], &mut [u8]) -> Result<usize, NdefError>,
+{
+    use crate::ntag424::{SELECT_NDEF_APP_APDU, SELECT_NDEF_FILE_02_APDU};
+    let mut resp = [0u8; 258];
+    let n = exchange(&SELECT_NDEF_APP_APDU, &mut resp)?;
+    check_status(&resp[..n], 0x90, 0x00)?;
+    let n = exchange(&SELECT_NDEF_FILE_02_APDU, &mut resp)?;
+    check_status(&resp[..n], 0x90, 0x00)?;
+    Ok(())
+}
+
+/// Read the NDEF file (NLEN + body) into `file`; returns the file length.
+fn read_file<F>(exchange: &mut F, file: &mut [u8; 258]) -> Result<usize, ProvisionError>
+where
+    F: FnMut(&[u8], &mut [u8]) -> Result<usize, NdefError>,
+{
+    let mut resp = [0u8; 258];
+    let n = exchange(&[0x00, crate::ntag424::READ_BINARY_INS, 0x00, 0x00, 0x02], &mut resp)?;
+    check_status(&resp[..n], 0x90, 0x00)?;
+    if n < 4 {
+        return Err(ProvisionError::ShortResponse);
+    }
+    let nlen = ((resp[0] as usize) << 8) | (resp[1] as usize);
+    if nlen == 0 || 2 + nlen > file.len() {
+        return Err(ProvisionError::ShortResponse);
+    }
+    let apdu = [
+        0x00,
+        crate::ntag424::READ_BINARY_INS,
+        0x00,
+        0x02,
+        nlen as u8,
+    ];
+    let n = exchange(&apdu, &mut resp)?;
+    check_status(&resp[..n], 0x90, 0x00)?;
+    let data = n.checked_sub(2).ok_or(ProvisionError::ShortResponse)?;
+    if data < nlen {
+        return Err(ProvisionError::ShortResponse);
+    }
+    // Reconstruct the full file view (NLEN ‖ message) so callers can index
+    // with plain FILE offsets (byte 0 = first NLEN byte, per AN12196).
+    if 2 + nlen > file.len() {
+        return Err(ProvisionError::BufferTooSmall);
+    }
+    file[0] = (nlen >> 8) as u8;
+    file[1] = (nlen & 0xFF) as u8;
+    file[2..2 + nlen].copy_from_slice(&resp[..nlen]);
+    Ok(nlen)
+}
+
+/// Run the full provisioning sequence against a blank (factory-keyed) tag.
+///
+/// Steps (AN12196 provisioning flow, restricted to what our verifier checks):
+/// select NDEF → `AuthenticateEV2First` with factory key 0 → `ChangeKey` 1 to
+/// the job key → write NDEF (template with empty placeholders + NLEN) via
+/// UPDATE BINARY while the file is still open → `ChangeFileSettings` to enable
+/// SDM mirroring under key 1 → read back through the live mirrors and verify
+/// the mirrored CMAC locally. Fills `out` with the tag identity read back.
+///
+/// `rnda` seeds the auth handshake (deterministic, host-testable). The
+/// transport `exchange` sends one APDU and returns `response ‖ SW1 SW2` —
+/// same contract as `ntag424::read_ndef_message`.
+pub fn provision_tag<F>(
+    exchange: &mut F,
+    rnda: &[u8; 16],
+    job_key: &[u8; 16],
+    url_template: &str,
+    out: &mut ProvisionReport,
+) -> Result<(), ProvisionError>
+where
+    F: FnMut(&[u8], &mut [u8]) -> Result<usize, NdefError>,
+{
+    let mut file = [0u8; 258];
+    let (file_len, offsets) = ndef_file_from_template(url_template, &mut file)?;
+
+    // 1) Select NDEF application + file.
+    select_ndef(exchange)?;
+
+    // 2) Authenticate with factory key 0 — NEVER change key 0.
+    let factory = [0u8; 16];
+    let mut session = authenticate_ev2_first(&factory, 0, rnda, exchange)?;
+
+    // 3) ChangeKey 1 <- job key (CommMode.Full).
+    let mut frame = [0u8; 64];
+    let n = change_key(&mut session, 1, job_key, 1, &mut frame)?;
+    let (apdu, len) = crate::ntag424::wrap_apdu(crate::provision::CHANGE_KEY_INS, &frame[..n]);
+    let mut resp = [0u8; 258];
+    let rn = exchange(&apdu[..len], &mut resp)?;
+    check_status(&resp[..rn], 0x91, 0x00)?;
+
+    // 4) Write NDEF (NLEN + record) while the file is still openly writable.
+    let apdu = [
+        0x00,
+        UPDATE_BINARY_INS,
+        0x00,
+        0x00,
+        file_len as u8,
+    ];
+    let mut update = [0u8; 260];
+    update[..5].copy_from_slice(&apdu);
+    update[5..5 + file_len].copy_from_slice(&file[..file_len]);
+    let rn = exchange(&update[..5 + file_len], &mut resp)?;
+    check_status(&resp[..rn], 0x90, 0x00)?;
+
+    // 5) ChangeFileSettings on file 2: enable SDM mirrors (CommMode.Full).
+    let settings = sdm_settings_bytes(&offsets);
+    let n = change_file_settings(&mut session, 2, &settings, &mut frame)?;
+    let (apdu, len) =
+        crate::ntag424::wrap_apdu(crate::provision::CHANGE_FILE_SETTINGS_INS, &frame[..n]);
+    let rn = exchange(&apdu[..len], &mut resp)?;
+    check_status(&resp[..rn], 0x91, 0x00)?;
+
+    // 6) Read back through the active mirrors and verify locally.
+    select_ndef(exchange)?;
+    let nlen = read_file(exchange, &mut resp)?;
+    let uri = crate::ntag424::extract_ndef_uri(&resp[2..2 + nlen])
+        .map_err(ProvisionError::Transport)?;
+    let sun = crate::ntag424::parse_sun_url(uri).map_err(|_| ProvisionError::MacMismatch)?;
+
+    // CMAC input is the exact raw ASCII the tag signed: uid mirror + separators.
+    if offsets.uid + 14 > nlen || offsets.read_ctr + 6 > nlen {
+        return Err(ProvisionError::ShortResponse);
+    }
+    let mut mac_input = [0u8; 29];
+    mac_input[..14].copy_from_slice(&resp[offsets.uid..offsets.uid + 14]);
+    mac_input[14..17].copy_from_slice(b"&c=");
+    mac_input[17..23].copy_from_slice(&resp[offsets.read_ctr..offsets.read_ctr + 6]);
+    mac_input[23..].copy_from_slice(b"&cmac=");
+
+    let expected = sun_tag_cmac(job_key, &sun.uid, sun.counter, &mac_input);
+    if !constant_time_eq(&expected, &sun.cmac) {
+        return Err(ProvisionError::MacMismatch);
+    }
+
+    out.uid = sun.uid;
+    out.counter = sun.counter;
+    Ok(())
 }
 
 /// Run `AuthenticateEV2First` (Part 1 + Part 2) and establish a session.
@@ -605,4 +949,381 @@ mod provision_tests {
             Err(ProvisionError::MacMismatch)
         );
     }
+
+    // -----------------------------------------------------------------------
+    // T4: provisioning sequence
+    // -----------------------------------------------------------------------
+
+    /// Uppercase ASCII hex encoder (matches NXP SUN mirrors + the verifier's
+    /// `write_hex_upper`).
+    fn enc_hex_upper(out: &mut [u8], src: &[u8]) {
+        const HEX: &[u8; 16] = b"0123456789ABCDEF";
+        for (i, b) in src.iter().enumerate() {
+            out[2 * i] = HEX[(b >> 4) as usize];
+            out[2 * i + 1] = HEX[(b & 0x0f) as usize];
+        }
+    }
+
+    /// Cross-repo pin: the firmware SUN session/CMAC construction must
+    /// reproduce the verifier's pylibsdm-generated golden vectors
+    /// (access-control-verifier tests/crypto_vectors.rs, vector set 1).
+    #[test]
+    fn test_sun_cmac_matches_verifier_goldens() {
+        // tag_key (diversified job key) and UID from the golden set.
+        let tag_key: [u8; 16] = h("71A4EC87107F7FC71B2220E23D8CE93A");
+        let uid: [u8; 7] = h("046522CABC5D80");
+        // (counter, expected session key, expected cmac)
+        let cases: &[(u32, &str, &str)] = &[
+            (1, "C30319AC9B924D5D42F1DB871821E65B", "4BE403BA3E9B7BD0"),
+            (8, "08D4380C34F41ED6506C6362AA43B287", "C894C366C5802E34"),
+            (11, "C371C486F40250C4B46F27ED2BF9D64C", "2EBFCD8D2474E800"),
+            (255, "3048E917D855466160E73E37E4622C94", "30A08B95BAAD09A4"),
+        ];
+        for &(ctr, ses, mac) in cases {
+            assert_eq!(sun_session_key(&tag_key, &uid, ctr), h(ses));
+            // mac_input per the pinned wire format: uid14&c=ctr6&cmac=
+            let mut input = [0u8; 29];
+            enc_hex_upper(&mut input[..14], &uid);
+            input[14..17].copy_from_slice(b"&c=");
+            let cb = ctr.to_be_bytes();
+            enc_hex_upper(&mut input[17..23], &cb[1..4]);
+            input[23..].copy_from_slice(b"&cmac=");
+            assert_eq!(sun_tag_cmac(&tag_key, &uid, ctr, &input), h(mac));
+        }
+    }
+
+    #[test]
+    fn test_template_offsets_and_ndef_image() {
+        let mut file = [0u8; 258];
+        let (len, o) =
+            ndef_file_from_template(TEMPLATE, &mut file)
+                .expect("template parses");
+        // Expanded body = 30 static + 36 mirror = 66 chars -> file 73 bytes.
+        assert_eq!(len, 73);
+        assert_eq!(o.uid, 28); // 7 + "?uid=" end in body (21)
+        assert_eq!(o.read_ctr, o.uid + 14 + 3); // 14-char mirror + "&c="
+        assert_eq!(o.mac, o.read_ctr + 6 + 6); // 6-char mirror + "&cmac="
+        assert_eq!(o.mac_input, o.uid);
+        assert_eq!(o.mac + 16, len); // CMAC mirror ends at EOF
+        // Record image sanity.
+        assert_eq!(file[0], 0x00);
+        assert_eq!(file[1], 71); // NLEN = 4 hdr + 1 prefix + 66 body
+        assert_eq!(&file[2..7], &[0xD1, 0x01, 67, b'U', 0x04]);
+        assert_eq!(&file[7..12], b"10bit");
+        assert_eq!(&file[24..28], b"uid=");
+        assert_eq!(&file[28..42], b"00000000000000"); // uid dummy
+        assert_eq!(&file[42..45], b"&c=");
+        assert_eq!(&file[45..51], b"000000"); // counter dummy
+        assert_eq!(&file[51..57], b"&cmac=");
+        assert_eq!(&file[57..73], b"0000000000000000"); // cmac dummy
+    }
+
+    #[test]
+    fn test_template_rejects_malformed() {
+        let mut file = [0u8; 258];
+        // Missing scheme.
+        assert_eq!(
+            ndef_file_from_template("http://x/k?uid=&c=&cmac=", &mut file),
+            Err(ProvisionError::BadTemplate)
+        );
+        // Missing cmac.
+        assert_eq!(
+            ndef_file_from_template("https://x/k?uid=&c=", &mut file),
+            Err(ProvisionError::BadTemplate)
+        );
+        // Non-empty counter placeholder (mirror overlap).
+        assert_eq!(
+            ndef_file_from_template("https://x/k?uid=&c=ZZZZZZ&cmac=", &mut file),
+            Err(ProvisionError::BadTemplate)
+        );
+        // Bare uid= without query marker.
+        assert_eq!(
+            ndef_file_from_template("https://uid=&c=&cmac=", &mut file),
+            Err(ProvisionError::BadTemplate)
+        );
+    }
+
+    #[test]
+    fn test_sdm_settings_wire_bytes() {
+        let o = SunOffsets { uid: 28, read_ctr: 45, mac_input: 28, mac: 57 };
+        let s = sdm_settings_bytes(&o);
+        assert_eq!(
+            s,
+            [
+                0x40, // file option: SDM on, PLAIN
+                0xEF, 0xF0, // read=E, write=F, rw=F, change=0
+                0xC1, // uid+read_ctr+ascii
+                0xFE, 0xE1, // ctr_ret=E free, meta=E free, file_read=1
+                28, 0, 0, // uid_offset LE24
+                45, 0, 0, // read_ctr_offset
+                28, 0, 0, // mac_input_offset
+                57, 0, 0, // mac_offset
+            ]
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // T4: full-sequence mock card
+    // -----------------------------------------------------------------------
+
+    /// Mirrors `TEMPLATE` (config is main-only:
+    /// its `env!()` credentials cannot compile on the host test target).
+    const TEMPLATE: &str = "https://10bitworks.org/k?uid=&c=&cmac=";
+
+    const MOCK_UID_HEX: &str = "046522CABC5D80";
+    const MOCK_JOB_KEY_HEX: &str = "aabbccddeeff00112233445566778899";
+    const MOCK_RNDB: &str = "b9e2fc789b64bf237cccaa20ec7e6e48";
+    const MOCK_CNTR: u32 = 1;
+
+    /// Stateful card stub: factory key 0, EV2 auth, ChangeKey, file write,
+    /// ChangeFileSettings, and SUN-mirrored reads computed with the REAL
+    /// construction (so the read-back verify is genuinely end-to-end).
+    struct MockCard {
+        key1: [u8; 16],
+        file: [u8; 258],
+        file_len: usize,
+        sdm: bool,
+        fail_file_select: bool,
+        // session state after auth
+        sess: Option<Session>,
+        cmdctr: u16,
+        rndb: [u8; 16],
+        recorded_settings: Option<[u8; 18]>,
+    }
+
+    impl MockCard {
+        fn new() -> Self {
+            Self {
+                key1: [0u8; 16],
+                file: [0u8; 258],
+                file_len: 0,
+                sdm: false,
+                fail_file_select: false,
+                sess: None,
+                cmdctr: 0,
+                rndb: h(MOCK_RNDB),
+                recorded_settings: None,
+            }
+        }
+
+        /// The SUN CMAC this card mirrors, computed with the real rules.
+        fn sun_cmac_hex(&self, uid: &[u8; 7]) -> [u8; 16] {
+            let mut out = [0u8; 16];
+            let cmac = sun_tag_cmac(&self.key1, uid, MOCK_CNTR, &self.mac_input(uid));
+            enc_hex_upper(&mut out, &cmac);
+            out
+        }
+
+        fn mac_input(&self, uid: &[u8; 7]) -> [u8; 29] {
+            let mut m = [0u8; 29];
+            enc_hex_upper(&mut m[..14], uid);
+            m[14..17].copy_from_slice(b"&c=");
+            let cb = MOCK_CNTR.to_be_bytes();
+            enc_hex_upper(&mut m[17..23], &cb[1..4]);
+            m[23..].copy_from_slice(b"&cmac=");
+            m
+        }
+
+        fn handle(&mut self, apdu: &[u8], out: &mut [u8]) -> Result<usize, NdefError> {
+            let ins = apdu[1];
+            match (apdu[0], ins) {
+                // SELECT (ISO) — NDEF app AID or file 02.
+                (0x00, 0xA4) => {
+                    if apdu[2] == 0x04 {
+                        out[0] = 0x90;
+                        out[1] = 0x00;
+                        return Ok(2);
+                    }
+                    // file 02 select
+                    if self.fail_file_select {
+                        out[0] = 0x6A;
+                        out[1] = 0x82;
+                        return Ok(2);
+                    }
+                    out[0] = 0x90;
+                    out[1] = 0x00;
+                    Ok(2)
+                }
+                // AuthenticateEV2First part 1 (native CLA 0x90).
+                (0x90, 0x71) => {
+                    let factory = [0u8; 16];
+                    let mut e = self.rndb;
+                    cbc_encrypt_inplace(&factory, &NULL_IV, &mut e);
+                    out[..16].copy_from_slice(&e);
+                    out[16] = 0x91;
+                    out[17] = 0xAF;
+                    Ok(18)
+                }
+                // Auth part 2.
+                (0x90, 0xAF) => {
+                    let factory = [0u8; 16];
+                    let lc = apdu[4] as usize;
+                    let mut data = [0u8; 32];
+                    data.copy_from_slice(&apdu[5..5 + lc]);
+                    cbc_decrypt_inplace(&factory, &NULL_IV, &mut data);
+                    let mut rnda = [0u8; 16];
+                    rnda.copy_from_slice(&data[..16]);
+                    let sk = crate::ntag424::derive_session_keys(&factory, &rnda, &self.rndb);
+                    self.sess = Some(Session {
+                        ti: [0x11, 0x22, 0x33, 0x44],
+                        cmdctr: 0,
+                        k_enc: sk.enc,
+                        k_mac: sk.mac,
+                    });
+                    self.cmdctr = 0;
+                    let mut resp = [0u8; 32];
+                    resp[0..4].copy_from_slice(&[0x11, 0x22, 0x33, 0x44]);
+                    resp[4..20].copy_from_slice(&rotate_left16(&rnda));
+                    cbc_encrypt_inplace(&factory, &NULL_IV, &mut resp);
+                    out[..32].copy_from_slice(&resp);
+                    out[32] = 0x91;
+                    out[33] = 0x00;
+                    Ok(34)
+                }
+                // ChangeKey / ChangeFileSettings (CommMode.Full, native).
+                (0x90, CHANGE_KEY_INS) | (0x90, CHANGE_FILE_SETTINGS_INS) => {
+                    let s = self.sess.expect("auth first");
+                    let lc = apdu[4] as usize;
+                    let frame = &apdu[5..5 + lc];
+                    // frame = hdr ‖ enc(32) ‖ cmac(8)
+                    let mut plain = [0u8; 32];
+                    plain.copy_from_slice(&frame[1..33]);
+                    let iv = iv_for_enc(&Session {
+                        ti: s.ti,
+                        cmdctr: self.cmdctr,
+                        k_enc: s.k_enc,
+                        k_mac: s.k_mac,
+                    });
+                    cbc_decrypt_inplace(&s.k_enc, &iv, &mut plain);
+                    if apdu[1] == CHANGE_KEY_INS {
+                        // plain = new key ‖ version
+                        self.key1.copy_from_slice(&plain[..16]);
+                        assert_eq!(plain[16], 1, "key version");
+                    } else {
+                        let mut st = [0u8; 18];
+                        st.copy_from_slice(&plain[..18]);
+                        self.recorded_settings = Some(st);
+                        self.sdm = true;
+                    }
+                    self.cmdctr = self.cmdctr.wrapping_add(1);
+                    out[0] = 0x91;
+                    out[1] = 0x00;
+                    Ok(2)
+                }
+                // UPDATE BINARY (ISO).
+                (0x00, UPDATE_BINARY_INS) => {
+                    let off = ((apdu[2] as usize) << 8) | apdu[3] as usize;
+                    let lc = apdu[4] as usize;
+                    assert_eq!(off, 0, "whole-file write only");
+                    self.file_len = lc;
+                    self.file[..lc].copy_from_slice(&apdu[5..5 + lc]);
+                    out[0] = 0x90;
+                    out[1] = 0x00;
+                    Ok(2)
+                }
+                // READ BINARY (ISO) — mirrors active after SDM enable.
+                (0x00, 0xB0) => {
+                    let off = ((apdu[2] as usize) << 8) | apdu[3] as usize;
+                    let le = apdu[4] as usize;
+                    let uid: [u8; 7] = h(MOCK_UID_HEX);
+                    let mut view = [0u8; 258];
+                    let n = self.file_len;
+                    view[..n].copy_from_slice(&self.file[..n]);
+                    if self.sdm {
+                        // Fill mirrors at the recorded settings offsets.
+                        let st = self.recorded_settings.expect("sdm settings");
+                        let rd = |b: &[u8]| -> usize {
+                            b[0] as usize | ((b[1] as usize) << 8) | ((b[2] as usize) << 16)
+                        };
+                        let uo = rd(&st[6..9]);
+                        let co = rd(&st[9..12]);
+                        let mo = rd(&st[15..18]);
+                        enc_hex_upper(&mut view[uo..uo + 14], &uid);
+                        let cb = MOCK_CNTR.to_be_bytes();
+                        enc_hex_upper(&mut view[co..co + 6], &cb[1..4]);
+                        view[mo..mo + 16].copy_from_slice(&self.sun_cmac_hex(&uid));
+                    }
+                    let end = (off + le).min(n);
+                    let data = end.saturating_sub(off);
+                    out[..data].copy_from_slice(&view[off..end]);
+                    out[data] = 0x90;
+                    out[data + 1] = 0x00;
+                    Ok(data + 2)
+                }
+                _ => Err(NdefError::Transport),
+            }
+        }
+    }
+
+    #[test]
+    fn test_provision_full_sequence_happy() {
+        let job_key: [u8; 16] = h(MOCK_JOB_KEY_HEX);
+        let rnda: [u8; 16] = h(RNDA);
+        let mut card = MockCard::new();
+        let mut report = ProvisionReport { uid: [0; 7], counter: 0 };
+        let res = {
+            let mut exchange = |apdu: &[u8], out: &mut [u8]| card.handle(apdu, out);
+            provision_tag(
+                &mut exchange,
+                &rnda,
+                &job_key,
+                TEMPLATE,
+                &mut report,
+            )
+        };
+        res.expect("provisioning succeeds");
+        // Report carries the identity read back through the mirrors.
+        assert_eq!(report.uid, h(MOCK_UID_HEX));
+        assert_eq!(report.counter, MOCK_CNTR);
+        // Card actually took the job key.
+        assert_eq!(card.key1, job_key);
+        // Card recorded exactly the expected 18-byte SDM settings.
+        let mut file = [0u8; 258];
+        let (_, o) =
+            ndef_file_from_template(TEMPLATE, &mut file).unwrap();
+        assert_eq!(card.recorded_settings, Some(sdm_settings_bytes(&o)));
+        // The written NDEF contains the expanded dummy placeholders.
+        let written = &card.file[..card.file_len];
+        let body = core::str::from_utf8(&written[7..]).unwrap();
+        assert_eq!(body.len(), 66);
+        assert_eq!(
+            body,
+            "10bitworks.org/k?uid=00000000000000&c=000000&cmac=0000000000000000"
+        );
+    }
+
+    #[test]
+    fn test_provision_file_select_failure_propagates() {
+        let job_key: [u8; 16] = h(MOCK_JOB_KEY_HEX);
+        let rnda: [u8; 16] = h(RNDA);
+        let mut card = MockCard::new();
+        card.fail_file_select = true;
+        let mut report = ProvisionReport { uid: [0; 7], counter: 0 };
+        let res = {
+            let mut exchange = |apdu: &[u8], out: &mut [u8]| card.handle(apdu, out);
+            provision_tag(
+                &mut exchange,
+                &rnda,
+                &job_key,
+                TEMPLATE,
+                &mut report,
+            )
+        };
+        assert_eq!(res, Err(ProvisionError::Status(0x6A, 0x82)));
+    }
+
+    #[test]
+    fn test_config_template_constant() {
+        // The template lives in config (not hardcoded in provision.rs) and
+        // satisfies the parser's contract.
+        let t = TEMPLATE;
+        assert!(t.starts_with("https://"));
+        assert!(t.contains("?uid="));
+        assert!(t.contains("&c="));
+        assert!(t.contains("&cmac="));
+        let mut file = [0u8; 258];
+        assert!(ndef_file_from_template(t, &mut file).is_ok());
+    }
+
 }
+

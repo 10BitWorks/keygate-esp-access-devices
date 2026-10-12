@@ -37,3 +37,11 @@ pub const RELAY_ACTIVE_LOW: &str = match option_env!("RELAY_ACTIVE_LOW") {
     Some(val) => val,
     None => "true",
 };
+
+/// SUN provisioning URL template (T4).
+///
+/// The three empty placeholders (`uid=`, `c=`, `cmac=`) are where the NTAG 424
+/// SDM mirrors land; `provision::provision_tag` computes the mirror file
+/// offsets from this template. MUST start with `https://` (NDEF URI prefix
+/// code 0x04) and contain `uid=`, `c=` and `cmac=` in that order.
+pub const PROVISION_URL_TEMPLATE: &str = "https://10bitworks.org/k?uid=&c=&cmac=";
