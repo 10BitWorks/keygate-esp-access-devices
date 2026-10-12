@@ -52,6 +52,52 @@ Adding a new board target requires two additions:
 - **Relay Strike:** GPIO13 (active-low default)
   - *Design note:* Relay uses GPIO13 rather than D12. GPIO12 is the ESP32 MTDI strapping pin controlling internal SPI flash voltage (VDD_SDIO 3.3V vs 1.8V) at boot. Connecting relay circuitry or pull-downs to GPIO12 risks boot failure and flash read errors.
 - **Status LED:** GPIO2 (onboard LED, active-low default)
+- **Piezo (passive, bridge-driven):** leg A → GPIO32, leg B → GPIO33 (either
+  leg on either pin — the drive is differential and polarity-free). A passive
+  2-terminal disc connects directly across the two GPIOs; a single-pin +
+  GND wiring also works but is noticeably quieter (half the swing). An
+  unwired board simply stays silent.
+
+### XIAO ESP32-C6 Piezo
+
+- **Piezo (passive, bridge-driven):** leg A → GPIO9, leg B → GPIO10. Same
+  polarity-free differential drive as the door board.
+
+### Piezo Feedback Reference
+
+All events are advisory and never block the NFC/MQTT loop (drop-on-full
+channel). Patterns (`freq Hz × ms`, gap-separated for multi-tone):
+
+| Event | Pattern | Sounds like |
+| --- | --- | --- |
+| Tag detected | 2600 × 60 | single chirp |
+| Auth published | 2600 × 40 | short tick |
+| Access granted | 3200 × 120, 3200 × 120 | two mid beeps |
+| Access denied | 1300 × 150, 1300 × 150 | two low buzzes |
+| Relay pulse | 2600 × 400 | long beep |
+| Provision armed | 3500 × 80 ×3 | three high chirps |
+| Provision OK | 2600/3200/4000 × 120 | ascending triple |
+| Provision failed | 3500/2600/2000 × 150 | descending triple |
+| Boot complete | 2600 × 60 | single chirp |
+
+### Tap-to-Enroll Provisioning (writer-role nodes)
+
+A blank NTAG 424 is provisioned on the reader itself:
+
+1. **Arm:** admin UI (verifier `#provision` panel) or
+   `POST /admin/api/jobs {member_key, device_id}` — see the verifier runbook's
+   *Tag Provisioning (OTA tap-to-enroll)* section for the full MQTT contract.
+2. **Tap:** hold the blank tag on the reader — three high chirps confirm the
+   armed job, then the provisioning sequence runs (~2-8 s): authenticate with
+   factory key 0, write the member's diversified key into key 1, write the SUN
+   NDEF URL, lock the file, and verify the mirrors read back correctly.
+3. **Result:** ascending triple = provisioned (done published, tag immediately
+   active); descending triple = failed (error published, job closed).
+4. The 90 s arm window lapses silently if no tag is tapped; a wildcard claim
+   that is not answered within 15 s fails the job explicitly.
+
+Firmware-side roles: a node only arms when the verifier has set its device
+role to `writer` or `both`.
 
 ### PN532 Lockup Supervisor & RSTO Recovery
 
