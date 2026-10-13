@@ -198,13 +198,22 @@ pub fn poll_tag<I: pn532::Interface, T: CountDown<Time = fugit::MillisDurationU3
             // (see docs/PN532-SPI-NOTES.md, "Symptom → diagnosis table").
             #[cfg(target_arch = "xtensa")]
             {
-                let hint = match &e {
-                    pn532::Error::TimeoutAck => "PN532 stopped ACKing mid-run — check wiring/connectors.",
-                    pn532::Error::TimeoutResponse => "RF response timeout — tag responses on this module run 240ms-3s (slow RF front-end). Hold the tag flat on the antenna; if this persists with NO tag nearby, check antenna/module.",
-                    pn532::Error::BadAck => "Garbage frame where ACK expected — recovery signature; power-cycle the module if repeated.",
-                    _ => "SPI interface error.",
-                };
-                esp_println::println!("[nfc] poll err ({:?}): {}", e, hint);
+                // Error-storm guard: a wedged reader can error at loop rate,
+                // and each println blocks on the UART — a flood here starves
+                // the async executor (MQTT/WiFi tasks stall, presence dies).
+                // Print the first error in full, then only every 512th.
+                use core::sync::atomic::{AtomicU32, Ordering};
+                static POLL_ERR_N: AtomicU32 = AtomicU32::new(0);
+                let n = POLL_ERR_N.fetch_add(1, Ordering::Relaxed);
+                if n == 0 || n % 512 == 0 {
+                    let hint = match &e {
+                        pn532::Error::TimeoutAck => "PN532 stopped ACKing mid-run — check wiring/connectors.",
+                        pn532::Error::TimeoutResponse => "RF response timeout — tag responses on this module run 240ms-3s (slow RF front-end). Hold the tag flat on the antenna; if this persists with NO tag nearby, check antenna/module.",
+                        pn532::Error::BadAck => "Garbage frame where ACK expected — recovery signature; power-cycle the module if repeated.",
+                        _ => "SPI interface error.",
+                    };
+                    esp_println::println!("[nfc] poll err #{} ({:?}): {}", n, e, hint);
+                }
             }
             match e {
                 pn532::Error::TimeoutAck | pn532::Error::TimeoutResponse => NfcError::Timeout,
