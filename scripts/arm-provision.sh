@@ -37,7 +37,7 @@ log() { printf '%s %s\n' "$(date +%H:%M:%S)" "$*"; }
 node_state() {
     timeout 15 ssh -o BatchMode=yes -o ConnectTimeout=8 \
         -o StrictHostKeyChecking=no "$BROKER_SSH" \
-        "emqx ctl clients list 2>/dev/null | grep -E '^Client\\($DEVICE'" 2>/dev/null
+        "emqx ctl clients list 2>/dev/null | grep -E '^Client\\(($DEVICE|keygate),'" 2>/dev/null
 }
 
 STABLE=0

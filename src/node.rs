@@ -161,15 +161,15 @@ fn decode_key16(hex: &str, out: &mut [u8; 16]) -> bool {
                 Ok(_) => println!("WiFi connected"),
                 Err(e) => {
                     blog!("WiFi connection failed: {:?}", e);
-                    Timer::after(Duration::from_secs(next_backoff(&mut backoff_secs))).await;
+                    Timer::after(Duration::from_secs(1)).await;
                     continue;
                 }
             }
         }
 
-        // Wait for DHCP (max 15 s before retrying).
+        // Wait for DHCP (up to 30 s with 500 ms poll).
         let mut dhcp_ok = false;
-        for _ in 0..30 {
+        for _ in 0..60 {
             if stack.config_v4().is_some() {
                 dhcp_ok = true;
                 break;
@@ -178,7 +178,7 @@ fn decode_key16(hex: &str, out: &mut [u8; 16]) -> bool {
         }
         if !dhcp_ok {
             blog!("DHCP timeout — retrying...");
-            Timer::after(Duration::from_secs(next_backoff(&mut backoff_secs))).await;
+            Timer::after(Duration::from_secs(1)).await;
             continue;
         }
 
@@ -228,7 +228,7 @@ fn decode_key16(hex: &str, out: &mut [u8; 16]) -> bool {
         let mqtt_config =
             match ConfigBuilder::new(Buffers::new(&mut mqtt_rx_buf, &mut mqtt_tx_buf))
                 .client_id(config::DEVICE_ID)
-                .and_then(|c| c.auth(config::MQTT_USER, config::MQTT_PASSWORD.as_bytes()))
+                .and_then(|c| c.auth(config::DEVICE_ID, config::MQTT_PASSWORD.as_bytes()))
                 .and_then(|c| c.will(will))
             {
                 Ok(c) => c,

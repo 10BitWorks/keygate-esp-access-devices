@@ -8,8 +8,17 @@ pub const WIFI_SSID: &str = env!("WIFI_SSID");
 /// Wi-Fi Password (mandatory)
 pub const WIFI_PASS: &str = env!("WIFI_PASS");
 
-/// MQTT Username (mandatory)
-pub const MQTT_USER: &str = env!("MQTT_USER");
+/// Unique Device Identifier (optional, default: "keygate1")
+pub const DEVICE_ID: &str = match option_env!("DEVICE_ID") {
+    Some(val) => val,
+    None => "keygate1",
+};
+
+/// MQTT Username (optional, defaults to DEVICE_ID so client ID and username are identical)
+pub const MQTT_USER: &str = match option_env!("MQTT_USER") {
+    Some(val) => val,
+    None => DEVICE_ID,
+};
 
 /// MQTT Password (mandatory)
 pub const MQTT_PASSWORD: &str = env!("MQTT_PASSWORD");
@@ -24,12 +33,6 @@ pub const MQTT_HOST: &str = match option_env!("MQTT_HOST") {
 pub const MQTT_PORT: &str = match option_env!("MQTT_PORT") {
     Some(val) => val,
     None => "1883",
-};
-
-/// Unique Device Identifier (optional, default: "keygate1")
-pub const DEVICE_ID: &str = match option_env!("DEVICE_ID") {
-    Some(val) => val,
-    None => "keygate1",
 };
 
 /// Relay Trigger Logic Polarity (optional, default: "true")
