@@ -375,6 +375,57 @@ async fn mqtt_runner(
     let mut backoff_secs: u64 = 1;
     let mut cycle: u32 = 0;
 
+    // Pick the STRONGEST AP for our SSID and pin the association to it.
+    //
+    // The fleet SSID is broadcast by many BSSIDs with ~50 dB of spread (bench
+    // survey: two APs at ≈-40 dBm across the room, distant cisco units at
+    // -70..-90). Without pinning, association landed on a -86 dBm distant AP
+    // while two -40 dBm APs sat next to the bench — every packet-starved
+    // keepalive kick and boot marathon followed from that.
+    match wifi_controller
+        .scan_async(&esp_radio::wifi::scan::ScanConfig::default())
+        .await
+    {
+        Ok(aps) => {
+            let best = aps
+                .iter()
+                .filter(|ap| ap.ssid.as_str() == config::WIFI_SSID)
+                .max_by_key(|ap| ap.signal_strength);
+            match best {
+                Some(ap) => {
+                    println!(
+                        "wifi: best {} AP {:02x?} ch {} rssi {} dBm (of {} scanned)",
+                        ap.ssid.as_str(),
+                        ap.bssid,
+                        ap.channel,
+                        ap.signal_strength,
+                        aps.len()
+                    );
+                    let station_config = esp_radio::wifi::Config::Station(
+                        esp_radio::wifi::sta::StationConfig::default()
+                            .with_ssid(config::WIFI_SSID)
+                            .with_password(config::WIFI_PASS.into())
+                            .with_bssid(ap.bssid)
+                            .with_auth_method(
+                                ap.auth_method
+                                    .unwrap_or(esp_radio::wifi::AuthenticationMethod::Wpa2Personal),
+                            ),
+                    );
+                    wifi_controller.set_config(&station_config).unwrap();
+                }
+                None => {
+                    println!(
+                        "wifi: scan found no '{}' AP — keeping default config",
+                        config::WIFI_SSID
+                    );
+                }
+            }
+        }
+        Err(e) => {
+            println!("wifi: scan failed ({:?}) — keeping default config", e);
+        }
+    }
+
     fn next_backoff(secs: &mut u64) -> u64 {
         let current = *secs;
         *secs = match current {

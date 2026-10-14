@@ -48,7 +48,6 @@ mod session;
 mod mock;
 
 pub use sdm::ProvisionReport;
-pub use sdm::sun_session_key;
 
 /// AuthenticateEV2First Part 1 instruction (datasheet Table 22).
 pub const AUTH_EV2_FIRST_INS: u8 = 0x71;
