@@ -58,7 +58,7 @@ esp-alloc = { version = "0.10.0", features = ["global-allocator"] }
 esp-rtos = { version = "0.3.0", optional = true, features = ["embassy", "esp-radio", "esp-alloc"] }
 esp-bootloader-esp-idf = { version = "0.5.0", optional = true }
 embassy-executor = { version = "0.10.0" }
-embassy-time = { version = "0.5.1", features = ["generic-queue-8"] }
+embassy-time = { version = "0.5.1", features = ["generic-queue-64"] }
 embassy-net = { version = "0.9.1", features = ["tcp", "dhcpv4", "medium-ethernet", "dns"] }
 embassy-sync = { version = "0.8.0" }
 embassy-futures = { version = "0.1", default-features = false }
