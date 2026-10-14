@@ -126,6 +126,17 @@ MON=$!
 # 3. Arm.
 # ---------------------------------------------------------------------------
 sleep 1
+# Serial capture (background) — must start BEFORE arming so the
+# "[prov] job armed" print and claim traffic are not lost.
+PORT=$(ls /dev/ttyUSB* 2>/dev/null | head -1)
+CAT=""
+if [ -n "$PORT" ]; then
+    stty -F "$PORT" 115200 cs8 -cstopb -parenb raw -echo 2>/dev/null
+    : > /tmp/armprov-serial.log
+    timeout 160 cat "$PORT" > /tmp/armprov-serial.log 2>/dev/null &
+    CAT=$!
+fi
+
 log "ARM: member=$MEMBER device=$DEVICE ttl=$TTL"
 RESP=$(curl -s -m 8 -X POST "$VERIFYER_URL/admin/api/jobs" \
     -H "Authorization: Bearer $ADMIN_BEARER_TOKEN" \
@@ -135,16 +146,8 @@ log "verifier: $RESP"
 printf '%s' "$RESP" | grep -q job_id || { log "ARM FAILED"; kill $MON 2>/dev/null; exit 1; }
 
 # ---------------------------------------------------------------------------
-# 4. Serial capture (background) + tap gate.
+# 4. Tap gate.
 # ---------------------------------------------------------------------------
-PORT=$(ls /dev/ttyUSB* 2>/dev/null | head -1)
-CAT=""
-if [ -n "$PORT" ]; then
-    stty -F "$PORT" 115200 cs8 -cstopb -parenb raw -echo 2>/dev/null
-    : > /tmp/armprov-serial.log
-    timeout 160 cat "$PORT" > /tmp/armprov-serial.log 2>/dev/null &
-    CAT=$!
-fi
 
 zenity --question --timeout=110 \
     --title="arm-provision: TAP" \
