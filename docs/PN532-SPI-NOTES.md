@@ -310,3 +310,14 @@ mock modeled a personalized card, so the gap never surfaced in tests.
    model reality; keep a "personalized" mock variant for the re-provision path.
 4. Bench: `./scripts/arm-provision.sh` → tap → ascending triple → tap again
    → grant → relay.
+
+### Refinement (2026-10-14 02:30): the 6A82 is narrower than "factory ships empty"
+
+NXP AN12196 + docs.rs/ntag424 + nfcutils all agree factory DNA cards **do**
+have the NDEF app and file 02 (256 B, free RW, keys all-zero). So the live
+`sequence error: Status(0x6A82)` is from a specific step, prime suspect:
+**the NDEF file SELECT**. AN12196 selects files by ISO file ID — NDEF = `E104`,
+CC = `E103`, proprietary = `E105` — while our sequence selects file number `02`
+(`SELECT_NDEF_FILE_02_APDU` in `src/ntag424.rs`). Per-step status prints in
+`provision_tag` will confirm; if the SELECT-by-02 is the failure, switch the
+file select to `E104` (and mirror in read_ndef).
