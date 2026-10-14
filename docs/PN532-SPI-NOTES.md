@@ -278,3 +278,13 @@ nobody re-derives them:
 2. no-stub + 115200 — slower, but its *writes* completed even on the degraded
    link (failures moved to the final MD5 read).
 3. `scripts/bench-flash.sh` wraps the zenity-gated retry workflow.
+
+### defmt-espflash experiment (reverted `92d61a4`)
+
+Enabling `esp-hal/defmt` + `esp-println/defmt-espflash` (for minimq internals)
+built fine but produced an ELF with **92 loadable segments (ROM max 16)** —
+espflash wrote it, the bootloader refused it, board boot-fail-looped
+(`esp_image: segment count 92 exceeds max 16`). Reverted in `b2a1ab7`.
+If retrying: merge link sections (custom linker script) or use a defmt
+transport that doesn't split sections, and verify the image's segment count
+with `espflash image-info` **before** flashing.
