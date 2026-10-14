@@ -306,21 +306,11 @@ fn decode_key16(hex: &str, out: &mut [u8; 16]) -> bool {
                 let mut no_nfc_logged = false;
 
                 loop {
-                    // Drive MQTT with a bounded wait so NFC polling keeps flowing.
-                    match embassy_time::with_timeout(
-                        // 250 ms bound: long enough for poll() to complete real
-                        // work (SUBSCRIBE flushes, keepalive PINGREQs, SUBACK
-                        // processing) in a single pass. The original 20 ms bound
-                        // cancelled poll() mid-operation on nearly every call:
-                        // subscriptions took minutes to land and keepalives were
-                        // dropped outright (44 broker keepalive kills in one
-                        // night), causing the session-flap cascade.
-                        Duration::from_millis(250),
-                        session.poll(),
-                    )
-                    .await
-                    {
-                        Ok(Ok(Some(msg))) => {
+                    // Drive MQTT cooperatively without blocking or future-cancellation.
+                    // `drive()` processes incoming packets, flushes pending outbound
+                    // buffers, and automatically sends PINGREQ when keepalive is due.
+                    match session.drive().await {
+                        Ok(Some(msg)) => {
                             let topic = msg.topic();
                             let payload = msg.payload();
                             if topic == cmd_topic.as_str() {
@@ -361,12 +351,11 @@ fn decode_key16(hex: &str, out: &mut [u8; 16]) -> bool {
                                 }
                             }
                         }
-                        Ok(Ok(None)) => {}
-                        Ok(Err(e)) => {
-                            blog!("mqtt poll error: {:?}", e);
+                        Ok(None) => {}
+                        Err(e) => {
+                            blog!("mqtt drive error: {:?}", e);
                             break;
                         }
-                        Err(_) => {} // No inbound packet within the window.
                     }
 
                     // Provisioning deadlines tick with the loop cadence
