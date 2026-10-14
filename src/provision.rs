@@ -665,8 +665,8 @@ where
     let apdu = [
         0x00,
         UPDATE_BINARY_INS,
-        0x00,
-        0x00,
+        0x82, // Short File ID 02h (P1 = 0x80 | SFID) per NT4H2421Gx Table 90
+        0x00, // Offset = 0
         file_len as u8,
     ];
     let mut update = [0u8; 260];
@@ -1293,7 +1293,11 @@ mod provision_tests {
                 }
                 // UPDATE BINARY (ISO).
                 (0x00, UPDATE_BINARY_INS) => {
-                    let off = ((apdu[2] as usize) << 8) | apdu[3] as usize;
+                    let off = if apdu[2] & 0x80 != 0 {
+                        apdu[3] as usize
+                    } else {
+                        ((apdu[2] as usize) << 8) | apdu[3] as usize
+                    };
                     let lc = apdu[4] as usize;
                     assert_eq!(off, 0, "whole-file write only");
                     self.file_len = lc;

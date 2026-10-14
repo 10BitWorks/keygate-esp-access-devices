@@ -286,16 +286,16 @@ mod embedded {
                         super::conn::ONLINE => {
                             if !online_announced {
                                 online_announced = true;
-                                // Classic "Charge!" bugle fanfare: G - C - E - G ... E - G!
+                                // Classic "Charge!" bugle fanfare (double-tempo): G - C - E - G ... E - G!
                                 play_pattern(
                                     &mut pins,
                                     &[
-                                        (1568, 80),
-                                        (2093, 80),
-                                        (2637, 80),
-                                        (3136, 140),
-                                        (2637, 80),
-                                        (3136, 260),
+                                        (1568, 40),
+                                        (2093, 40),
+                                        (2637, 40),
+                                        (3136, 70),
+                                        (2637, 40),
+                                        (3136, 130),
                                     ],
                                 )
                                 .await;
