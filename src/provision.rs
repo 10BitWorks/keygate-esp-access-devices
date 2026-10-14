@@ -237,8 +237,10 @@ pub fn full_unwrap(session: &Session, data: &[u8], out: &mut [u8]) -> Result<usi
     Ok(end - 1)
 }
 
-/// Standard IEEE 802.3 32-bit CRC (Ethernet/FCS polynomial 0xEDB88320).
-/// Required by NTAG 424 DNA ChangeKey command when changing keys 1..=4.
+/// Compute the `CRC32NK` value per NT4H2421Gx Table 63 footnote [1] and AN12196 §5.16.1.
+///
+/// Standard IEEE 802.3 32-bit CRC (polynomial 0xEDB88320) initialized to 0xFFFFFFFF,
+/// but NXP convention omits the final one's-complement (the raw residue is written little-endian).
 pub fn crc32_ieee(data: &[u8]) -> u32 {
     let mut crc = 0xFFFF_FFFFu32;
     for &byte in data {
@@ -248,7 +250,7 @@ pub fn crc32_ieee(data: &[u8]) -> u32 {
             crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
         }
     }
-    !crc
+    crc
 }
 
 /// Build the full CommMode.Full data field for `ChangeKey`:
@@ -966,6 +968,13 @@ mod provision_tests {
         assert_eq!(n, 41);
         assert_eq!(&out[..n], &h::<41>(CFS_FRAME)[..]);
         assert_eq!(session.cmdctr, 2);
+    }
+
+    #[test]
+    fn test_crc32nk_matches_an12196_case1_vector() {
+        let new_key = h::<16>("F3847D627727ED3BC9C4CC050489B966");
+        // AN12196 §5.16.1 Table 25 Step 7: CRC32(NewKey) = 789DFADC (little-endian bytes)
+        assert_eq!(crc32_ieee(&new_key).to_le_bytes(), h::<4>("789DFADC"));
     }
 
     #[test]
