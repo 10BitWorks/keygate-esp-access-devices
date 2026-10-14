@@ -205,12 +205,26 @@ fn decode_key16(hex: &str, out: &mut [u8; 16]) -> bool {
             };
         println!("Broker {} -> {}:{}", config::MQTT_HOST, broker_addr, broker_port);
 
-        // Open the TCP transport.
+        // Open the TCP transport. Bounded at 10 s: when a stale firewall/
+        // conntrack state blackholes the SYN (same ephemeral-port reuse
+        // after kills), an unbounded connect() hangs in retransmit backoff
+        // for minutes — the multi-minute offline waves. A fresh socket on
+        // retry picks a new source port, dodging the stale state.
         let mut socket = TcpSocket::new(stack, &mut tcp_rx_buf, &mut tcp_tx_buf);
-        match socket.connect((broker_addr, broker_port)).await {
-            Ok(_) => println!("TCP connected to MQTT broker."),
-            Err(e) => {
-                println!("TCP connection to broker failed: {:?}", e);
+        match embassy_time::with_timeout(
+            Duration::from_secs(10),
+            socket.connect((broker_addr, broker_port)),
+        )
+        .await
+        {
+            Ok(Ok(())) => println!("TCP connected to MQTT broker."),
+            Ok(Err(e)) => {
+                blog!("TCP connection to broker failed: {:?}", e);
+                Timer::after(Duration::from_secs(next_backoff(&mut backoff_secs))).await;
+                continue;
+            }
+            Err(_) => {
+                blog!("TCP connect timed out (10s) — cycling socket");
                 Timer::after(Duration::from_secs(next_backoff(&mut backoff_secs))).await;
                 continue;
             }
