@@ -262,6 +262,16 @@ fn decode_key16(hex: &str, out: &mut [u8; 16]) -> bool {
                 // Connection is healthy again — reset the reconnect backoff.
                 backoff_secs = 1;
 
+                // Flush diagnostics buffered during previous (dead) sessions
+                // to access/{id}/log. QoS0; on failure the rest stays queued.
+                while let Some(line) = crate::diag::imp::pop() {
+                    let pkt = Publication::new(log_topic.as_str(), line.as_str());
+                    if session.publish(pkt).await.is_err() {
+                        blog!("log flush interrupted");
+                        break;
+                    }
+                }
+
                 // Announce presence (retained so late subscribers see "online").
                 let online = Publication::new(presence_topic.as_str(), "online").retain();
                 if let Err(e) = session.publish(online).await {
@@ -293,16 +303,6 @@ fn decode_key16(hex: &str, out: &mut [u8; 16]) -> bool {
                     status_led::set_state(status_led::LedState::DeniedOrOffline);
                     Timer::after(Duration::from_secs(next_backoff(&mut backoff_secs))).await;
                     continue;
-                }
-
-                // Flush diagnostics buffered during previous (dead) sessions
-                // to access/{id}/log. QoS0; on failure the rest stays queued.
-                while let Some(line) = crate::diag::imp::pop() {
-                    let pkt = Publication::new(log_topic.as_str(), line.as_str());
-                    if session.publish(pkt).await.is_err() {
-                        blog!("log flush interrupted");
-                        break;
-                    }
                 }
 
                 let mut debounce = tag_debounce::TagDebounce::new();
