@@ -401,6 +401,11 @@ async fn mqtt_runner(
                         ap.signal_strength,
                         aps.len()
                     );
+                    blog!(
+                        "wifi: best AP rssi {} dBm (of {} scanned)",
+                        ap.signal_strength,
+                        aps.len()
+                    );
                     let station_config = esp_radio::wifi::Config::Station(
                         esp_radio::wifi::sta::StationConfig::default()
                             .with_ssid(config::WIFI_SSID)
@@ -455,6 +460,7 @@ async fn mqtt_runner(
                 Ok(_) => println!("WiFi connected"),
                 Err(e) => {
                     println!("WiFi connection failed: {:?}", e);
+                    blog!("wifi assoc failed: {:?}", e);
                     Timer::after(Duration::from_secs(5)).await;
                     continue;
                 }
@@ -542,9 +548,10 @@ async fn mqtt_runner(
                 status_led::set_state(status_led::LedState::MqttConnected);
                 backoff_secs = 1;
 
-                // Flush buffered diagnostics (bounded, max 4 lines).
+                // Flush buffered diagnostics (bounded — boot milestones +
+                // recent events; the ring holds 64, drain the overflow).
                 let mut flushed = 0u8;
-                while flushed < 4 {
+                while flushed < 12 {
                     let Some(line) = crate::diag::imp::pop() else {
                         break;
                     };
@@ -580,6 +587,7 @@ async fn mqtt_runner(
                 }
 
                 println!("[mqtt] both subscriptions live — node fully online!");
+                blog!("subscriptions live — online");
                 // Audible confirmation: online (plays only when truly online & subscribed!).
                 piezo::set_conn_state(piezo::conn::ONLINE);
 

@@ -47,3 +47,31 @@
   the pin reads LOW spuriously on this harness and broke init instantly;
   do not reintroduce it without measuring the pin first. Never use an
   unbounded or edge-only wait.
+
+## Expected timing (regression baselines — measured 2026-10-14)
+
+Healthy cadences on the ESP32 door bench. A deviation in a capture is a
+regression signal, not noise:
+
+- **Boot → bugle: ~5.5 s.** Breakdown: Wi-Fi scan of ~12 APs ≈ 1.9 s → 1 Hz
+  connect-loop floor 1.0 s → association ≈ 1.3 s → DHCP ≤ 1.0 s (poll
+  granularity) → TCP+CONNACK+subscribes ≈ 0.15 s → bugle on the next ≤500 ms
+  piezo tick. (Pre-scan builds booted in ~3 s; scan + floor buy a
+  deterministic strongest-BSSID pick and cost ~2.5 s — accepted.)
+- **`[pump hb n]` every ~35 s** (300 pump iterations at ~8.7/s). Heartbeats
+  stopping while the broker logs `keepalive_timeout` = executor starvation
+  or the pump is not being polled — that is a bug, not Wi-Fi.
+- **Stable session: zero drops.** Pinned to the strongest AP (~-51 dBm at
+  the bench), 5+ minutes showed zero `session poll error`. Drops within
+  minutes mean association quality degraded — check the boot line
+  `wifi: best xblight AP ... rssi N dBm`.
+- **RSSI expectations at the bench:** strongest xblight ≈ -51 dBm (laptop
+  survey ≈ -40; PCB antenna difference is normal). Distant cisco units
+  measure -73..-86 dBm and produce `AuthenticationExpired` associations —
+  the scan-and-pin exists to never pick them. Best-pick below -70 dBm at
+  boot = RF problem; investigate placement before firmware.
+- **Broker-side truth:** EMQX trace reason `keepalive_timeout` = the device
+  went silent on a live TCP socket (starvation). `discarded` = a newer
+  connect took the session over (reconnect churn). `tcp_closed` = real link
+  loss. Trace lives at `/var/log/emqx/trace_keygate1.log` on 10.7.1.106
+  (`emqx ctl trace list`).

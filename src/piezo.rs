@@ -286,16 +286,18 @@ mod embedded {
                         super::conn::ONLINE => {
                             if !online_announced {
                                 online_announced = true;
-                                // Classic "Charge!" bugle fanfare (double-tempo): G - C - E - G ... E - G!
+                                // Classic "Charge!" bugle fanfare: G - C - E - G^ - E - G^!
+                                // 4th/5th notes halved vs the original dotted rhythm, whole
+                                // thing at 0.8x duration (20% faster). Base was 40ms.
                                 play_pattern(
                                     &mut pins,
                                     &[
-                                        (1568, 40),
-                                        (2093, 40),
-                                        (2637, 40),
-                                        (3136, 70),
-                                        (2637, 40),
-                                        (3136, 130),
+                                        (1568, 32),
+                                        (2093, 32),
+                                        (2637, 32),
+                                        (3136, 28),
+                                        (2637, 16),
+                                        (3136, 104),
                                     ],
                                 )
                                 .await;

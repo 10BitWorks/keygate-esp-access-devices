@@ -44,6 +44,14 @@ async fn net_task(
 
 #[esp_rtos::main]
 async fn main(spawner: Spawner) -> ! {
+    // Boot stamp: which build is running. Mirrored into the diag ring so the
+    // first MQTT connect publishes it to `access/<id>/log`.
+    crate::blog!(
+        "keygate {} fw git:{}",
+        env!("CARGO_PKG_VERSION"),
+        env!("KEYGATE_GIT_SHA")
+    );
+
     // 1. Initialize heap allocator (72 KiB).
     esp_alloc::heap_allocator!(size: 72 * 1024);
 
