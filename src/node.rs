@@ -129,7 +129,7 @@ async fn nfc_runner<I: pn532::Interface>(
                             pin.set_high();
                             Timer::after(Duration::from_millis(100)).await;
                         }
-                        let _ = nfc::soft_reinit(pn);
+                        let _ = nfc::soft_reinit(pn, 2500);
                     }
                 }
             }

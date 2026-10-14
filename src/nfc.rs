@@ -141,7 +141,14 @@ pub fn init_pn532<I: pn532::Interface>(
     let mut attempt = 0;
     loop {
         attempt += 1;
-        match soft_reinit(&mut pn532) {
+        // Progressive windows: the fast path still resolves in 500 ms; a
+        // slow-processing module mood gets up to 3 s on the later attempts.
+        let sam_timeout_ms = match attempt {
+            1 => 500,
+            2 => 1500,
+            _ => 3000,
+        };
+        match soft_reinit(&mut pn532, sam_timeout_ms) {
             Ok(()) => break,
             Err(e) if attempt < 3 => {
                 #[cfg(target_arch = "xtensa")]
@@ -170,9 +177,16 @@ fn busy_wait_ms(ms: u32) {
 
 /// Re-initialize the PN532 SAM mode on an existing driver instance.
 ///
+/// `sam_timeout_ms` bounds the SAMConfig wait. This module clone processes
+/// commands 5-30x slower than Adafruit-class modules (see
+/// PN532-SPI-NOTES.md "Timing measurements"): telemetry shows the status
+/// byte driven-but-not-ready (0x00) for the entire window when the 500 ms
+/// default is too short — the command is in flight, we just give up early.
+///
 /// Typically called after hardware RSTO pulse or when soft recovery is triggered.
 pub fn soft_reinit<I: pn532::Interface>(
     pn: &mut Pn532<I, Pn532Delay, 300>,
+    sam_timeout_ms: u32,
 ) -> Result<(), NfcError> {
     // Configure SAM (Security Access Module) to normal mode.
     // PN532 SAMConfiguration typical response latency is <2ms; 20ms timeout is generous
@@ -230,7 +244,7 @@ pub fn health_check<I: pn532::Interface, T: CountDown<Time = fugit::MillisDurati
         .process(
             &Request::GET_FIRMWARE_VERSION,
             4,
-            fugit::MillisDurationU32::from_ticks(500),
+        fugit::MillisDurationU32::from_ticks(500),
         )
         .map_err(|e| match e {
             pn532::Error::TimeoutAck | pn532::Error::TimeoutResponse => NfcError::Timeout,
