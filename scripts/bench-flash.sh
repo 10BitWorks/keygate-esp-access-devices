@@ -51,34 +51,37 @@ is_in_download_mode() {
 }
 
 FLASHED=1
+
+# Automatic boot-mode entry (no buttons): esptool's classic DTR/RTS
+# sequence via scripts/force-download.py — bench-proven on this CP2102
+# clone (espflash's --before default-reset uses timing it rejects).
+# Then flash with --before no-reset (chip already in download mode).
 for i in 1 2 3; do
-    echo "=== Flash attempt $i @ 57600 baud (stub mode) ==="
-    
-    if is_in_download_mode; then
-        echo "Chip is already in download mode — flashing immediately!"
-    else
-        echo "Chip not in download mode; requesting bootloader dance..."
-        if [ "$i" -eq 1 ]; then
-            PROMPT_TITLE="KeyGate: ESP32 Flashing"
-            PROMPT_TEXT="Target: $PORT\n\nClick OK, then perform the BOOT dance:\n1. HOLD BOOT button\n2. TAP EN (RST) button once\n3. KEEP HOLDING BOOT for ~2 seconds\n4. RELEASE BOOT"
-        else
-            PROMPT_TITLE="KeyGate: Retry Flash"
-            PROMPT_TEXT="Attempt $((i-1)) failed or missed window.\n\nClick OK, then repeat the BOOT dance:\nHOLD BOOT -> TAP EN -> HOLD ~2s -> RELEASE"
-        fi
-
-        if ! zenity --question --title="$PROMPT_TITLE" --text="$PROMPT_TEXT" 2>/dev/null; then
-            echo "Flashing cancelled by user."
-            exit 0
-        fi
+    echo "=== Flash attempt $i @ 57600 baud ==="
+    if ! python3 scripts/force-download.py "$PORT"; then
+        echo "Auto boot-mode entry failed (attempt $i) — retrying."
+        sleep 1
+        continue
     fi
-
     if timeout 300 espflash flash --chip esp32 --port "$PORT" --before no-reset -B 57600 --no-verify --partition-table partitions.csv --erase-parts otadata --target-app-partition ota_0 "$ELF"; then
         echo "Flash succeeded on attempt $i!"
         FLASHED=0
         break
     fi
-    [ "$i" = 3 ] && break
 done
+
+# Last resort: manual BOOT dance (only if auto entry died 3x).
+if [ "$FLASHED" -ne 0 ]; then
+    if ! zenity --question --timeout=90 --title="KeyGate: Manual BOOT dance" \
+        --text="Automatic boot-mode entry failed 3 times.\n\nClick OK, then perform the BOOT dance:\n1. HOLD BOOT button\n2. TAP EN (RST) once\n3. KEEP HOLDING BOOT ~2 seconds\n4. RELEASE BOOT" 2>/dev/null; then
+        echo "Flashing cancelled."
+        exit 1
+    fi
+    if timeout 300 espflash flash --chip esp32 --port "$PORT" --before no-reset -B 57600 --no-verify --partition-table partitions.csv --erase-parts otadata --target-app-partition ota_0 "$ELF"; then
+        echo "Flash succeeded (manual dance)!"
+        FLASHED=0
+    fi
+fi
 
 if [ "$FLASHED" -ne 0 ]; then
     zenity --error --title="KeyGate: Flash Failed" --text="All flash attempts failed." 2>/dev/null || true
