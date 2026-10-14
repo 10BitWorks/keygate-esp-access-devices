@@ -403,37 +403,32 @@ pub type Esp32SpiBus = esp_hal::spi::master::Spi<'static, esp_hal::Blocking>;
 #[allow(dead_code)]
 pub type DoorSpiDeviceImpl = DoorSpiDevice<Esp32SpiBus, esp_hal::gpio::Output<'static>>;
 #[cfg(feature = "board-esp32-devkit-door")]
-pub type DoorNfcIface = DoorIrqProbeIface;
+pub type DoorNfcIface = DoorLatencyIface;
 
-/// PN532 interface with IRQ (GPIO4) **diagnostics**.
+/// PN532 interface with per-command SPI latency diagnostics.
 ///
-/// Readiness is SPI STATREAD, exactly like the proven `SPIInterface` — the
-/// IRQ line NEVER influences behavior (level-sampling it for readiness broke
-/// init: the pin reads LOW spuriously on this harness). The pin is only
-/// observed and reported, so its real behavior can be characterized from
-/// captures/MQTT logs before any future IRQ-driven design is trusted.
+/// HISTORY — do not blindly re-add GPIO4 here, twice is a pattern:
+/// configuring GPIO4 as an input (twice: with pull-up in 5f42f35, and as an
+/// observation-only probe in 76e9c78) broke PN532 init instantly both times
+/// (`SAMConfig failed (TimeoutAck)` — the module stops ACKing). Whatever the
+/// "IRQ" harness slot is actually wired to, putting an ESP32 input buffer +
+/// pull-up on it kills the module's ACK. The pin is UNTRUSTED until someone
+/// measures it physically (meter/scope, module at 5 V VIN).
 ///
-/// Logging is bounded: one line per IRQ falling edge (elapsed ms into the
-/// command) and one line per resolved command (elapsed ms + whether IRQ ever
-/// asserted). An idle bus (poll timeouts, no card) stays silent.
+/// Readiness is SPI STATREAD (proven); this wrapper only logs each resolved
+/// command's latency so PN532 bus health stays visible over serial/MQTT.
 #[cfg(feature = "board-esp32-devkit-door")]
-pub struct DoorIrqProbeIface {
+pub struct DoorLatencyIface {
     spi: DoorSoftSpiDevice,
-    irq: esp_hal::gpio::Input<'static>,
-    /// When the current command was sent (for elapsed-ms reporting).
     write_at: Option<esp_hal::time::Instant>,
-    last_irq_low: bool,
-    irq_ever_low: bool,
 }
 
 #[cfg(feature = "board-esp32-devkit-door")]
-impl pn532::Interface for DoorIrqProbeIface {
+impl pn532::Interface for DoorLatencyIface {
     type Error = core::convert::Infallible;
 
     fn write(&mut self, frame: &mut [u8]) -> Result<(), Self::Error> {
         self.write_at = Some(esp_hal::time::Instant::now());
-        self.irq_ever_low = false;
-        self.last_irq_low = self.irq.is_low();
         self.spi.transaction(&mut [
             Operation::Write(&[pn532::spi::PN532_SPI_DATAWRITE]),
             Operation::Write(frame),
@@ -441,17 +436,6 @@ impl pn532::Interface for DoorIrqProbeIface {
     }
 
     fn wait_ready(&mut self) -> core::task::Poll<Result<(), Self::Error>> {
-        let irq_low = self.irq.is_low();
-        if irq_low && !self.last_irq_low {
-            self.irq_ever_low = true;
-            let elapsed = self
-                .write_at
-                .map(|t0| (esp_hal::time::Instant::now() - t0).as_millis())
-                .unwrap_or(0);
-            esp_println::println!("[pn532-irq] fell {} ms into command", elapsed);
-        }
-        self.last_irq_low = irq_low;
-
         // Authoritative readiness: SPI status poll (proven path).
         let mut buf = [pn532::spi::PN532_SPI_STATREAD, 0x00];
         self.spi.transfer_in_place(&mut buf)?;
@@ -460,12 +444,7 @@ impl pn532::Interface for DoorIrqProbeIface {
                 .write_at
                 .map(|t0| (esp_hal::time::Instant::now() - t0).as_millis())
                 .unwrap_or(0);
-            esp_println::println!(
-                "[pn532-irq] cmd ok {} ms, irq {} ({})",
-                elapsed,
-                self.irq_ever_low,
-                if self.irq_ever_low { "agree" } else { "silent" }
-            );
+            esp_println::println!("[pn532-lat] cmd ok {} ms", elapsed);
             core::task::Poll::Ready(Ok(()))
         } else {
             core::task::Poll::Pending
@@ -613,16 +592,12 @@ pub fn setup(peripherals: esp_hal::peripherals::Peripherals) -> Setup<DoorNfcIfa
     // Wake the PN532 core from low-power standby before wrapping spi_device in SPIInterface.
     spi_device.wake();
 
-    // IRQ (GPIO4): observed for diagnostics only — readiness is SPI-polled.
-    // See DoorIrqProbeIface (level-sampling for readiness broke init; the
-    // pin's real behavior is what this probe characterizes).
-    let irq = Input::new(peripherals.GPIO4, InputConfig::default().with_pull(Pull::Up));
-    let iface = DoorIrqProbeIface {
+    // GPIO4 ("IRQ" harness slot) intentionally left UNCONFIGURED — twice now
+    // (5f42f35, 76e9c78) configuring it as an input broke PN532 init. See the
+    // DoorLatencyIface history note.
+    let iface = DoorLatencyIface {
         spi: spi_device,
-        irq,
         write_at: None,
-        last_irq_low: false,
-        irq_ever_low: false,
     };
 
     // PN532 init is non-fatal: Wi-Fi/MQTT proceed regardless.
