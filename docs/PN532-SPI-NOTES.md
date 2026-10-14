@@ -288,3 +288,25 @@ espflash wrote it, the bootloader refused it, board boot-fail-looped
 If retrying: merge link sections (custom linker script) or use a defmt
 transport that doesn't split sections, and verify the image's segment count
 with `espflash image-info` **before** flashing.
+
+## Provisioning blocker found (2026-10-14 ~02:00): factory DNA cards ship empty
+
+First live provisioning attempt on a factory-fresh NTAG 424 DNA failed at
+`SELECT NDEF application → 6A82 (file not found)`. Root cause: **NTAG 424 DNA
+ships DESFire-style empty** — no NDEF application, no files. The provision
+sequence (`provision_tag`) assumed a pre-created NDEF app + file 02; the host
+mock modeled a personalized card, so the gap never surfaced in tests.
+
+**Resume plan** (well-scoped, ~1-2 h):
+1. Add native-command builders: `CREATE_APPLICATION (0xCA)` for AID
+   `D2760000850101` (keyset 0x0F, factory key 0) and
+   `CREATE_STD_DATA_FILE (0xCD)` for file 02 (size ~128 B, comm plain,
+   access EEEE-or-key0) — verify exact settings against the NXP app's
+   personalization or schnee/pylibsdm reference flows.
+2. In `provision_tag`: attempt `select_ndef`; on `6A82` → run the create path
+   (CreateApplication → SelectApplication(0x5A) → CreateStdDataFile) →
+   continue with the existing auth/change-key/write/SDM flow.
+3. Update the mock card to FACTORY state (no app until created) so the tests
+   model reality; keep a "personalized" mock variant for the re-provision path.
+4. Bench: `./scripts/arm-provision.sh` → tap → ascending triple → tap again
+   → grant → relay.
