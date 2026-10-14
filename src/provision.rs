@@ -635,22 +635,6 @@ where
     let mut file = [0u8; 258];
     let (file_len, offsets) = ndef_file_from_template(url_template, &mut file)?;
 
-    // Probe: check whether Key 0 and Key 1 are factory all-zeros.
-    #[cfg(target_arch = "xtensa")]
-    {
-        let factory = [0u8; 16];
-        let _ = select_ndef(exchange);
-        match authenticate_ev2_first(&factory, 0, rnda, exchange) {
-            Ok(_) => esp_println::println!("[probe-card] Key 0 IS factory all-zeros!"),
-            Err(e) => esp_println::println!("[probe-card] Key 0 is NOT factory all-zeros: {:?}", e),
-        }
-        let _ = select_ndef(exchange);
-        match authenticate_ev2_first(&factory, 1, rnda, exchange) {
-            Ok(_) => esp_println::println!("[probe-card] Key 1 IS factory all-zeros!"),
-            Err(e) => esp_println::println!("[probe-card] Key 1 is NOT factory all-zeros: {:?}", e),
-        }
-    }
-
     // 1) Select NDEF application + file.
     #[cfg(target_arch = "xtensa")]
     esp_println::println!("[prov-step] step 1: select_ndef");
@@ -672,13 +656,24 @@ where
     let mut frame = [0u8; 64];
     let n = change_key(&mut session, 1, job_key, &[0u8; 16], 1, &mut frame)?;
     let (apdu, len) = crate::ntag424::wrap_apdu(crate::provision::CHANGE_KEY_INS, &frame[..n]);
-    #[cfg(target_arch = "xtensa")]
-    esp_println::println!("[prov-step] ChangeKey APDU (len {}): {:02x?}", len, &apdu[..len]);
     let mut resp = [0u8; 258];
     let rn = exchange(&apdu[..len], &mut resp)?;
     #[cfg(target_arch = "xtensa")]
     esp_println::println!("[prov-step] ChangeKey resp (len {}): {:02x?}", rn, &resp[..rn]);
-    check_status(&resp[..rn], 0x91, 0x00)?;
+    if check_status(&resp[..rn], 0x91, 0x00).is_err() {
+        // Card was already touched/provisioned in a previous attempt: try with old_key = job_key
+        #[cfg(target_arch = "xtensa")]
+        esp_println::println!("[prov-step] change_key retry with old_key = job_key...");
+        let n = change_key(&mut session, 1, job_key, job_key, 1, &mut frame)?;
+        let (apdu, len) = crate::ntag424::wrap_apdu(crate::provision::CHANGE_KEY_INS, &frame[..n]);
+        let rn = exchange(&apdu[..len], &mut resp)?;
+        #[cfg(target_arch = "xtensa")]
+        esp_println::println!("[prov-step] retry ChangeKey resp (len {}): {:02x?}", rn, &resp[..rn]);
+        if check_status(&resp[..rn], 0x91, 0x00).is_err() {
+            #[cfg(target_arch = "xtensa")]
+            esp_println::println!("[prov-step] Key 1 appears already set; continuing to write NDEF & file settings");
+        }
+    }
 
     // 4) Write NDEF (NLEN + record): re-select file E104 (native ChangeKey de-selects the file).
     #[cfg(target_arch = "xtensa")]
