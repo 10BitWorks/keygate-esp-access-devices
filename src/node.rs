@@ -383,28 +383,29 @@ async fn mqtt_runner(
 
         if !wifi_controller.is_connected() {
             println!("Connecting to WiFi...");
+            let _ = wifi_controller.disconnect_async().await;
             match wifi_controller.connect_async().await {
                 Ok(_) => println!("WiFi connected"),
                 Err(e) => {
-                    blog!("WiFi connection failed: {:?}", e);
-                    Timer::after(Duration::from_secs(1)).await;
+                    println!("WiFi connection failed: {:?}", e);
+                    Timer::after(Duration::from_secs(2)).await;
                     continue;
                 }
             }
         }
 
-        // Wait for DHCP (up to 30 s with 500 ms poll).
+        // Wait for DHCP (up to 30 s).
         let mut dhcp_ok = false;
-        for _ in 0..60 {
+        for _ in 0..30 {
             if stack.config_v4().is_some() {
                 dhcp_ok = true;
                 break;
             }
-            Timer::after(Duration::from_millis(500)).await;
+            Timer::after(Duration::from_secs(1)).await;
         }
         if !dhcp_ok {
-            blog!("DHCP timeout — retrying...");
-            Timer::after(Duration::from_secs(1)).await;
+            println!("DHCP timeout — retrying...");
+            Timer::after(Duration::from_secs(2)).await;
             continue;
         }
 
