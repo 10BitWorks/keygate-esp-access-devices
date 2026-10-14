@@ -43,16 +43,24 @@
   diagnostics: a missing heartbeat in a capture localizes starvation to the
   exact task.
 - PN532 readiness is SPI STATREAD polling (`SPIInterface`), bounded by the
-  driver's timeouts. **GPIO4 ("IRQ" harness slot) stays unconfigured** — not
-  because the pin is guilty (it was exonerated by bisect: init failed with
-  the pin configured AND unconfigured), but because it is unmeasured. Never
-  use an unbounded or edge-only wait.
-- **PN532 `SAMConfig failed (TimeoutAck)` = per-boot first-command flakiness
-  on this module clone; `init_pn532` retries 3x (ACK-abort resync + 200 ms
-  settle) and self-heals.** Persistent failure across retries = module The module latches interface mode at power-on and
-  its 5 V rail never cycles across ESP32 reflashes. Fix: pull the module's
-  VIN for ~5 s (full power cycle), then reboot the node. Corroborate with
-  the broker log: `pn532 init failed` in `access/<id>/log`.
+  driver's timeouts.
+- **The "IRQ" harness wire (GPIO4) must stay DISCONNECTED — live A/B proven
+  (2026-10-14, user at bench):** with the wire out the node boots clean and
+  the reader works; re-inserting the wire mid-boot on a build that never
+  configures GPIO4 kills the PN532 instantly (failure tone). The slot is
+  not a benign IRQ output — suspect RSTPDN or a mode pin mislanded by the
+  slid 8-pin harness. Before ANY future IRQ usage: continuity-check the
+  wire to the actual PN532 IRQ pad with a meter. Never use an unbounded or
+  edge-only wait.
+- **PN532 `SAMConfig failed (TimeoutAck)`: check the IRQ wire first.** With
+  the GPIO4 harness wire connected the module never ACKs (mislanded line —
+  see above); disconnect it and the reader comes back. `init_pn532` retries
+  3x (ACK-abort resync + 200 ms settle) to self-heal genuine transients.
+  Persistent failure across retries with the wire OUT = module wedge (its
+  interface mode latches at power-on and the 5 V rail never cycles across
+  ESP32 reflashes): pull the module's VIN ~5 s, then reboot. Corroborate
+  with the broker log: `pn532 init failed` in `access/<id>/log`, and the
+  NfcDown alarm beeps while the reader is down.
 
 ## Expected timing (regression baselines — measured 2026-10-14)
 

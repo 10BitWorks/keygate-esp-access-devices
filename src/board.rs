@@ -421,6 +421,7 @@ pub type DoorNfcIface = DoorLatencyIface;
 pub struct DoorLatencyIface {
     spi: DoorSoftSpiDevice,
     write_at: Option<esp_hal::time::Instant>,
+    poll_calls: u32,
 }
 
 #[cfg(feature = "board-esp32-devkit-door")]
@@ -439,6 +440,15 @@ impl pn532::Interface for DoorLatencyIface {
         // Authoritative readiness: SPI status poll (proven path).
         let mut buf = [pn532::spi::PN532_SPI_STATREAD, 0x00];
         self.spi.transfer_in_place(&mut buf)?;
+        self.poll_calls += 1;
+        #[cfg(feature = "nfc-spy")]
+        if self.poll_calls <= 3 || self.poll_calls % 200 == 0 {
+            esp_println::println!(
+                "[pn532-lat] poll #{} status=0x{:02X}",
+                self.poll_calls,
+                buf[1]
+            );
+        }
         if buf[1] == pn532::spi::PN532_SPI_READY {
             let elapsed = self
                 .write_at
@@ -598,6 +608,7 @@ pub fn setup(peripherals: esp_hal::peripherals::Peripherals) -> Setup<DoorNfcIfa
     let iface = DoorLatencyIface {
         spi: spi_device,
         write_at: None,
+        poll_calls: 0,
     };
 
     // PN532 init is non-fatal: Wi-Fi/MQTT proceed regardless.
