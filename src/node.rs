@@ -617,6 +617,10 @@ async fn mqtt_runner(
                         Ok(Err(e)) => {
                             println!("[mqtt] session poll error: {:?}", e);
                             blog!("mqtt poll error: {:?}", e);
+                            // Back off before reconnecting: a flapping link
+                            // otherwise hot-cycles TCP+MQTT setup at line
+                            // rate and hammers the broker.
+                            Timer::after(Duration::from_secs(next_backoff(&mut backoff_secs))).await;
                             break;
                         }
                         Err(_) => {
