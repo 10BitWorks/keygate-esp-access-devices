@@ -179,20 +179,6 @@ pub fn soft_reinit<I: pn532::Interface>(
     Ok(())
 }
 
-/// Briefly cycle the PN532 RF field off then on (power-cycles any tag resting on the antenna).
-///
-/// Passive tags (like NTAG 424 DNA) stay in ISO-DEP (14443-4) active mode after APDU exchanges.
-/// Cycling the RF field for a fraction of a millisecond resets any resting tag back to ISO-14443-3 Idle,
-/// allowing clean subsequent polling and proper debounce without hardware supervisor timeouts.
-pub fn cycle_rf_field<I: pn532::Interface>(
-    pn: &mut Pn532<I, Pn532Delay, 300>,
-) {
-    let off = Request::new(Command::RFConfiguration, [0x01, 0x00]);
-    let _ = pn.process(&off, 0, fugit::MillisDurationU32::from_ticks(50));
-    let on = Request::new(Command::RFConfiguration, [0x01, 0x01]);
-    let _ = pn.process(&on, 0, fugit::MillisDurationU32::from_ticks(50));
-}
-
 /// Poll for a single NFC tag.
 ///
 /// Returns:

@@ -142,7 +142,6 @@ async fn nfc_runner<I: pn532::Interface>(
             if let Some((job_id, key_hex)) = prov_ready {
                 println!("[prov] keyed claim reply active — writing card now (job {})", job_id);
                 execute_tag_provisioning(pn, &job_id, &key_hex).await;
-                nfc::cycle_rf_field(pn);
                 continue;
             } else if is_claim_wait {
                 // Keep target 1 intact while verifier computes diversified key!
@@ -189,7 +188,6 @@ async fn nfc_runner<I: pn532::Interface>(
                             };
                             if let Some((job_id, key_hex)) = prov_ctx {
                                 execute_tag_provisioning(pn, &job_id, &key_hex).await;
-                                nfc::cycle_rf_field(pn);
                             }
                         }
                         _ => {
@@ -244,18 +242,8 @@ async fn nfc_runner<I: pn532::Interface>(
                                 }
                             }
                         }
-
-                    // Only reset the RF field if not in an active provisioning flow
-                    // (the card must remain activated in target slot 1 while awaiting the keyed claim reply).
-                    let in_prov = {
-                        let m = PROV_MACHINE.lock().await;
-                        !m.state.is_idle()
-                    };
-                    if !in_prov {
-                        nfc::cycle_rf_field(pn);
                     }
                 }
-            }
         } else {
             if !no_nfc_logged {
                 println!("[nfc] no reader initialized — idling NFC polling");
