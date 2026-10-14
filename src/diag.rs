@@ -26,7 +26,6 @@ pub(crate) mod imp {
         let mut s = heapless::String::<LOG_LINE_MAX>::new();
         let _ = core::write!(s, "{} ", embassy_time::Instant::now().as_millis());
         let _ = core::write!(s, "{}", args);
-        esp_println::println!("{}", s.as_str());
         match LOGQ.try_send(s) {
             Ok(()) => {}
             // Ring full: drop the OLDEST line to keep the newest.

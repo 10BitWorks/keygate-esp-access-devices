@@ -437,12 +437,18 @@ async fn mqtt_runner(
         };
         println!("Broker {} -> {}:{}", config::MQTT_HOST, broker_addr, broker_port);
 
-        // Open TCP transport.
+        // Open TCP transport with a bounded 10s connect timeout.
         let mut socket = TcpSocket::new(stack, &mut tcp_rx_buf, &mut tcp_tx_buf);
-        match socket.connect((broker_addr, broker_port)).await {
-            Ok(_) => println!("TCP connected to MQTT broker."),
-            Err(e) => {
+        socket.set_timeout(Some(Duration::from_secs(10)));
+        match embassy_time::with_timeout(Duration::from_secs(10), socket.connect((broker_addr, broker_port))).await {
+            Ok(Ok(_)) => println!("TCP connected to MQTT broker."),
+            Ok(Err(e)) => {
                 println!("TCP connection to broker failed: {:?}", e);
+                Timer::after(Duration::from_secs(next_backoff(&mut backoff_secs))).await;
+                continue;
+            }
+            Err(_) => {
+                println!("TCP connect timed out (10s)");
                 Timer::after(Duration::from_secs(next_backoff(&mut backoff_secs))).await;
                 continue;
             }
@@ -473,8 +479,8 @@ async fn mqtt_runner(
 
         let mut session = Session::new(mqtt_config);
 
-        match session.connect(socket).await {
-            Ok(ConnectEvent::Connected) | Ok(ConnectEvent::Reconnected) => {
+        match embassy_time::with_timeout(Duration::from_secs(10), session.connect(socket)).await {
+            Ok(Ok(ConnectEvent::Connected)) | Ok(Ok(ConnectEvent::Reconnected)) => {
                 println!("MQTT connected! Broker online.");
                 status_led::set_state(status_led::LedState::MqttConnected);
                 backoff_secs = 1;
@@ -622,8 +628,13 @@ async fn mqtt_runner(
                 blog!("mqtt session dropped — reconnect in {}s", wait);
                 Timer::after(Duration::from_secs(wait)).await;
             }
-            Err(e) => {
-                blog!("MQTT session connect failed: {:?}", e);
+            Ok(Err(e)) => {
+                println!("MQTT session connect failed: {:?}", e);
+                status_led::set_state(status_led::LedState::DeniedOrOffline);
+                Timer::after(Duration::from_secs(next_backoff(&mut backoff_secs))).await;
+            }
+            Err(_) => {
+                println!("MQTT session connect timed out (10s)");
                 status_led::set_state(status_led::LedState::DeniedOrOffline);
                 Timer::after(Duration::from_secs(next_backoff(&mut backoff_secs))).await;
             }

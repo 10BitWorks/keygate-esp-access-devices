@@ -29,3 +29,4 @@
 - Piezo Transducer music generation examples: https://github.com/MoriancumerSouza/arduino-buzzer-songs
 - Library of (sound files) examples of nice beep-like notifying sounds: https://www.pond5.com/search?kw=chirp-beep&media=sfx
 - Arduino examples: https://github.com/AbhishekGhosh/Arduino-Buzzer-Tone-Codes
+- More melodies as beep code: https://github.com/SpaceinvaderOne/Beep-Music-Converter/tree/main/beep_music
