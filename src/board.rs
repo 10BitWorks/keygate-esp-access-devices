@@ -403,71 +403,23 @@ pub type Esp32SpiBus = esp_hal::spi::master::Spi<'static, esp_hal::Blocking>;
 #[allow(dead_code)]
 pub type DoorSpiDeviceImpl = DoorSpiDevice<Esp32SpiBus, esp_hal::gpio::Output<'static>>;
 #[cfg(feature = "board-esp32-devkit-door")]
-pub type DoorNfcIface = DoorLatencyIface;
+pub type DoorNfcIface = pn532::spi::SPIInterface<DoorSoftSpiDevice>;
 
-/// PN532 interface with per-command SPI latency diagnostics.
+/// HISTORY — twice-poisoned wrapper experiments, do not reintroduce:
+/// Any `Instant::now()` call inside `write()` before the SPI transaction
+/// kills PN532 init on this target (ESP32 classic + esp-rtos): frames go
+/// out but the module never asserts ready (status=0x00 all window). BOTH
+/// clock sources falsified at the bench with the GPIO4 wire OUT:
+/// `esp_hal::time::Instant` (76e9c78–0e49810 builds) AND
+/// `embassy_time::Instant` (2026-10-14 23:00 build — SAMConfig TimeoutAck
+/// ×3). Plain `SPIInterface` (this alias) is the only config that inits.
+/// If per-command latency is ever needed again, measure it in `wait_ready`
+/// only — never touch a clock in `write()`.
 ///
-/// HISTORY — do not blindly re-add GPIO4 here, twice is a pattern:
-/// configuring GPIO4 as an input (twice: with pull-up in 5f42f35, and as an
-/// observation-only probe in 76e9c78) broke PN532 init instantly both times
-/// (`SAMConfig failed (TimeoutAck)` — the module stops ACKing). Whatever the
-/// "IRQ" harness slot is actually wired to, putting an ESP32 input buffer +
-/// pull-up on it kills the module's ACK. The pin is UNTRUSTED until someone
-/// measures it physically (meter/scope, module at 5 V VIN).
-///
-/// Readiness is SPI STATREAD (proven); this wrapper only logs each resolved
-/// command's latency so PN532 bus health stays visible over serial/MQTT.
-#[cfg(feature = "board-esp32-devkit-door")]
-pub struct DoorLatencyIface {
-    spi: DoorSoftSpiDevice,
-    write_at: Option<esp_hal::time::Instant>,
-    poll_calls: u32,
-}
-
-#[cfg(feature = "board-esp32-devkit-door")]
-impl pn532::Interface for DoorLatencyIface {
-    type Error = core::convert::Infallible;
-
-    fn write(&mut self, frame: &mut [u8]) -> Result<(), Self::Error> {
-        self.write_at = Some(esp_hal::time::Instant::now());
-        self.spi.transaction(&mut [
-            Operation::Write(&[pn532::spi::PN532_SPI_DATAWRITE]),
-            Operation::Write(frame),
-        ])
-    }
-
-    fn wait_ready(&mut self) -> core::task::Poll<Result<(), Self::Error>> {
-        // Authoritative readiness: SPI status poll (proven path).
-        let mut buf = [pn532::spi::PN532_SPI_STATREAD, 0x00];
-        self.spi.transfer_in_place(&mut buf)?;
-        self.poll_calls += 1;
-        #[cfg(feature = "nfc-spy")]
-        if self.poll_calls <= 3 || self.poll_calls % 200 == 0 {
-            esp_println::println!(
-                "[pn532-lat] poll #{} status=0x{:02X}",
-                self.poll_calls,
-                buf[1]
-            );
-        }
-        if buf[1] == pn532::spi::PN532_SPI_READY {
-            let elapsed = self
-                .write_at
-                .map(|t0| (esp_hal::time::Instant::now() - t0).as_millis())
-                .unwrap_or(0);
-            esp_println::println!("[pn532-lat] cmd ok {} ms", elapsed);
-            core::task::Poll::Ready(Ok(()))
-        } else {
-            core::task::Poll::Pending
-        }
-    }
-
-    fn read(&mut self, buf: &mut [u8]) -> Result<(), Self::Error> {
-        self.spi.transaction(&mut [
-            Operation::Write(&[pn532::spi::PN532_SPI_DATAREAD]),
-            Operation::Read(buf),
-        ])
-    }
-}
+/// GPIO4 ("IRQ" harness slot) stays physically disconnected AND
+/// unconfigured: live A/B (user at bench) showed wire-in kills the reader
+/// on builds that never touch the pin — mislanded harness line. Meter it
+/// before ever trusting it.
 
 #[cfg(feature = "board-xiao-c6")]
 pub fn setup(peripherals: esp_hal::peripherals::Peripherals) -> Setup<XiaoNfcIface> {
@@ -602,14 +554,9 @@ pub fn setup(peripherals: esp_hal::peripherals::Peripherals) -> Setup<DoorNfcIfa
     // Wake the PN532 core from low-power standby before wrapping spi_device in SPIInterface.
     spi_device.wake();
 
-    // GPIO4 ("IRQ" harness slot) intentionally left UNCONFIGURED — twice now
-    // (5f42f35, 76e9c78) configuring it as an input broke PN532 init. See the
-    // DoorLatencyIface history note.
-    let iface = DoorLatencyIface {
-        spi: spi_device,
-        write_at: None,
-        poll_calls: 0,
-    };
+    // GPIO4 ("IRQ" harness slot) intentionally left UNCONFIGURED and the
+    // wire stays physically disconnected — see the DoorNfcIface history note.
+    let iface = pn532::spi::SPIInterface { spi: spi_device };
 
     // PN532 init is non-fatal: Wi-Fi/MQTT proceed regardless.
     let pn532 = match nfc::init_pn532(iface) {
