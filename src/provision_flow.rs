@@ -150,7 +150,7 @@ pub struct ProvMachine {
 }
 
 impl ProvMachine {
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self { state: ProvState::Idle }
     }
 

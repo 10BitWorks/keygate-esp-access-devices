@@ -2,10 +2,11 @@
 //!
 //! Separates NFC tag reading from Wi-Fi and MQTT connectivity:
 //! - `nfc_runner`: Runs continuously and independently. Polls PN532, handles
-//!   tag debouncing, SUN extraction, blank tag resilience, and beeps.
+//!   tag debouncing, SUN extraction, blank tag resilience, provisioning, and beeps.
 //!   Works completely offline without Wi-Fi or broker connectivity.
 //! - `mqtt_runner`: Manages Wi-Fi association, DHCP, MQTT session lifecycle,
-//!   incoming door commands (`cmd_topic`), and drains the outgoing auth queue.
+//!   incoming door commands (`cmd_topic`), provisioning job routing, and drains
+//!   the outgoing auth, claim, and done queues.
 
 use core::fmt::Write;
 use embassy_futures::select::{select4, Either4};
@@ -24,7 +25,8 @@ use crate::{
     auth_msg, cmd, config,
     nfc::{self, Pn532Delay},
     ntag424,
-    provision, provision_flow::ProvState,
+    provision,
+    provision_flow::{self, ProvAction, ProvMachine, ProvState},
     relay, status_led, tag_debounce,
 };
 use crate::piezo::{self, BeepEvent};
@@ -33,10 +35,6 @@ use crate::piezo::PIEZO_CHANNEL as PZ;
 /// Outbound authentication requests from the independent NFC reader to MQTT.
 /// Capacity 8 buffers taps during brief network disconnects or broker retries.
 pub static AUTH_OUTBOUND: Channel<CriticalSectionRawMutex, heapless::String<256>, 8> = Channel::new();
-
-/// Pending provisioning job dispatched from MQTT to the NFC task.
-pub static PROV_JOB: Mutex<CriticalSectionRawMutex, Option<(heapless::String<32>, heapless::String<32>)>> =
-    Mutex::new(None);
 
 /// Outbound provisioning claim requests from NFC to MQTT.
 pub static PROV_CLAIM_OUTBOUND: Channel<CriticalSectionRawMutex, heapless::String<128>, 2> = Channel::new();
@@ -47,6 +45,9 @@ pub static PROV_DONE_OUTBOUND: Channel<
     (heapless::String<32>, bool, u32, &'static str),
     2,
 > = Channel::new();
+
+/// Shared provisioning state machine coordinating the 2-step enrollment protocol between runners.
+pub static PROV_MACHINE: Mutex<CriticalSectionRawMutex, ProvMachine> = Mutex::new(ProvMachine::new());
 
 /// Main node entry point running both decoupled runners concurrently.
 pub async fn run<I: pn532::Interface>(
@@ -112,6 +113,7 @@ async fn nfc_runner<I: pn532::Interface>(
         if let Some(ref mut pn) = pn532 {
             no_nfc_logged = false;
             let now = Instant::now();
+            let now_ms = now.as_millis() as u64;
 
             // Periodic liveness check: verify SPI bus integrity via GetFirmwareVersion.
             {
@@ -144,121 +146,110 @@ async fn nfc_runner<I: pn532::Interface>(
                 if ev.sak == 0x20 {
                     status_led::set_state(status_led::LedState::TagReading);
 
-                    // Check if an admin provisioning job is active.
-                    let pending_job = {
-                        let lock = PROV_JOB.lock().await;
-                        lock.clone()
+                    // Check provisioning state machine:
+                    let prov_action = {
+                        let mut m = PROV_MACHINE.lock().await;
+                        if !m.state.is_idle() {
+                            m.on_tap(ev.uid, now_ms, config::CLAIM_WAIT_SECS)
+                        } else {
+                            ProvAction::None
+                        }
                     };
 
-                    if let Some((job_id, key_hex)) = pending_job {
-                        println!("[prov] executing tag provisioning for job {}...", job_id);
-                        let mut rnda = [0u8; 16];
-                        let mut rng = esp_hal::rng::Rng::new();
-                        for chunk in rnda.chunks_mut(4) {
-                            let w = rng.random().to_le_bytes();
-                            chunk.copy_from_slice(&w[..chunk.len()]);
+                    match prov_action {
+                        ProvAction::PublishClaim(claim) => {
+                            println!("[prov] wildcard tap: publishing claim for uid");
+                            let _ = PROV_CLAIM_OUTBOUND.try_send(claim);
                         }
-                        let mut key = [0u8; 16];
-                        let run = if decode_key16(key_hex.as_str(), &mut key) {
-                            let mut report = provision::ProvisionReport { uid: [0; 7], counter: 0 };
-                            let pn_ref: &mut _ = &mut *pn;
-                            let mut exchange = move |apdu: &[u8], out: &mut [u8]| -> Result<usize, ntag424::NdefError> {
-                                let resp = nfc::in_data_exchange(pn_ref, 1, apdu)
-                                    .map_err(|_| ntag424::NdefError::Transport)?;
-                                if out.len() < resp.len() {
-                                    return Err(ntag424::NdefError::BufferTooSmall);
-                                }
-                                out[..resp.len()].copy_from_slice(resp);
-                                Ok(resp.len())
-                            };
-                            provision::provision_tag(
-                                &mut exchange,
-                                &rnda,
-                                &key,
-                                config::PROVISION_URL_TEMPLATE,
-                                &mut report,
-                            )
-                            .map(|_| report)
-                        } else {
-                            Err(provision::ProvisionError::BadTemplate)
-                        };
-
-                        let (ok, counter, reason) = match &run {
-                            Ok(report) => (true, report.counter, ""),
-                            Err(e) => {
-                                println!("[prov] provision error: {:?}", e);
-                                (false, 0, "provision error")
-                            }
-                        };
-
-                        // Clear job after one execution attempt.
-                        {
-                            let mut lock = PROV_JOB.lock().await;
-                            *lock = None;
-                        }
-
-                        let _ = PROV_DONE_OUTBOUND.try_send((job_id, ok, counter, reason));
-                        if ok {
-                            let _ = PZ.try_send(BeepEvent::Granted);
-                            status_led::set_state(status_led::LedState::Grant);
-                        } else {
+                        ProvAction::TapRejected => {
+                            println!("[prov] tap rejected (uid mismatch for fixed-uid job)");
                             let _ = PZ.try_send(BeepEvent::Denied);
-                            status_led::set_state(status_led::LedState::DeniedOrOffline);
                         }
-                    } else {
-                        // Standard authentication path: read NDEF message.
-                        let read_res = {
-                            let pn_ref: &mut _ = &mut *pn;
-                            let mut exchange = move |apdu: &[u8], out: &mut [u8]| -> Result<usize, ntag424::NdefError> {
-                                let resp = nfc::in_data_exchange(pn_ref, 1, apdu)
-                                    .map_err(|_| ntag424::NdefError::Transport)?;
-                                if out.len() < resp.len() {
-                                    return Err(ntag424::NdefError::BufferTooSmall);
-                                }
-                                out[..resp.len()].copy_from_slice(resp);
-                                Ok(resp.len())
+                        ProvAction::ProvisionStart => {
+                            // Fixed-uid job with pre-provided key or immediate provisioning
+                            let prov_ctx = {
+                                let m = PROV_MACHINE.lock().await;
+                                m.pending_context()
                             };
-                            ntag424::read_ndef_message(&mut exchange, &mut ndef_buf)
-                        };
-
-                        match read_res {
-                            Ok(n) => match ntag424::extract_ndef_uri(&ndef_buf[..n]) {
-                                Ok(uri) => match ntag424::parse_sun_url(uri) {
-                                    Ok(sun) => {
-                                        let mut payload = heapless::String::<256>::new();
-                                        if auth_msg::build_auth_json(config::DEVICE_ID, &sun, &mut payload).is_ok() {
-                                            println!(
-                                                "auth: {} uid:{} ctr:{}",
-                                                ev.uid_len,
-                                                nfc::TagInfo { uid: ev.uid, uid_len: ev.uid_len, sak: ev.sak }.uid_hex(),
-                                                sun.counter
-                                            );
-                                            // Enqueue for publishing when MQTT is online.
-                                            let _ = AUTH_OUTBOUND.try_send(payload);
-                                            let _ = PZ.try_send(BeepEvent::AuthSent);
+                            if let Some((job_id, key_hex)) = prov_ctx {
+                                execute_tag_provisioning(pn, &job_id, &key_hex).await;
+                            }
+                        }
+                        _ => {
+                            // Check if keyed claim reply already arrived and we're ready to write
+                            let prov_ctx = {
+                                let m = PROV_MACHINE.lock().await;
+                                m.pending_context()
+                            };
+                            if let Some((job_id, key_hex)) = prov_ctx {
+                                execute_tag_provisioning(pn, &job_id, &key_hex).await;
+                            } else {
+                                // Standard authentication path: read NDEF message.
+                                let read_res = {
+                                    let pn_ref: &mut _ = &mut *pn;
+                                    let mut exchange = move |apdu: &[u8], out: &mut [u8]| -> Result<usize, ntag424::NdefError> {
+                                        let resp = nfc::in_data_exchange(pn_ref, 1, apdu)
+                                            .map_err(|_| ntag424::NdefError::Transport)?;
+                                        if out.len() < resp.len() {
+                                            return Err(ntag424::NdefError::BufferTooSmall);
                                         }
-                                        status_led::set_state(status_led::LedState::MqttConnected);
-                                    }
+                                        out[..resp.len()].copy_from_slice(resp);
+                                        Ok(resp.len())
+                                    };
+                                    ntag424::read_ndef_message(&mut exchange, &mut ndef_buf)
+                                };
+
+                                match read_res {
+                                    Ok(n) => match ntag424::extract_ndef_uri(&ndef_buf[..n]) {
+                                        Ok(uri) => match ntag424::parse_sun_url(uri) {
+                                            Ok(sun) => {
+                                                let mut payload = heapless::String::<256>::new();
+                                                if auth_msg::build_auth_json(config::DEVICE_ID, &sun, &mut payload).is_ok() {
+                                                    println!(
+                                                        "auth: {} uid:{} ctr:{}",
+                                                        ev.uid_len,
+                                                        nfc::TagInfo { uid: ev.uid, uid_len: ev.uid_len, sak: ev.sak }.uid_hex(),
+                                                        sun.counter
+                                                    );
+                                                    // Enqueue for publishing when MQTT is online.
+                                                    let _ = AUTH_OUTBOUND.try_send(payload);
+                                                    let _ = PZ.try_send(BeepEvent::AuthSent);
+                                                }
+                                                status_led::set_state(status_led::LedState::MqttConnected);
+                                            }
+                                            Err(e) => {
+                                                println!("SUN parse error: {:?}", e);
+                                                status_led::set_state(status_led::LedState::MqttConnected);
+                                            }
+                                        },
+                                        Err(e) => {
+                                            println!("NDEF URI error: {:?}", e);
+                                            status_led::set_state(status_led::LedState::MqttConnected);
+                                        }
+                                    },
                                     Err(e) => {
-                                        println!("SUN parse error: {:?}", e);
+                                        // Blank / unwritten tag — perfectly normal.
+                                        println!("NDEF read: unwritten/blank tag ({:?})", e);
                                         status_led::set_state(status_led::LedState::MqttConnected);
                                     }
-                                },
-                                Err(e) => {
-                                    println!("NDEF URI error: {:?}", e);
-                                    status_led::set_state(status_led::LedState::MqttConnected);
                                 }
-                            },
-                            Err(e) => {
-                                // Blank / unwritten tag — perfectly normal.
-                                println!("NDEF read: unwritten/blank tag ({:?})", e);
-                                status_led::set_state(status_led::LedState::MqttConnected);
                             }
                         }
                     }
 
                     // Reset RF field so any tag remaining on the antenna power-cycles
                     // back to ISO-14443-3 Idle for clean subsequent polling.
+                    nfc::cycle_rf_field(pn);
+                }
+            } else {
+                // If in ClaimWait state, check if the keyed job reply arrived while the card is being held:
+                let prov_ctx = {
+                    let m = PROV_MACHINE.lock().await;
+                    m.pending_context()
+                };
+                if let Some((job_id, key_hex)) = prov_ctx {
+                    println!("[prov] keyed claim reply active — writing card now");
+                    execute_tag_provisioning(pn, &job_id, &key_hex).await;
                     nfc::cycle_rf_field(pn);
                 }
             }
@@ -271,7 +262,75 @@ async fn nfc_runner<I: pn532::Interface>(
         }
 
         // Cooperative yield to executor tasks.
-        Timer::after(Duration::from_millis(20)).await;
+        Timer::after(Duration::from_millis(15)).await;
+    }
+}
+
+/// Helper to execute the cryptographic provisioning sequence on the tapped tag.
+async fn execute_tag_provisioning<I: pn532::Interface>(
+    pn: &mut Pn532<I, Pn532Delay, 300>,
+    job_id: &str,
+    key_hex: &str,
+) {
+    println!("[prov] provisioning tag (job {})...", job_id);
+    status_led::set_state(status_led::LedState::TagReading);
+
+    let mut rnda = [0u8; 16];
+    let mut rng = esp_hal::rng::Rng::new();
+    for chunk in rnda.chunks_mut(4) {
+        let w = rng.random().to_le_bytes();
+        chunk.copy_from_slice(&w[..chunk.len()]);
+    }
+
+    let mut key = [0u8; 16];
+    let run = if decode_key16(key_hex, &mut key) {
+        let mut report = provision::ProvisionReport { uid: [0; 7], counter: 0 };
+        let mut exchange = move |apdu: &[u8], out: &mut [u8]| -> Result<usize, ntag424::NdefError> {
+            let resp = nfc::in_data_exchange(pn, 1, apdu)
+                .map_err(|_| ntag424::NdefError::Transport)?;
+            if out.len() < resp.len() {
+                return Err(ntag424::NdefError::BufferTooSmall);
+            }
+            out[..resp.len()].copy_from_slice(resp);
+            Ok(resp.len())
+        };
+        provision::provision_tag(
+            &mut exchange,
+            &rnda,
+            &key,
+            config::PROVISION_URL_TEMPLATE,
+            &mut report,
+        )
+        .map(|_| report)
+    } else {
+        Err(provision::ProvisionError::BadTemplate)
+    };
+
+    let (ok, counter, reason) = match &run {
+        Ok(report) => (true, report.counter, ""),
+        Err(e) => {
+            println!("[prov] provision sequence error: {:?}", e);
+            (false, 0, "provision error")
+        }
+    };
+
+    let _action = {
+        let mut m = PROV_MACHINE.lock().await;
+        m.on_provision_done(ok, counter, reason)
+    };
+
+    let mut j_id = heapless::String::<32>::new();
+    let _ = j_id.push_str(job_id);
+    let _ = PROV_DONE_OUTBOUND.try_send((j_id, ok, counter, reason));
+
+    if ok {
+        println!("[prov] tag successfully provisioned!");
+        let _ = PZ.try_send(BeepEvent::Granted);
+        status_led::set_state(status_led::LedState::Grant);
+    } else {
+        println!("[prov] provisioning failed");
+        let _ = PZ.try_send(BeepEvent::Denied);
+        status_led::set_state(status_led::LedState::DeniedOrOffline);
     }
 }
 
@@ -479,18 +538,39 @@ async fn mqtt_runner(
                                         }
                                     }
                                 } else if topic == job_topic.as_str() {
+                                    let now_ms = Instant::now().as_millis() as u64;
                                     if let Ok(text) = core::str::from_utf8(payload) {
-                                        if let Ok((job_p, _)) =
-                                            serde_json_core::from_str::<crate::provision_flow::JobPayload>(text)
-                                        {
-                                            println!("[prov] received job: {}", job_p.job_id);
-                                            let mut j_id = heapless::String::<32>::new();
-                                            let mut j_key = heapless::String::<32>::new();
-                                            let _ = j_id.push_str(job_p.job_id);
-                                            let _ = j_key.push_str(job_p.key);
-                                            let mut lock = PROV_JOB.lock().await;
-                                            *lock = Some((j_id, j_key));
-                                            let _ = PZ.try_send(BeepEvent::ProvisionArmed);
+                                        let action = {
+                                            let mut m = PROV_MACHINE.lock().await;
+                                            let was_claim = matches!(m.state, ProvState::ClaimWait(..));
+                                            if was_claim {
+                                                m.on_claim(text, now_ms)
+                                            } else {
+                                                m.on_job(text, now_ms, config::PROVISION_WINDOW_SECS).1
+                                            }
+                                        };
+                                        match action {
+                                            ProvAction::Arm => {
+                                                println!("[prov] job armed — tap blank tag now");
+                                                let _ = PZ.try_send(BeepEvent::ProvisionArmed);
+                                            }
+                                            ProvAction::PublishClaim(claim) => {
+                                                let pkt = Publication::new(claim_topic.as_str(), claim.as_str())
+                                                    .qos(minimq::QoS::AtLeastOnce);
+                                                let _ = session.publish(pkt).await;
+                                            }
+                                            ProvAction::ProvisionStart => {
+                                                println!("[prov] keyed claim reply received from verifier");
+                                            }
+                                            ProvAction::Fail(j_id, reason) => {
+                                                println!("[prov] job rejected: {}", reason);
+                                                let done = provision_flow::build_done_json(j_id.as_str(), false, 0, reason);
+                                                let pkt = Publication::new(done_topic.as_str(), done.as_str())
+                                                    .qos(minimq::QoS::AtLeastOnce);
+                                                let _ = session.publish(pkt).await;
+                                                let _ = PZ.try_send(BeepEvent::Denied);
+                                            }
+                                            _ => {}
                                         }
                                     }
                                 }
@@ -510,12 +590,14 @@ async fn mqtt_runner(
                             }
                         }
                         Either4::Third(claim_payload) => {
+                            println!("[mqtt] sending claim to verifier");
                             let pkt = Publication::new(claim_topic.as_str(), claim_payload.as_str())
                                 .qos(minimq::QoS::AtLeastOnce);
                             let _ = session.publish(pkt).await;
                         }
                         Either4::Fourth((job_id, ok, counter, reason)) => {
-                            let done = crate::provision_flow::build_done_json(job_id.as_str(), ok, counter, reason);
+                            println!("[mqtt] sending done report to verifier");
+                            let done = provision_flow::build_done_json(job_id.as_str(), ok, counter, reason);
                             let pkt = Publication::new(done_topic.as_str(), done.as_str())
                                 .qos(minimq::QoS::AtLeastOnce);
                             let _ = session.publish(pkt).await;
