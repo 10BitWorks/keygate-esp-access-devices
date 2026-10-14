@@ -237,12 +237,18 @@ async fn nfc_runner<I: pn532::Interface>(
                         }
                     }
 
-                    // Reset RF field so any tag remaining on the antenna power-cycles
-                    // back to ISO-14443-3 Idle for clean subsequent polling.
-                    nfc::cycle_rf_field(pn);
+                    // Only reset the RF field if not in an active provisioning flow
+                    // (the card must remain activated in target slot 1 while awaiting the keyed claim reply).
+                    let in_prov = {
+                        let m = PROV_MACHINE.lock().await;
+                        !m.state.is_idle()
+                    };
+                    if !in_prov {
+                        nfc::cycle_rf_field(pn);
+                    }
                 }
             } else {
-                // If in ClaimWait state, check if the keyed job reply arrived while the card is being held:
+                // If in ClaimWait/Provisioning state, check if the keyed job reply arrived while the card is held:
                 let prov_ctx = {
                     let m = PROV_MACHINE.lock().await;
                     m.pending_context()
