@@ -403,57 +403,15 @@ pub type Esp32SpiBus = esp_hal::spi::master::Spi<'static, esp_hal::Blocking>;
 #[allow(dead_code)]
 pub type DoorSpiDeviceImpl = DoorSpiDevice<Esp32SpiBus, esp_hal::gpio::Output<'static>>;
 #[cfg(feature = "board-esp32-devkit-door")]
-pub type DoorNfcIface = DoorIrqIface;
+pub type DoorNfcIface = pn532::spi::SPIInterface<DoorSoftSpiDevice>;
 
-/// PN532 interface for the door board: IRQ (GPIO4) level as the fast
-/// readiness signal, with the proven SPI STATREAD poll as fallback.
-///
-/// The PN532 IRQ line idles high and pulls LOW when a response is ready.
-/// `wait_ready` samples the pin first (one GPIO read, no bus traffic); only
-/// when IRQ reads high does it fall back to the SPI status poll — identical
-/// behavior to the pre-IRQ interface. A broken or floating IRQ line can
-/// therefore only cost SPI traffic, never correctness. (An earlier
-/// IRQ-*edge*-driven interface hung init; level-sampling inside the crate's
-/// existing timeout-bounded wait has no such failure mode.)
-#[cfg(feature = "board-esp32-devkit-door")]
-pub struct DoorIrqIface {
-    spi: DoorSoftSpiDevice,
-    irq: esp_hal::gpio::Input<'static>,
-}
-
-#[cfg(feature = "board-esp32-devkit-door")]
-impl pn532::Interface for DoorIrqIface {
-    type Error = core::convert::Infallible;
-
-    fn write(&mut self, frame: &mut [u8]) -> Result<(), Self::Error> {
-        self.spi.transaction(&mut [
-            Operation::Write(&[pn532::spi::PN532_SPI_DATAWRITE]),
-            Operation::Write(frame),
-        ])
-    }
-
-    fn wait_ready(&mut self) -> core::task::Poll<Result<(), Self::Error>> {
-        // Fast path: IRQ low = response ready (one GPIO read, no bus traffic).
-        if self.irq.is_low() {
-            return core::task::Poll::Ready(Ok(()));
-        }
-        // Fallback: proven SPI status poll.
-        let mut buf = [pn532::spi::PN532_SPI_STATREAD, 0x00];
-        self.spi.transfer_in_place(&mut buf)?;
-        if buf[1] == pn532::spi::PN532_SPI_READY {
-            core::task::Poll::Ready(Ok(()))
-        } else {
-            core::task::Poll::Pending
-        }
-    }
-
-    fn read(&mut self, buf: &mut [u8]) -> Result<(), Self::Error> {
-        self.spi.transaction(&mut [
-            Operation::Write(&[pn532::spi::PN532_SPI_DATAREAD]),
-            Operation::Read(buf),
-        ])
-    }
-}
+// NOTE on IRQ (GPIO4): level-sampling the IRQ pin as a wait_ready fast path
+// was tried (commit 5f42f35) and broke PN532 init on the first boot — the
+// pin read LOW spuriously, wait_ready returned Ready before any response
+// existed, and every command failed. The line is UNTRUSTED on this harness
+// until verified with a meter/scope. Readiness stays on the proven SPI
+// STATREAD poll; the driver's own timeout bound is what keeps those spins
+// finite.
 
 #[cfg(feature = "board-xiao-c6")]
 pub fn setup(peripherals: esp_hal::peripherals::Peripherals) -> Setup<XiaoNfcIface> {
@@ -588,10 +546,10 @@ pub fn setup(peripherals: esp_hal::peripherals::Peripherals) -> Setup<DoorNfcIfa
     // Wake the PN532 core from low-power standby before wrapping spi_device in SPIInterface.
     spi_device.wake();
 
-    // IRQ (GPIO4): PN532 response-ready line, sampled as a level in
-    // wait_ready (see DoorIrqIface). Pull-up matches the module's own pull.
-    let irq = Input::new(peripherals.GPIO4, InputConfig::default().with_pull(Pull::Up));
-    let iface = DoorIrqIface { spi: spi_device, irq };
+    // IRQ (GPIO4) intentionally unused: readiness is STATUS-polled over MISO.
+    // Level-sampling IRQ in wait_ready broke init instantly (pin reads LOW
+    // spuriously on this harness — see the NOTE above DoorNfcIface).
+    let iface = pn532::spi::SPIInterface { spi: spi_device };
 
     // PN532 init is non-fatal: Wi-Fi/MQTT proceed regardless.
     let pn532 = match nfc::init_pn532(iface) {

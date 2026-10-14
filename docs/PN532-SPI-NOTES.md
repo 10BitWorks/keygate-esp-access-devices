@@ -365,14 +365,19 @@ Rules:
 - The same applies to NFC waits: never spin-wait without the driver's
   timeout bound, and prefer the IRQ fast path below.
 
-### 6. IRQ (GPIO4) readiness — level-sampled, not edge-driven
+### 6. IRQ (GPIO4) — tried, broke init instantly, UNTRUSTED
 
-The PN532 IRQ line idles high and pulls **low** when a response is ready.
-`DoorIrqIface::wait_ready` samples the pin level first (one GPIO read, no bus
-traffic) and falls back to the proven SPI STATREAD poll when it reads high.
-A broken/floating IRQ can only cost SPI traffic, never correctness.
+The PN532 IRQ line idles high and pulls low when a response is ready. Theory:
+sample the pin level in `wait_ready` (one GPIO read) with the SPI STATREAD
+poll as fallback for the high case.
 
-History: an earlier IRQ-*edge*-driven interface (`SPIInterfaceWithIrq`-style,
-waiting on the edge with no fallback) hung init at boot — the failure mode to
-avoid. Level-sampling inside the crate's existing timeout-bounded wait has no
-such failure mode.
+Result (commit 5f42f35, reverted same day): the pin read LOW spuriously on
+this harness — `wait_ready` returned Ready before any response existed, every
+command failed, and `init_pn532` errored on the first boot. The fallback only
+guards the stuck-HIGH case; a false LOW is indistinguishable from "response
+ready" without doing the SPI read anyway.
+
+Status: **GPIO4 is untrusted until verified with a meter/scope.** Readiness
+stays on the proven SPI STATREAD poll; the driver's own timeout bound is what
+keeps those spins finite. Do not reintroduce IRQ sampling without first
+measuring the pin's idle level on the wired harness.

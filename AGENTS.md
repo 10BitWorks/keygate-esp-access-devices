@@ -42,5 +42,8 @@
 - Liveness heartbeats (`[pump hb]`, `[mqtt-cycle]`) are load-bearing
   diagnostics: a missing heartbeat in a capture localizes starvation to the
   exact task.
-- PN532 readiness uses IRQ (GPIO4) level-sampling with SPI STATREAD fallback
-  (`DoorIrqIface`). Never reintroduce an unbounded or edge-only wait.
+- PN532 readiness is SPI STATREAD polling (`SPIInterface`), bounded by the
+  driver's timeouts. **IRQ (GPIO4) level-sampling was tried and reverted** —
+  the pin reads LOW spuriously on this harness and broke init instantly;
+  do not reintroduce it without measuring the pin first. Never use an
+  unbounded or edge-only wait.
