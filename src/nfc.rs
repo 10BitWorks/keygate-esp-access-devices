@@ -170,7 +170,27 @@ pub fn soft_reinit<I: pn532::Interface>(
         NfcError::Pn532
     })?;
 
+    // CfgItem 5: MaxRetries (MxRtyATR = 0xFF, MxRtyPSL = 0x01, MxRtyPassiveActivation = 0x0A)
+    // Matches Adafruit setPassiveActivationRetries(0x0A): allows InListPassiveTarget
+    // to cleanly return NbTg=0 when no tag is present in ~50ms instead of spinning indefinitely.
+    let max_retries = Request::new(Command::RFConfiguration, [0x05, 0xFF, 0x01, 0x0A]);
+    let _ = pn.process(&max_retries, 0, fugit::MillisDurationU32::from_ticks(100));
+
     Ok(())
+}
+
+/// Briefly cycle the PN532 RF field off then on (power-cycles any tag resting on the antenna).
+///
+/// Passive tags (like NTAG 424 DNA) stay in ISO-DEP (14443-4) active mode after APDU exchanges.
+/// Cycling the RF field for a fraction of a millisecond resets any resting tag back to ISO-14443-3 Idle,
+/// allowing clean subsequent polling and proper debounce without hardware supervisor timeouts.
+pub fn cycle_rf_field<I: pn532::Interface>(
+    pn: &mut Pn532<I, Pn532Delay, 300>,
+) {
+    let off = Request::new(Command::RFConfiguration, [0x01, 0x00]);
+    let _ = pn.process(&off, 0, fugit::MillisDurationU32::from_ticks(50));
+    let on = Request::new(Command::RFConfiguration, [0x01, 0x01]);
+    let _ = pn.process(&on, 0, fugit::MillisDurationU32::from_ticks(50));
 }
 
 /// Poll for a single NFC tag.
@@ -207,81 +227,33 @@ pub fn health_check<I: pn532::Interface, T: CountDown<Time = fugit::MillisDurati
 
 pub fn poll_tag<I: pn532::Interface, T: CountDown<Time = fugit::MillisDurationU32>, const N: usize>(
     pn532: &mut Pn532<I, T, N>,
-) -> Result<Option<TagInfo>, NfcError> {
+) -> Option<TagInfo> {
     // INLIST_ONE_ISO_A_TARGET: poll for 1 target at 106 kbps Type A.
-    // When no tag is in the RF field, PN532 responds with NbTg=0 after its internal scan.
-    // 3000ms: measured tag-present responses on this module run 240-900 ms,
-    // occasionally ~3 s (cold re-activation after field release is slow).
-    let res = pn532
-        .process(
-            &Request::INLIST_ONE_ISO_A_TARGET,
-            20,
-            fugit::MillisDurationU32::from_ticks(3000),
-        )
-        .map_err(|e| {
-            // Symptom-based diagnostics from the bench session
-            // (see docs/PN532-SPI-NOTES.md, "Symptom → diagnosis table").
-            #[cfg(target_arch = "xtensa")]
-            {
-                // Error-storm guard: a wedged reader can error at loop rate,
-                // and each println blocks on the UART — a flood here starves
-                // the async executor (MQTT/WiFi tasks stall, presence dies).
-                // Print the first error in full, then only every 512th.
-                use core::sync::atomic::{AtomicU32, Ordering};
-                static POLL_ERR_N: AtomicU32 = AtomicU32::new(0);
-                let n = POLL_ERR_N.fetch_add(1, Ordering::Relaxed);
-                if n == 0 || n % 512 == 0 {
-                    let hint = match &e {
-                        pn532::Error::TimeoutAck => "PN532 stopped ACKing mid-run — check wiring/connectors.",
-                        pn532::Error::TimeoutResponse => "RF response timeout — tag responses on this module run 240ms-3s (slow RF front-end). Hold the tag flat on the antenna; if this persists with NO tag nearby, check antenna/module.",
-                        pn532::Error::BadAck => "Garbage frame where ACK expected — recovery signature; power-cycle the module if repeated.",
-                        _ => "SPI interface error.",
-                    };
-                    esp_println::println!("[nfc] poll err #{} ({:?}): {}", n, e, hint);
-                }
-            }
-            match e {
-                pn532::Error::TimeoutAck | pn532::Error::TimeoutResponse => NfcError::Timeout,
-                _ => NfcError::Pn532,
-            }
-        })?;
-
-    if res.is_empty() || res[0] == 0 {
-        // Heartbeat: log the first 100 poll results so bench captures can tell
-        // "loop alive, no tag" (nbtg=0) from "loop hung" (no lines at all).
-        #[cfg(all(target_arch = "xtensa", feature = "nfc-spy"))]
-        {
-            static POLL_LOG: core::sync::atomic::AtomicU32 =
-                core::sync::atomic::AtomicU32::new(0);
-            let n = POLL_LOG.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-            if n < 100 {
-                esp_println::println!("[nfc] poll #{} nbtg=0", n);
-            }
+    // 250ms matches the proven, smooth timing from the Waveshare C6 RFID reader.
+    if let Ok(res) = pn532.process(
+        &Request::INLIST_ONE_ISO_A_TARGET,
+        20,
+        fugit::MillisDurationU32::from_ticks(250),
+    ) {
+        if res.is_empty() || res[0] == 0 {
+            return None;
         }
-        return Ok(None);
+
+        let sak = res[4];
+        let uid_len = res[5] as usize;
+
+        if res.len() >= 6 + uid_len {
+            let mut uid = [0u8; 7];
+            let copy_len = uid_len.min(7);
+            uid[..copy_len].copy_from_slice(&res[6..6 + copy_len]);
+            return Some(TagInfo {
+                uid,
+                uid_len: copy_len as u8,
+                sak,
+            });
+        }
     }
-
-    // res[0] = NbTg (number of targets found, should be 1)
-    // res[1] = Tg (target number, typically 1)
-    // res[2..4] = SENS_RES (2 bytes ATQA)
-    // res[4] = SEL_RES (1 byte SAK)
-    // res[5] = NFCIDLength (UID length)
-    // res[6..6+NFCIDLength] = NFCID1 (UID)
-    let sak = res[4];
-    let uid_len = res[5] as usize;
-
-    if res.len() >= 6 + uid_len {
-        let mut uid = [0u8; 7];
-        let copy_len = uid_len.min(7);
-        uid[..copy_len].copy_from_slice(&res[6..6 + copy_len]);
-        return Ok(Some(TagInfo {
-            uid,
-            uid_len: copy_len as u8,
-            sak,
-        }));
-    }
-
-    Ok(None)
+    None
 }
 
 /// Send an ISO-DEP (ISO 14443-4) APDU to a target via PN532 `InDataExchange`.

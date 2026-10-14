@@ -1222,6 +1222,7 @@ dependencies = [
  "cmac",
  "critical-section",
  "embassy-executor",
+ "embassy-futures",
  "embassy-net",
  "embassy-sync 0.8.0",
  "embassy-time",
