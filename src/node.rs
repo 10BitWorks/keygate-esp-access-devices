@@ -594,13 +594,14 @@ async fn mqtt_runner(
                 // Inner connected MQTT pump loop driven by select4.
                 // Connected MQTT pump loop: drain outbound queues then poll with bounded wait.
                 let mut pump_iters: u32 = 0;
+                let mut last_hb = Instant::now();
                 loop {
                     pump_iters += 1;
-                    if pump_iters % 300 == 0 {
-                        // Liveness heartbeat: if these stop while the broker
-                        // logs keepalive_timeout, the executor is being
-                        // starved (or minimq stopped being polled).
-                        println!("[pump hb {}]", pump_iters);
+                    // Time-based heartbeat: iteration speed varies with poll
+                    // outcomes, so gate on wall time, not iteration count.
+                    if (Instant::now() - last_hb).as_millis() >= 30_000 {
+                        println!("[pump hb {} iters]", pump_iters);
+                        last_hb = Instant::now();
                     }
                     // 1. Drain and publish any pending auth requests.
                     while let Ok(auth_payload) = AUTH_OUTBOUND.try_receive() {

@@ -132,9 +132,40 @@ pub fn init_pn532<I: pn532::Interface>(
     let timer = Pn532Delay::new();
     let mut pn532 = Pn532::new(interface, timer);
 
-    soft_reinit(&mut pn532)?;
+    // SAMConfig on this module clone is per-boot flaky: identical firmware
+    // boots have both passed and failed the first attempt (see AGENTS.md
+    // "Expected timing" / PN532-SPI-NOTES.md). The reader must self-heal at
+    // boot, not idle NFC-less until a manual reflash — retry with a resync
+    // (ACK abort) and settle gap between attempts. All attempts share one
+    // interface instance; nothing is lost on failure.
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        match soft_reinit(&mut pn532) {
+            Ok(()) => break,
+            Err(e) if attempt < 3 => {
+                #[cfg(target_arch = "xtensa")]
+                esp_println::println!(
+                    "[nfc] init attempt {} failed ({:?}) — resync + retry",
+                    attempt,
+                    e
+                );
+                let _ = pn532.abort(); // datasheet: ACK frame forces the PN532 to resync
+                busy_wait_ms(200);
+            }
+            Err(e) => return Err(e),
+        }
+    }
 
     Ok(pn532)
+}
+
+/// Boot-only bounded settle delay (sync context, pre-executor).
+fn busy_wait_ms(ms: u32) {
+    let t0 = embassy_time::Instant::now();
+    while (embassy_time::Instant::now() - t0).as_millis() < ms as u64 {
+        core::hint::spin_loop();
+    }
 }
 
 /// Re-initialize the PN532 SAM mode on an existing driver instance.

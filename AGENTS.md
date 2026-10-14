@@ -47,8 +47,9 @@
   because the pin is guilty (it was exonerated by bisect: init failed with
   the pin configured AND unconfigured), but because it is unmeasured. Never
   use an unbounded or edge-only wait.
-- **PN532 `SAMConfig failed (TimeoutAck)` after long bench uptime = module
-  wedge, not firmware.** The module latches interface mode at power-on and
+- **PN532 `SAMConfig failed (TimeoutAck)` = per-boot first-command flakiness
+  on this module clone; `init_pn532` retries 3x (ACK-abort resync + 200 ms
+  settle) and self-heals.** Persistent failure across retries = module The module latches interface mode at power-on and
   its 5 V rail never cycles across ESP32 reflashes. Fix: pull the module's
   VIN for ~5 s (full power cycle), then reboot the node. Corroborate with
   the broker log: `pn532 init failed` in `access/<id>/log`.
@@ -63,7 +64,7 @@ regression signal, not noise:
   granularity) → TCP+CONNACK+subscribes ≈ 0.15 s → bugle on the next ≤500 ms
   piezo tick. (Pre-scan builds booted in ~3 s; scan + floor buy a
   deterministic strongest-BSSID pick and cost ~2.5 s — accepted.)
-- **`[pump hb n]` every ~35 s** (300 pump iterations at ~8.7/s). Heartbeats
+- **`[pump hb]` every 30 s** (time-based, wall-clock gated). Heartbeats
   stopping while the broker logs `keepalive_timeout` = executor starvation
   or the pump is not being polled — that is a bug, not Wi-Fi.
 - **Stable session: zero drops.** Pinned to the strongest AP (~-51 dBm at
