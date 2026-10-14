@@ -675,11 +675,10 @@ where
         }
     }
 
-    // 4) Write NDEF (NLEN + record): re-select file E104 (native ChangeKey de-selects the file).
+    // 4) Write NDEF (NLEN + record): select NDEF application & file E104.
     #[cfg(target_arch = "xtensa")]
-    esp_println::println!("[prov-step] step 4: re-select file E104 & update_binary");
-    let n = exchange(&crate::ntag424::SELECT_NDEF_FILE_02_APDU, &mut resp)?;
-    check_status(&resp[..n], 0x90, 0x00)?;
+    esp_println::println!("[prov-step] step 4: select_ndef & update_binary");
+    select_ndef(exchange)?;
 
     let apdu = [
         0x00,
