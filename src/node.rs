@@ -9,7 +9,6 @@
 //!   the outgoing auth, claim, and done queues.
 
 use core::fmt::Write;
-use embassy_futures::select::{select4, Either4};
 use embassy_net::tcp::TcpSocket;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
@@ -517,98 +516,102 @@ async fn mqtt_runner(
                 }
 
                 // Inner connected MQTT pump loop driven by select4.
+                // Connected MQTT pump loop: drain outbound queues then poll with bounded wait.
                 loop {
-                    match select4(
-                        session.poll(),
-                        AUTH_OUTBOUND.receive(),
-                        PROV_CLAIM_OUTBOUND.receive(),
-                        PROV_DONE_OUTBOUND.receive(),
-                    )
-                    .await
-                    {
-                        Either4::First(poll_res) => match poll_res {
-                            Ok(Some(msg)) => {
-                                let topic = msg.topic();
-                                let payload = msg.payload();
+                    // 1. Drain and publish any pending auth requests.
+                    while let Ok(auth_payload) = AUTH_OUTBOUND.try_receive() {
+                        let pkt = Publication::new(auth_topic.as_str(), auth_payload.as_str());
+                        if let Err(e) = session.publish(pkt).await {
+                            println!("[mqtt] auth publish error: {:?}", e);
+                            break;
+                        }
+                    }
 
-                                if topic == cmd_topic.as_str() {
-                                    if let Ok(c) = cmd::parse_cmd_slice(payload) {
-                                        if c.grant {
-                                            let _ = relay::RELAY_CHANNEL.try_send(c.pulse_ms);
-                                            let _ = PZ.try_send(BeepEvent::RelayPulse);
-                                            let _ = PZ.try_send(BeepEvent::Granted);
-                                            status_led::set_state(status_led::LedState::Grant);
-                                            println!("GRANT ({} ms): {}", c.pulse_ms, c.reason);
-                                        } else {
-                                            let _ = PZ.try_send(BeepEvent::Denied);
-                                            status_led::set_state(status_led::LedState::DeniedOrOffline);
-                                            println!("DENY: {}", c.reason);
-                                        }
+                    // 2. Drain and publish any claim requests.
+                    while let Ok(claim_payload) = PROV_CLAIM_OUTBOUND.try_receive() {
+                        println!("[mqtt] sending claim to verifier");
+                        let pkt = Publication::new(claim_topic.as_str(), claim_payload.as_str())
+                            .qos(minimq::QoS::AtLeastOnce);
+                        let _ = session.publish(pkt).await;
+                    }
+
+                    // 3. Drain and publish any done reports.
+                    while let Ok((job_id, ok, counter, reason)) = PROV_DONE_OUTBOUND.try_receive() {
+                        println!("[mqtt] sending done report to verifier");
+                        let done = provision_flow::build_done_json(job_id.as_str(), ok, counter, reason);
+                        let pkt = Publication::new(done_topic.as_str(), done.as_str())
+                            .qos(minimq::QoS::AtLeastOnce);
+                        let _ = session.publish(pkt).await;
+                    }
+
+                    // 4. Drive MQTT with a bounded 100 ms wait (as documented in minimq examples).
+                    match embassy_time::with_timeout(Duration::from_millis(100), session.poll()).await {
+                        Ok(Ok(Some(msg))) => {
+                            let topic = msg.topic();
+                            let payload = msg.payload();
+
+                            if topic == cmd_topic.as_str() {
+                                if let Ok(c) = cmd::parse_cmd_slice(payload) {
+                                    if c.grant {
+                                        let _ = relay::RELAY_CHANNEL.try_send(c.pulse_ms);
+                                        let _ = PZ.try_send(BeepEvent::RelayPulse);
+                                        let _ = PZ.try_send(BeepEvent::Granted);
+                                        status_led::set_state(status_led::LedState::Grant);
+                                        println!("GRANT ({} ms): {}", c.pulse_ms, c.reason);
+                                    } else {
+                                        let _ = PZ.try_send(BeepEvent::Denied);
+                                        status_led::set_state(status_led::LedState::DeniedOrOffline);
+                                        println!("DENY: {}", c.reason);
                                     }
-                                } else if topic == job_topic.as_str() {
-                                    let now_ms = Instant::now().as_millis() as u64;
-                                    if let Ok(text) = core::str::from_utf8(payload) {
-                                        let action = {
-                                            let mut m = PROV_MACHINE.lock().await;
-                                            let was_claim = matches!(m.state, ProvState::ClaimWait(..));
-                                            if was_claim {
-                                                m.on_claim(text, now_ms)
-                                            } else {
-                                                m.on_job(text, now_ms, config::PROVISION_WINDOW_SECS).1
-                                            }
-                                        };
-                                        match action {
-                                            ProvAction::Arm => {
-                                                println!("[prov] job armed — tap blank tag now");
-                                                let _ = PZ.try_send(BeepEvent::ProvisionArmed);
-                                            }
-                                            ProvAction::PublishClaim(claim) => {
-                                                let pkt = Publication::new(claim_topic.as_str(), claim.as_str())
-                                                    .qos(minimq::QoS::AtLeastOnce);
-                                                let _ = session.publish(pkt).await;
-                                            }
-                                            ProvAction::ProvisionStart => {
-                                                println!("[prov] keyed claim reply received from verifier");
-                                            }
-                                            ProvAction::Fail(j_id, reason) => {
-                                                println!("[prov] job rejected: {}", reason);
-                                                let done = provision_flow::build_done_json(j_id.as_str(), false, 0, reason);
-                                                let pkt = Publication::new(done_topic.as_str(), done.as_str())
-                                                    .qos(minimq::QoS::AtLeastOnce);
-                                                let _ = session.publish(pkt).await;
-                                                let _ = PZ.try_send(BeepEvent::Denied);
-                                            }
-                                            _ => {}
+                                }
+                            } else if topic == job_topic.as_str() {
+                                let now_ms = Instant::now().as_millis() as u64;
+                                if let Ok(text) = core::str::from_utf8(payload) {
+                                    let action = {
+                                        let mut m = PROV_MACHINE.lock().await;
+                                        let was_claim = matches!(m.state, ProvState::ClaimWait(..));
+                                        if was_claim {
+                                            m.on_claim(text, now_ms)
+                                        } else {
+                                            m.on_job(text, now_ms, config::PROVISION_WINDOW_SECS).1
                                         }
+                                    };
+                                    match action {
+                                        ProvAction::Arm => {
+                                            println!("[prov] job armed — tap blank tag now");
+                                            let _ = PZ.try_send(BeepEvent::ProvisionArmed);
+                                        }
+                                        ProvAction::PublishClaim(claim) => {
+                                            let pkt = Publication::new(claim_topic.as_str(), claim.as_str())
+                                                .qos(minimq::QoS::AtLeastOnce);
+                                            let _ = session.publish(pkt).await;
+                                        }
+                                        ProvAction::ProvisionStart => {
+                                            println!("[prov] keyed claim reply received from verifier");
+                                        }
+                                        ProvAction::Fail(j_id, reason) => {
+                                            println!("[prov] job rejected: {}", reason);
+                                            let done = provision_flow::build_done_json(j_id.as_str(), false, 0, reason);
+                                            let pkt = Publication::new(done_topic.as_str(), done.as_str())
+                                                .qos(minimq::QoS::AtLeastOnce);
+                                            let _ = session.publish(pkt).await;
+                                            let _ = PZ.try_send(BeepEvent::Denied);
+                                        }
+                                        _ => {}
                                     }
                                 }
                             }
-                            Ok(None) => {}
-                            Err(e) => {
-                                println!("[mqtt] session poll error: {:?}", e);
-                                blog!("mqtt poll error: {:?}", e);
-                                break;
-                            }
-                        },
-                        Either4::Second(auth_payload) => {
-                            let pkt = Publication::new(auth_topic.as_str(), auth_payload.as_str());
-                            if let Err(e) = session.publish(pkt).await {
-                                println!("[mqtt] auth publish error: {:?}", e);
-                                break;
-                            }
                         }
-                        Either4::Third(claim_payload) => {
-                            println!("[mqtt] sending claim to verifier");
-                            let pkt = Publication::new(claim_topic.as_str(), claim_payload.as_str())
-                                .qos(minimq::QoS::AtLeastOnce);
-                            let _ = session.publish(pkt).await;
+                        Ok(Ok(None)) => {
+                            // Local progress (PINGRESP / SUBACK / keepalive)
                         }
-                        Either4::Fourth((job_id, ok, counter, reason)) => {
-                            println!("[mqtt] sending done report to verifier");
-                            let done = provision_flow::build_done_json(job_id.as_str(), ok, counter, reason);
-                            let pkt = Publication::new(done_topic.as_str(), done.as_str())
-                                .qos(minimq::QoS::AtLeastOnce);
-                            let _ = session.publish(pkt).await;
+                        Ok(Err(e)) => {
+                            println!("[mqtt] session poll error: {:?}", e);
+                            blog!("mqtt poll error: {:?}", e);
+                            break;
+                        }
+                        Err(_) => {
+                            // 100 ms timeout with no incoming publish packet: loop to service outbound queues
                         }
                     }
                 }

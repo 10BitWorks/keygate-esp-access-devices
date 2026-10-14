@@ -22,3 +22,10 @@
 - **MQTT Auth Topic:** Publish auth requests to `access/<device_id>/auth`.
 - **MQTT Cmd Topic:** Listen for door commands on `access/<device_id>/cmd`.
 - **MQTT Presence Topic:** Retained LWT offline and online on `access/<device_id>/presence`.
+
+# Resources
+
+## Piezo Melodies
+- Piezo Transducer music generation examples: https://github.com/MoriancumerSouza/arduino-buzzer-songs
+- Library of (sound files) examples of nice beep-like notifying sounds: https://www.pond5.com/search?kw=chirp-beep&media=sfx
+- Arduino examples: https://github.com/AbhishekGhosh/Arduino-Buzzer-Tone-Codes
