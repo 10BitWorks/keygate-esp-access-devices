@@ -133,7 +133,9 @@ pub enum ProvAction {
 }
 
 /// Upper bound for the claim JSON `{"job_id":"<32>","uid":"<14>"}`.
-const CLAIM_JSON_MAX: usize = 64;
+// 69 bytes for a real 32-hex job_id + 7-byte uid (was 64 — silently
+/// truncated, and the verifier rejected the claim as malformed JSON).
+const CLAIM_JSON_MAX: usize = 128;
 
 impl ProvState {
     pub fn is_idle(&self) -> bool {
@@ -328,6 +330,24 @@ fn write_hex_byte<const N: usize>(out: &mut String<N>, b: u8) -> Result<(), ()> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn claim_json_fits_real_job_id() {
+        // Regression: a real verifier job_id is 32 hex chars; with
+        // CLAIM_JSON_MAX = 64 the claim was silently truncated at column 64
+        // and the verifier rejected it as malformed JSON.
+        let job_id = "c53a1f82bbf3c919eeb889bb10b4020e";
+        let uid: [u8; 7] = [0x04, 0x87, 0x53, 0x62, 0x1E, 0x18, 0x90];
+        let claim = build_claim_json(job_id, &uid);
+        let expected = "{\"job_id\":\"c53a1f82bbf3c919eeb889bb10b4020e\",\
+                        \"uid\":\"048753621e1890\"}";
+        assert_eq!(claim.as_str(), expected);
+        assert_eq!(claim.len(), 69);
+        // The done JSON must also survive a 32-hex job id.
+        let done = build_done_json(job_id, true, 42, "");
+        assert!(done.as_str().contains(job_id));
+        assert!(done.as_str().ends_with("\"counter\":42}"));
+    }
 
     const JOB_WILDCARD: &str =
         r#"{"uid":"","key":"","sun_config":{"key_version":1,"cmac_bytes":8},"job_id":"abc123","expires_at":"2026-10-11T00:00:00Z"}"#;
