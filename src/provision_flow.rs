@@ -342,7 +342,7 @@ mod tests {
         let expected = "{\"job_id\":\"c53a1f82bbf3c919eeb889bb10b4020e\",\
                         \"uid\":\"048753621e1890\"}";
         assert_eq!(claim.as_str(), expected);
-        assert_eq!(claim.len(), 69);
+        assert_eq!(claim.len(), 68); // 11 + 32 (job_id) + 9 + 14 (uid) + 2 — overflows the old 64-byte buffer by 4
         // The done JSON must also survive a 32-hex job id.
         let done = build_done_json(job_id, true, 42, "");
         assert!(done.as_str().contains(job_id));
