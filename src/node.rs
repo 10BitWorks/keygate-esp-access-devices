@@ -339,10 +339,15 @@ async fn mqtt_runner(
     stack: embassy_net::Stack<'static>,
     mut wifi_controller: esp_radio::wifi::WifiController<'static>,
 ) -> ! {
-    let mut mqtt_rx_buf = [0u8; 1024];
-    let mut mqtt_tx_buf = [0u8; 1024];
-    let mut tcp_rx_buf = [0u8; 1024];
-    let mut tcp_tx_buf = [0u8; 1024];
+    static TCP_RX: static_cell::StaticCell<[u8; 1024]> = static_cell::StaticCell::new();
+    static TCP_TX: static_cell::StaticCell<[u8; 1024]> = static_cell::StaticCell::new();
+    static MQTT_RX: static_cell::StaticCell<[u8; 1024]> = static_cell::StaticCell::new();
+    static MQTT_TX: static_cell::StaticCell<[u8; 1024]> = static_cell::StaticCell::new();
+
+    let tcp_rx_buf = TCP_RX.init([0u8; 1024]);
+    let tcp_tx_buf = TCP_TX.init([0u8; 1024]);
+    let mqtt_rx_buf = MQTT_RX.init([0u8; 1024]);
+    let mqtt_tx_buf = MQTT_TX.init([0u8; 1024]);
 
     let mut auth_topic = heapless::String::<96>::new();
     let mut cmd_topic = heapless::String::<96>::new();
@@ -428,7 +433,7 @@ async fn mqtt_runner(
         println!("Broker {} -> {}:{}", config::MQTT_HOST, broker_addr, broker_port);
 
         // Open TCP transport.
-        let mut socket = TcpSocket::new(stack, &mut tcp_rx_buf, &mut tcp_tx_buf);
+        let mut socket = TcpSocket::new(stack, &mut tcp_rx_buf[..], &mut tcp_tx_buf[..]);
         match socket.connect((broker_addr, broker_port)).await {
             Ok(_) => println!("TCP connected to MQTT broker."),
             Err(e) => {
@@ -448,7 +453,7 @@ async fn mqtt_runner(
             }
         };
 
-        let mqtt_config = match ConfigBuilder::new(Buffers::new(&mut mqtt_rx_buf, &mut mqtt_tx_buf))
+        let mqtt_config = match ConfigBuilder::new(Buffers::new(&mut mqtt_rx_buf[..], &mut mqtt_tx_buf[..]))
             .client_id(config::DEVICE_ID)
             .and_then(|c| c.auth(config::DEVICE_ID, config::MQTT_PASSWORD.as_bytes()))
             .and_then(|c| c.will(will))
