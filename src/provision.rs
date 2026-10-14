@@ -692,6 +692,8 @@ where
     update[5..5 + file_len].copy_from_slice(&file[..file_len]);
     let rn = exchange(&update[..5 + file_len], &mut resp)?;
     check_status(&resp[..rn], 0x90, 0x00)?;
+    #[cfg(target_arch = "xtensa")]
+    esp_println::println!("[prov-step] step 4 OK");
 
     // 5) ChangeFileSettings on file 2: enable SDM mirrors (CommMode.Full).
     #[cfg(target_arch = "xtensa")]
@@ -702,6 +704,8 @@ where
         crate::ntag424::wrap_apdu(crate::provision::CHANGE_FILE_SETTINGS_INS, &frame[..n]);
     let rn = exchange(&apdu[..len], &mut resp)?;
     check_status(&resp[..rn], 0x91, 0x00)?;
+    #[cfg(target_arch = "xtensa")]
+    esp_println::println!("[prov-step] step 5 OK");
 
     // 6) Read back through the active mirrors and verify locally.
     #[cfg(target_arch = "xtensa")]

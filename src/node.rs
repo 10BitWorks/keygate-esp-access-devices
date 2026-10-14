@@ -278,11 +278,13 @@ async fn execute_tag_provisioning<I: pn532::Interface>(
     let run = if decode_key16(key_hex, &mut key) {
         let mut report = provision::ProvisionReport { uid: [0; 7], counter: 0 };
         let mut exchange = move |apdu: &[u8], out: &mut [u8]| -> Result<usize, ntag424::NdefError> {
+            println!("[apdu-tx] (len {}) {:02x?}", apdu.len(), apdu);
             let resp = nfc::in_data_exchange(pn, 1, apdu)
                 .map_err(|e| {
                     println!("[exchange] in_data_exchange error: {:?}", e);
                     ntag424::NdefError::Transport
                 })?;
+            println!("[apdu-rx] (len {}) {:02x?}", resp.len(), resp);
             if out.len() < resp.len() {
                 return Err(ntag424::NdefError::BufferTooSmall);
             }
