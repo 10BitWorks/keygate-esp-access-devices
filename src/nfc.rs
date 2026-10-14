@@ -179,6 +179,32 @@ pub fn soft_reinit<I: pn532::Interface>(
 /// - `Ok(Some(TagInfo))` if a tag is present in the RF field.
 /// - `Ok(None)` if no tag is present (NbTg == 0).
 /// - `Err(NfcError)` if communication or protocol failure occurs.
+/// Periodic liveness probe: a real GetFirmwareVersion round-trip.
+///
+/// Detects the "fake-ready" wedge where STATUS polls report ready instantly
+/// and every InListPassiveTarget returns a clean NbTg=0 while the RF core is
+/// actually dead — a state the error-counting supervisor cannot see, because
+/// nothing ever errors. A wedged reader fails this probe and lands in the
+/// caller's recovery path (RSTO pulse + re-init).
+pub fn health_check<I: pn532::Interface, T: CountDown<Time = fugit::MillisDurationU32>, const N: usize>(
+    pn: &mut Pn532<I, T, N>,
+) -> Result<[u8; 4], NfcError> {
+    let res = pn
+        .process(
+            &Request::GET_FIRMWARE_VERSION,
+            4,
+            fugit::MillisDurationU32::from_ticks(500),
+        )
+        .map_err(|e| match e {
+            pn532::Error::TimeoutAck | pn532::Error::TimeoutResponse => NfcError::Timeout,
+            _ => NfcError::Pn532,
+        })?;
+    if res.len() < 4 || res[0] != 0x32 {
+        return Err(NfcError::Pn532);
+    }
+    Ok([res[0], res[1], res[2], res[3]])
+}
+
 pub fn poll_tag<I: pn532::Interface, T: CountDown<Time = fugit::MillisDurationU32>, const N: usize>(
     pn532: &mut Pn532<I, T, N>,
 ) -> Result<Option<TagInfo>, NfcError> {

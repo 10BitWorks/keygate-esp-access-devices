@@ -358,6 +358,42 @@ fn decode_key16(hex: &str, out: &mut [u8; 16]) -> bool {
                         let now = Instant::now();
                         let now_ms = now.as_millis() as u64;
 
+                        // Periodic liveness probe (every 64 iterations, ~30 s):
+                        // a real GetFirmwareVersion round-trip. Catches the
+                        // fake-ready wedge (STATUS says ready, RF core dead,
+                        // every scan returns clean NbTg=0) that never produces
+                        // poll errors for the supervisor to count.
+                        {
+                            use core::sync::atomic::{AtomicU32, Ordering};
+                            static HEALTH_N: AtomicU32 = AtomicU32::new(0);
+                            let it = HEALTH_N.fetch_add(1, Ordering::Relaxed);
+                            if it % 64 == 0 {
+                                match nfc::health_check(pn) {
+                                    Ok(fw) => {
+                                        if it % 640 == 0 {
+                                            println!(
+                                                "[nfc] health ok fw={:02x}:{:02x}:{:02x}:{:02x} (iter {})",
+                                                fw[0], fw[1], fw[2], fw[3], it
+                                            );
+                                        }
+                                    }
+                                    Err(e) => {
+                                        println!(
+                                            "[nfc] health check FAILED ({:?}) — pulsing RSTO + reinit",
+                                            e
+                                        );
+                                        if let Some(pin) = reader_reset.as_mut() {
+                                            pin.set_low();
+                                            Timer::after(Duration::from_millis(10)).await;
+                                            pin.set_high();
+                                            Timer::after(Duration::from_millis(100)).await;
+                                        }
+                                        let _ = nfc::soft_reinit(pn);
+                                    }
+                                }
+                            }
+                        }
+
                         match nfc::poll_tag(pn) {
                             Ok(tag_opt) => {
                                 policy.observe(false, now_ms);

@@ -23,7 +23,7 @@ MEMBER="${1:-testmember1}"
 DEVICE="${2:-keygate1}"
 TTL="${3:-120}"
 VERIFYER_URL="${VERIFYER_URL:-http://10.7.1.25:8001}"
-BROKER_HOST="${BROKER_HOST:-10.7.1.106}"
+export BROKER_HOST="${BROKER_HOST:-10.7.1.106}"
 BROKER_SSH="${BROKER_SSH:-root@10.7.1.106}"
 
 : "${ADMIN_BEARER_TOKEN:?export ADMIN_BEARER_TOKEN (verifier admin token)}"
