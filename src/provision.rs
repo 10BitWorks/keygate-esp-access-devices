@@ -635,6 +635,22 @@ where
     let mut file = [0u8; 258];
     let (file_len, offsets) = ndef_file_from_template(url_template, &mut file)?;
 
+    // Probe: check whether Key 0 and Key 1 are factory all-zeros.
+    #[cfg(target_arch = "xtensa")]
+    {
+        let factory = [0u8; 16];
+        let _ = select_ndef(exchange);
+        match authenticate_ev2_first(&factory, 0, rnda, exchange) {
+            Ok(_) => esp_println::println!("[probe-card] Key 0 IS factory all-zeros!"),
+            Err(e) => esp_println::println!("[probe-card] Key 0 is NOT factory all-zeros: {:?}", e),
+        }
+        let _ = select_ndef(exchange);
+        match authenticate_ev2_first(&factory, 1, rnda, exchange) {
+            Ok(_) => esp_println::println!("[probe-card] Key 1 IS factory all-zeros!"),
+            Err(e) => esp_println::println!("[probe-card] Key 1 is NOT factory all-zeros: {:?}", e),
+        }
+    }
+
     // 1) Select NDEF application + file.
     #[cfg(target_arch = "xtensa")]
     esp_println::println!("[prov-step] step 1: select_ndef");
