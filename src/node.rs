@@ -600,7 +600,8 @@ async fn mqtt_runner(
                             }
                         }
                         Ok(Ok(None)) => {
-                            // Local progress (PINGRESP / SUBACK / keepalive)
+                            // Cooperative yield so other executor tasks (Wi-Fi, NFC, timers) run cleanly
+                            Timer::after(Duration::from_millis(15)).await;
                         }
                         Ok(Err(e)) => {
                             println!("[mqtt] session poll error: {:?}", e);

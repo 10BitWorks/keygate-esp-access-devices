@@ -491,6 +491,16 @@ mod tests {
     }
 
     #[test]
+    fn test_real_verifier_wildcard_job_arms() {
+        let payload = r#"{"expires_at":"2026-10-14T16:25:02.236144627+00:00","job_id":"12fbcb7eff6ae9a9ba34a5300cd0fb07","key":"","sun_config":{"cmac_bytes":8,"key_version":1},"uid":""}"#;
+        let mut m = ProvMachine::new();
+        let (job, action) = m.on_job(payload, 1000, 90);
+        assert_eq!(action, ProvAction::Arm);
+        let job = job.expect("job parsed");
+        assert_eq!(job.job_id.as_str(), "12fbcb7eff6ae9a9ba34a5300cd0fb07");
+    }
+
+    #[test]
     fn malformed_job_is_rejected() {
         let mut m = ProvMachine::new();
         assert_eq!(m.on_job("{not json", 0, 90), (None, ProvAction::None));
