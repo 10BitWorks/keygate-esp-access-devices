@@ -30,3 +30,17 @@
 - Library of (sound files) examples of nice beep-like notifying sounds: https://www.pond5.com/search?kw=chirp-beep&media=sfx
 - Arduino examples: https://github.com/AbhishekGhosh/Arduino-Buzzer-Tone-Codes
 - More melodies as beep code: https://github.com/SpaceinvaderOne/Beep-Music-Converter/tree/main/beep_music
+
+## Firmware loop discipline (hard rules)
+
+- **No line-rate loops, ever.** Every retry/connection loop carries an
+  unconditional sleep at the loop top (see `mqtt_runner`'s 1 Hz floor). If a
+  loop can outrun its intended cadence when every await returns early, it
+  will — and it floods the UART, the broker, and starves sibling tasks.
+- Every handshake has a timeout (MQTT connect: 10 s). Zombie sessions and
+  CONNACK hangs are failures, not states to wait out.
+- Liveness heartbeats (`[pump hb]`, `[mqtt-cycle]`) are load-bearing
+  diagnostics: a missing heartbeat in a capture localizes starvation to the
+  exact task.
+- PN532 readiness uses IRQ (GPIO4) level-sampling with SPI STATREAD fallback
+  (`DoorIrqIface`). Never reintroduce an unbounded or edge-only wait.

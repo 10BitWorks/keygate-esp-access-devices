@@ -344,3 +344,35 @@ in commit `d1b570f`.
 ### 4. 2-Step Wildcard Provisioning Protocol Invariant
 - The initial job payload from the verifier arrives with `key: ""` because key diversification requires the card's physical UID.
 - The node must publish `writer/<device>/claim` with the UID, keep the tag activated in target slot 1 (never cycling the RF field mid-flow), and execute `provision_tag` only after the keyed claim reply arrives on `writer/<device>/job`.
+
+### 5. No Line-Rate Loops (hard rule)
+
+Any loop that can iterate faster than its poll/sleep interval is a line-rate
+loop. They flood the UART ( burying real diagnostics under megabytes of one
+line), flood the broker (EMQX logged `runq_overload` alarms from a firmware
+CONNECT flood), starve sibling executor tasks (MQTT pings stop → broker kicks
+with `keepalive_timeout`), and burn power. Every stability regression traced
+so far shipped with one.
+
+Rules:
+
+- Every retry/connection loop gets a **hard sleep at the loop top** (`mqtt_runner`
+  sleeps 1 s unconditionally before each cycle — `continue` paths cannot skip it).
+- Every handshake gets a **timeout** (`session.connect` is capped at 10 s; a
+  broker that accepts TCP but stalls CONNACK must not hold a zombie session).
+- Liveness heartbeats (`[pump hb n]`, `[mqtt-cycle n]`) make a starved or
+  hot-looping task visible in one capture instead of a bench day.
+- The same applies to NFC waits: never spin-wait without the driver's
+  timeout bound, and prefer the IRQ fast path below.
+
+### 6. IRQ (GPIO4) readiness — level-sampled, not edge-driven
+
+The PN532 IRQ line idles high and pulls **low** when a response is ready.
+`DoorIrqIface::wait_ready` samples the pin level first (one GPIO read, no bus
+traffic) and falls back to the proven SPI STATREAD poll when it reads high.
+A broken/floating IRQ can only cost SPI traffic, never correctness.
+
+History: an earlier IRQ-*edge*-driven interface (`SPIInterfaceWithIrq`-style,
+waiting on the edge with no fallback) hung init at boot — the failure mode to
+avoid. Level-sampling inside the crate's existing timeout-bounded wait has no
+such failure mode.

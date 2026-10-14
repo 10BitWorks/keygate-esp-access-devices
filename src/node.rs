@@ -373,6 +373,7 @@ async fn mqtt_runner(
 
     let broker_port: u16 = config::MQTT_PORT.parse().unwrap_or(1883);
     let mut backoff_secs: u64 = 1;
+    let mut cycle: u32 = 0;
 
     fn next_backoff(secs: &mut u64) -> u64 {
         let current = *secs;
@@ -385,6 +386,14 @@ async fn mqtt_runner(
     }
 
     loop {
+        cycle += 1;
+        // HARD rate floor: this loop may never cycle faster than 1 Hz. A hot
+        // loop here floods the broker with CONNECT takeovers (runq_overload),
+        // spams the UART at line rate, and masks the real failure cadence.
+        // Every retry path funnels back through here; no exceptions.
+        Timer::after(Duration::from_secs(1)).await;
+        println!("[mqtt-cycle {}]", cycle);
+
         // Audible connection progress: joining Wi-Fi first.
         piezo::set_conn_state(piezo::conn::WAIT_WIFI);
         status_led::set_state(status_led::LedState::WifiConnecting);
@@ -438,7 +447,9 @@ async fn mqtt_runner(
         };
         println!("Broker {} -> {}:{}", config::MQTT_HOST, broker_addr, broker_port);
 
-        // Open TCP transport.
+        // Open TCP transport, then the MQTT session — both bounded. A broker
+        // that accepts TCP but stalls CONNACK must not hold a zombie session
+        // (and our pump hostage) for minutes.
         let mut socket = TcpSocket::new(stack, &mut tcp_rx_buf[..], &mut tcp_tx_buf[..]);
         match socket.connect((broker_addr, broker_port)).await {
             Ok(_) => println!("TCP connected to MQTT broker."),
@@ -474,8 +485,8 @@ async fn mqtt_runner(
 
         let mut session = Session::new(mqtt_config);
 
-        match session.connect(socket).await {
-            Ok(ConnectEvent::Connected) | Ok(ConnectEvent::Reconnected) => {
+        match embassy_time::with_timeout(Duration::from_secs(10), session.connect(socket)).await {
+            Ok(Ok(ConnectEvent::Connected)) | Ok(Ok(ConnectEvent::Reconnected)) => {
                 println!("MQTT connected! Broker online.");
                 status_led::set_state(status_led::LedState::MqttConnected);
                 backoff_secs = 1;
@@ -523,7 +534,15 @@ async fn mqtt_runner(
 
                 // Inner connected MQTT pump loop driven by select4.
                 // Connected MQTT pump loop: drain outbound queues then poll with bounded wait.
+                let mut pump_iters: u32 = 0;
                 loop {
+                    pump_iters += 1;
+                    if pump_iters % 300 == 0 {
+                        // Liveness heartbeat: if these stop while the broker
+                        // logs keepalive_timeout, the executor is being
+                        // starved (or minimq stopped being polled).
+                        println!("[pump hb {}]", pump_iters);
+                    }
                     // 1. Drain and publish any pending auth requests.
                     while let Ok(auth_payload) = AUTH_OUTBOUND.try_receive() {
                         let pkt = Publication::new(auth_topic.as_str(), auth_payload.as_str());
@@ -635,8 +654,14 @@ async fn mqtt_runner(
                 blog!("mqtt session dropped — reconnect in {}s", wait);
                 Timer::after(Duration::from_secs(wait)).await;
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 println!("MQTT session connect failed: {:?}", e);
+                status_led::set_state(status_led::LedState::DeniedOrOffline);
+                Timer::after(Duration::from_secs(next_backoff(&mut backoff_secs))).await;
+            }
+            Err(_) => {
+                println!("[mqtt] connect timeout — no CONNACK in 10s");
+                blog!("mqtt connect timeout (10s)");
                 status_led::set_state(status_led::LedState::DeniedOrOffline);
                 Timer::after(Duration::from_secs(next_backoff(&mut backoff_secs))).await;
             }
