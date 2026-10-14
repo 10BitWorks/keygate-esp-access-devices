@@ -21,7 +21,7 @@ use crate::{
     reader_supervisor::{Action, ResetPolicy},
     relay, status_led, tag_debounce,
 };
-use crate::piezo::BeepEvent;
+use crate::piezo::{self, BeepEvent};
 use crate::piezo::PIEZO_CHANNEL as PZ;
 
 pub async fn run<I: pn532::Interface>(
@@ -46,6 +46,9 @@ pub async fn run<I: pn532::Interface>(
     let _ = write!(&mut auth_topic, "access/{}/auth", config::DEVICE_ID);
     let _ = write!(&mut cmd_topic, "access/{}/cmd", config::DEVICE_ID);
     let _ = write!(&mut presence_topic, "access/{}/presence", config::DEVICE_ID);
+
+    // Audible connection progress: joining Wi-Fi first.
+    piezo::set_conn_state(piezo::conn::WAIT_WIFI);
     let _ = write!(&mut job_topic, "writer/{}/job", config::DEVICE_ID);
     let _ = write!(&mut claim_topic, "writer/{}/claim", config::DEVICE_ID);
     let _ = write!(&mut done_topic, "writer/{}/done", config::DEVICE_ID);
@@ -180,6 +183,9 @@ fn decode_key16(hex: &str, out: &mut [u8; 16]) -> bool {
         let ip_info = stack.config_v4().unwrap();
         println!("IP: {}", ip_info.address);
 
+        // Wi-Fi + DHCP up; now audible progress moves to MQTT joining.
+        piezo::set_conn_state(piezo::conn::WAIT_MQTT);
+
         // Resolve the broker. `dns_query` also accepts IP literals.
         let broker_addr =
             match stack.dns_query(config::MQTT_HOST, embassy_net::dns::DnsQueryType::A).await {
@@ -250,8 +256,8 @@ fn decode_key16(hex: &str, out: &mut [u8; 16]) -> bool {
                 // a reconnect drops any in-flight job — the server TTL lapses).
                 let mut prov = ProvMachine::new();
 
-                // Boot beep: the node is fully up.
-                let _ = PZ.try_send(BeepEvent::Boot);
+                // Fully online — confirmation melody via the conn-state hook.
+                piezo::set_conn_state(piezo::conn::ONLINE);
 
                 // Subscribe to commands AND provisioning jobs. Two separate
                 // SUBSCRIBEs: minimq 0.12's multi-filter SUBSCRIBE encoding is
@@ -591,7 +597,9 @@ fn decode_key16(hex: &str, out: &mut [u8; 16]) -> bool {
                 // Session died mid-loop (the tag loop only exits via break on
                 // transport/protocol failure). Honor the reconnect backoff
                 // here — without it a flapping broker pins the CPU at
-                // reconnect rate and starves every other task.
+                // reconnect rate and starves every other task. Audible state
+                // drops to the slow reconnect beep.
+                piezo::set_conn_state(piezo::conn::RECONNECT);
                 Timer::after(Duration::from_secs(next_backoff(&mut backoff_secs))).await;
             }
             Err(e) => {

@@ -58,6 +58,34 @@ pub const ON_MS_MIN: u32 = 10;
 pub const ON_MS_MAX: u32 = 1000;
 
 /// Feedback pattern per event, per draft decision D5.
+
+/// Connection progress states for the audible status beeps. Written by the
+/// node via [`set_conn_state`] as the network stack comes up (or drops).
+pub mod conn {
+    /// Booting; nothing audible yet.
+    pub const BOOT: u8 = 0;
+    /// Joining Wi-Fi: one short beep per tick.
+    pub const WAIT_WIFI: u8 = 1;
+    /// Joining MQTT: double short beep per tick.
+    pub const WAIT_MQTT: u8 = 2;
+    /// Fully online: rising confirmation once, then silent.
+    pub const ONLINE: u8 = 3;
+    /// Lost the connection after having been online: one low beep every
+    /// 15 s so an offline reader is noticed from across the room.
+    pub const RECONNECT: u8 = 4;
+}
+
+/// Current connection state (see [`conn`]).
+pub static CONN_STATE: core::sync::atomic::AtomicU8 =
+    core::sync::atomic::AtomicU8::new(conn::BOOT);
+
+/// Publish a new connection state for the audible progress beeps.
+pub fn set_conn_state(state: u8) {
+    CONN_STATE.store(state, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// How often (in ticks) the reconnect beep plays while [`conn::RECONNECT`].
+const RECONNECT_TICKS: u32 = 15;
 ///
 /// Each entry maps an event to an ordered list of tones `(freq_hz, on_ms)`. The
 /// first entry of each pattern is the leading beep; multi-tone patterns are
@@ -106,7 +134,7 @@ mod embedded {
 
     use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
     use embassy_sync::channel::{Channel, Receiver, Sender};
-    use embassy_time::{Duration, Timer};
+    use embassy_time::{Duration, Timer, with_timeout};
     use esp_hal::gpio::{Level, Output};
     use esp_println::println;
 
@@ -203,25 +231,67 @@ mod embedded {
         pins.idle();
     }
 
+    /// Play a pattern with inter-tone gaps, returning the pins to idle.
+    async fn play_pattern(pins: &mut PiezoPins, pattern: &[Tone]) {
+        for (i, &(freq_hz, on_ms)) in pattern.iter().enumerate() {
+            if i > 0 {
+                pins.idle();
+                Timer::after(Duration::from_millis(TONE_GAP_MS as u64)).await;
+            }
+            play_tone(pins, freq_hz, on_ms);
+        }
+        pins.idle();
+    }
+
+    fn conn_state() -> u8 {
+        super::CONN_STATE.load(core::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Drain feedback events and play their patterns forever.
+    ///
+    /// Between events (1 s tick) the connection state drives audible progress:
+    /// single beep while joining Wi-Fi, double beep while joining MQTT, a
+    /// rising confirmation when online, and a slow beep every 15 s while
+    /// reconnecting after a drop.
     pub async fn run(rx: PiezoReceiver, mut pins: PiezoPins) -> ! {
         pins.idle();
         println!("[piezo] bridge driver ready (idle both-low)");
 
+        let mut tick: u32 = 0;
+        let mut online_announced = false;
         loop {
-            let event = rx.receive().await;
-            let pattern = pattern_for(event);
-            println!("[piezo] play {:?} ({} tone(s))", event, pattern.len());
-
-            for (i, &(freq_hz, on_ms)) in pattern.iter().enumerate() {
-                if i > 0 {
-                    pins.idle();
-                    Timer::after(Duration::from_millis(TONE_GAP_MS as u64)).await;
+            match with_timeout(Duration::from_millis(1000), rx.receive()).await {
+                Ok(event) => {
+                    let pattern = pattern_for(event);
+                    println!("[piezo] play {:?} ({} tone(s))", event, pattern.len());
+                    play_pattern(&mut pins, &pattern).await;
                 }
-                play_tone(&mut pins, freq_hz, on_ms);
+                Err(_) => {
+                    tick = tick.saturating_add(1);
+                    match conn_state() {
+                        super::conn::WAIT_WIFI => play_pattern(&mut pins, &[(2000, 80)]).await,
+                        super::conn::WAIT_MQTT => {
+                            play_pattern(&mut pins, &[(2500, 50), (2500, 50)]).await
+                        }
+                        super::conn::ONLINE => {
+                            if !online_announced {
+                                online_announced = true;
+                                play_pattern(&mut pins, &[(1800, 90), (2400, 120)]).await;
+                            }
+                        }
+                        super::conn::RECONNECT => {
+                            if tick % RECONNECT_TICKS == 0 {
+                                play_pattern(&mut pins, &[(1200, 150)]).await;
+                            }
+                        }
+                        _ => {}
+                    }
+                    pins.idle();
+                }
             }
-
-            pins.idle();
+            if conn_state() != super::conn::ONLINE {
+                online_announced = false;
+            }
         }
     }
 
