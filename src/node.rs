@@ -57,10 +57,6 @@ pub async fn run<I: pn532::Interface>(
 
     let broker_port: u16 = config::MQTT_PORT.parse().unwrap_or(1883);
     let mut backoff_secs: u64 = 1;
-    // Consecutive TCP-connect failures: after 3, force a WiFi rejoin — the
-    // AP can silently drop the client (inactivity/PS kick) while the stack
-    // still reports "connected", leaving every TCP connect timing out.
-    let mut tcp_fails: u32 = 0;
 
     fn next_backoff(secs: &mut u64) -> u64 {
         let current = *secs;
@@ -223,24 +219,12 @@ fn decode_key16(hex: &str, out: &mut [u8; 16]) -> bool {
         {
             Ok(Ok(())) => println!("TCP connected to MQTT broker."),
             Ok(Err(e)) => {
-                tcp_fails += 1;
-                blog!("TCP connection to broker failed ({} consecutive): {:?}", tcp_fails, e);
-                if tcp_fails >= 3 {
-                    blog!("3 consecutive TCP failures — forcing WiFi rejoin");
-                    tcp_fails = 0;
-                    let _ = wifi_controller.disconnect_async().await;
-                }
+                blog!("TCP connection to broker failed: {:?}", e);
                 Timer::after(Duration::from_secs(next_backoff(&mut backoff_secs))).await;
                 continue;
             }
             Err(_) => {
-                tcp_fails += 1;
-                blog!("TCP connect timed out (10s) — cycling socket ({} consecutive)", tcp_fails);
-                if tcp_fails >= 3 {
-                    blog!("3 consecutive TCP failures — forcing WiFi rejoin");
-                    tcp_fails = 0;
-                    let _ = wifi_controller.disconnect_async().await;
-                }
+                blog!("TCP connect timed out (10s) — cycling socket");
                 Timer::after(Duration::from_secs(next_backoff(&mut backoff_secs))).await;
                 continue;
             }
