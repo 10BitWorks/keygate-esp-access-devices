@@ -44,7 +44,7 @@ fi
 FLASHED=1
 for i in 1 2 3; do
     echo "=== Flash attempt $i @ 57600 baud (stub mode) ==="
-    if timeout 300 espflash flash --chip esp32 --port "$PORT" --before no-reset -B 57600 --no-verify "$ELF"; then
+    if timeout 300 espflash flash --chip esp32 --port "$PORT" --before no-reset -B 57600 --no-verify --partition-table partitions.csv --erase-parts otadata --target-app-partition ota_0 "$ELF"; then
         echo "Flash succeeded on attempt $i!"
         FLASHED=0
         break

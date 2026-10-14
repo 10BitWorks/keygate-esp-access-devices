@@ -539,10 +539,6 @@ fn decode_key16(hex: &str, out: &mut [u8; 16]) -> bool {
                                             }
                                             } // else: provisioning branch consumed the tap
                                         }
-
-                                        // Release target so the PN532 frees its internal slot
-                                        // and can cleanly detect subsequent taps.
-                                        nfc::release_targets(pn);
                                     }
                                 }
 
@@ -606,7 +602,6 @@ fn decode_key16(hex: &str, out: &mut [u8; 16]) -> bool {
                                         action, &mut prov, &mut session,
                                         claim_topic.as_str(), done_topic.as_str()
                                     );
-                                    nfc::release_targets(pn);
                                 }
                             }
                             Err(e) => {
