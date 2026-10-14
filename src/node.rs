@@ -264,8 +264,8 @@ async fn nfc_runner<I: pn532::Interface>(
             Timer::after(Duration::from_secs(1)).await;
         }
 
-        // Cooperative yield to executor tasks.
-        Timer::after(Duration::from_millis(15)).await;
+        // Cooperative yield to executor tasks (matches xiao-c6 adaptive yield).
+        Timer::after(Duration::from_millis(150)).await;
     }
 }
 
@@ -392,12 +392,11 @@ async fn mqtt_runner(
 
         if !wifi_controller.is_connected() {
             println!("Connecting to WiFi...");
-            let _ = wifi_controller.disconnect_async().await;
             match wifi_controller.connect_async().await {
                 Ok(_) => println!("WiFi connected"),
                 Err(e) => {
                     println!("WiFi connection failed: {:?}", e);
-                    Timer::after(Duration::from_secs(2)).await;
+                    Timer::after(Duration::from_secs(5)).await;
                     continue;
                 }
             }
