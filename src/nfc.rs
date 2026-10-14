@@ -337,5 +337,16 @@ pub fn in_data_exchange<'a, I: pn532::Interface, T: CountDown<Time = fugit::Mill
     Ok(&resp[1..])
 }
 
+/// Release all active targets in the PN532 internal target table.
+///
+/// Must be called after an APDU interaction (or when a tag is removed) so the
+/// PN532 frees its internal target slot and can cleanly detect the next tap.
+pub fn release_targets<I: pn532::Interface, T: CountDown<Time = fugit::MillisDurationU32>, const N: usize>(
+    pn532: &mut Pn532<I, T, N>,
+) {
+    let req = Request::new(Command::InRelease, [0]);
+    let _ = pn532.process(&req, 1, fugit::MillisDurationU32::from_ticks(50));
+}
+
 
 
