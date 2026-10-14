@@ -43,10 +43,15 @@
   diagnostics: a missing heartbeat in a capture localizes starvation to the
   exact task.
 - PN532 readiness is SPI STATREAD polling (`SPIInterface`), bounded by the
-  driver's timeouts. **IRQ (GPIO4) level-sampling was tried and reverted** —
-  the pin reads LOW spuriously on this harness and broke init instantly;
-  do not reintroduce it without measuring the pin first. Never use an
-  unbounded or edge-only wait.
+  driver's timeouts. **GPIO4 ("IRQ" harness slot) stays unconfigured** — not
+  because the pin is guilty (it was exonerated by bisect: init failed with
+  the pin configured AND unconfigured), but because it is unmeasured. Never
+  use an unbounded or edge-only wait.
+- **PN532 `SAMConfig failed (TimeoutAck)` after long bench uptime = module
+  wedge, not firmware.** The module latches interface mode at power-on and
+  its 5 V rail never cycles across ESP32 reflashes. Fix: pull the module's
+  VIN for ~5 s (full power cycle), then reboot the node. Corroborate with
+  the broker log: `pn532 init failed` in `access/<id>/log`.
 
 ## Expected timing (regression baselines — measured 2026-10-14)
 
