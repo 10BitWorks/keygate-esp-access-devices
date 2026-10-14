@@ -254,3 +254,27 @@ this CH340), 20–30 s capture windows, MQTT-gated tap captures.
   EMQX credentials — blanks correctly stop at SW 6A82.
 - Determine which physical module is on the door (the C6's module was borrowed during
   testing and may not have been returned).
+
+## Serial / flash forensics — invalidated assumptions (2026-10-13/14 bench session)
+
+Assumptions that were tested tonight and **did not survive**, kept here so
+nobody re-derives them:
+
+| Assumption | Reality |
+|---|---|
+| The USB-serial bridge is a CH340 | Never verified. `lsusb` shows the devkit's **on-board CP2102**; the same micro-USB cable was used all night. No external adapter exists. |
+| Serial flood byte counts = firmware print rates | **Phantom.** Multiple captures exceeded the 115200 baud physical limit by 10-60x. The adapter/kernel replayed stale buffer content on every reader attach. **Content and ordering are real; volumes are not.** Use the broker (or `emqx ctl clients`) as ground truth. |
+| Tag-loop clock "runs fake-fast" (supervisor cooldown passing at kHz rates) | Superseded. Boot-time probe measures `Timer::after(1000ms) = 1000 ms`; loop-tick telemetry showed a sane clock. The "evidence" was phantom flood volume. Treat the app clock as trustworthy. |
+| BOOT-dance hold duration matters; late release can kill a started flash | **Unverified either way.** Failures happen at specific stages (MemBegin / ReadReg / FlashDeflData) regardless of hold timing. Release of BOOT does not electrically reset the chip, but a worn BOOT/EN button pair *could* bounce. Keep holds short-ish; treat 8 s as habit, not physics. |
+| A failed flash leaves the chip running | No — a failure during connect leaves the chip **in download mode** (next flash needs no dance); a failure **mid-write** corrupts the image → boot-loop or silent brick. Recovery = dance + reflash (ROM bootloader is mask ROM, unbrickable). Proven twice. |
+| 20 ms bounded `session.poll()` is harmless | **Invalidated.** Cancelling poll() every iteration starved minimq's pending operations: subscriptions landed minutes late (`subscriptions=0→1→2` over ~3 min) and keepalives were dropped (44 broker `keepalive_timeout` kills in one night) → session-flap cascade. Fixed at **250 ms** (`6126478`). |
+| Multi-filter SUBSCRIBE works | **Invalidated.** minimq 0.12's multi-filter encoding is untested upstream; EMQX kills the session with `topic_filter_invalid` on the combined packet. Fixed by two single-filter SUBSCRIBEs (`fb9cdf6`). |
+| The EMQX broker "wedged" during the night | **Invalidated.** The ad-hoc probe scripts omitted the MQTT CONNECT fixed header (`0x10`), so the broker correctly dropped every one. The broker was healthy; the restart was unnecessary. |
+| The door reader is "slow/weak" | **Invalidated by the owner:** detection is instant with ~0.5-1.5" range when the reader is alive. The real failure mode is the **post-transaction fake-ready wedge**: first tap is seen, then every scan returns clean `NbTg=0` with zero poll errors — invisible to the error-counting supervisor. Now covered by the periodic `GetFirmwareVersion` health probe (`cceff14`). |
+
+### Flash recipes that worked tonight (in order of reliability)
+
+1. Stub + 57600 (`--before no-reset -B 57600 --no-verify`) — most successful.
+2. no-stub + 115200 — slower, but its *writes* completed even on the degraded
+   link (failures moved to the final MD5 read).
+3. `scripts/bench-flash.sh` wraps the zenity-gated retry workflow.
