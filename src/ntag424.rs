@@ -306,10 +306,12 @@ pub const SELECT_NDEF_APP_APDU: [u8; 13] = [
     0x00, 0xA4, 0x04, 0x00, 0x07, 0xD2, 0x76, 0x00, 0x00, 0x85, 0x01, 0x01, 0x00,
 ];
 
-/// ISO 7816-4 SELECT by file ID for NDEF File 02.
+/// ISO 7816-4 SELECT by file ID for the NDEF file (file number 02).
 ///
-/// `00 A4 00 0C 02 02 00`
-pub const SELECT_NDEF_FILE_02_APDU: [u8; 7] = [0x00, 0xA4, 0x00, 0x0C, 0x02, 0x02, 0x00];
+/// `00 A4 00 0C 02 E1 04` — the NDEF file's ISO file ID is `E104`
+/// (CC = `E103`, proprietary = `E105`; NXP AN12196 §5.x). Selecting by the
+/// file *number* (`02 00`) returns SW 6A82 (file not found).
+pub const SELECT_NDEF_FILE_02_APDU: [u8; 7] = [0x00, 0xA4, 0x00, 0x0C, 0x02, 0xE1, 0x04];
 
 /// ISO 7816-4 READ BINARY instruction byte (INS=0xB0).
 pub const READ_BINARY_INS: u8 = 0xB0;
