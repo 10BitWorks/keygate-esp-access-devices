@@ -49,10 +49,11 @@ board-esp32-devkit-door = []
 nfc-spy = []
 
 [target.'cfg(any(target_arch = "riscv32", target_arch = "xtensa"))'.dependencies]
+defmt = "1"
 # ESP32 HAL and runtime
-esp-hal = { version = "1.1", optional = true, features = ["unstable"] }
+esp-hal = { version = "1.1", optional = true, features = ["unstable", "defmt"] }
 esp-backtrace = { version = "0.19", optional = true, features = ["panic-handler", "println"] }
-esp-println = { version = "0.17", optional = true, default-features = false, features = ["auto"] }
+esp-println = { version = "0.17", optional = true, default-features = false, features = ["auto", "defmt-espflash"] }
 esp-radio = { version = "0.18.0", optional = true, features = ["wifi", "unstable"] }
 esp-alloc = { version = "0.10.0", features = ["global-allocator"] }
 esp-rtos = { version = "0.3.0", optional = true, features = ["embassy", "esp-radio", "esp-alloc"] }
