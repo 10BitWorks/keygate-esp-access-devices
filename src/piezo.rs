@@ -269,17 +269,9 @@ mod embedded {
                 Err(_) => {
                     tick = tick.saturating_add(1);
                     match conn_state() {
-                        // Wait-state beeps every 10 s (tick % 10); the owner
-                        // found 1 s cadence too noisy.
-                        super::conn::WAIT_WIFI => {
-                            if tick % 10 == 0 {
-                                play_pattern(&mut pins, &[(2000, 80)]).await
-                            }
-                        }
+                        super::conn::WAIT_WIFI => play_pattern(&mut pins, &[(2000, 80)]).await,
                         super::conn::WAIT_MQTT => {
-                            if tick % 10 == 0 {
-                                play_pattern(&mut pins, &[(2500, 50), (2500, 50)]).await
-                            }
+                            play_pattern(&mut pins, &[(2500, 50), (2500, 50)]).await
                         }
                         super::conn::ONLINE => {
                             if !online_announced {
