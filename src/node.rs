@@ -8,6 +8,7 @@
 //!   incoming door commands (`cmd_topic`), and drains the outgoing auth queue.
 
 use core::fmt::Write;
+use embassy_futures::select::{select4, Either4};
 use embassy_net::tcp::TcpSocket;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
@@ -448,75 +449,78 @@ async fn mqtt_runner(
                     continue;
                 }
 
-                // Inner connected MQTT pump loop.
+                // Inner connected MQTT pump loop driven by select4.
                 loop {
-                    // Drive MQTT (non-blocking keepalives and inbound messages).
-                    match session.drive().await {
-                        Ok(Some(msg)) => {
-                            let topic = msg.topic();
-                            let payload = msg.payload();
+                    match select4(
+                        session.poll(),
+                        AUTH_OUTBOUND.receive(),
+                        PROV_CLAIM_OUTBOUND.receive(),
+                        PROV_DONE_OUTBOUND.receive(),
+                    )
+                    .await
+                    {
+                        Either4::First(poll_res) => match poll_res {
+                            Ok(Some(msg)) => {
+                                let topic = msg.topic();
+                                let payload = msg.payload();
 
-                            if topic == cmd_topic.as_str() {
-                                if let Ok(c) = cmd::parse_cmd_slice(payload) {
-                                    if c.grant {
-                                        let _ = relay::RELAY_CHANNEL.try_send(c.pulse_ms);
-                                        let _ = PZ.try_send(BeepEvent::RelayPulse);
-                                        let _ = PZ.try_send(BeepEvent::Granted);
-                                        status_led::set_state(status_led::LedState::Grant);
-                                        println!("GRANT ({} ms): {}", c.pulse_ms, c.reason);
-                                    } else {
-                                        let _ = PZ.try_send(BeepEvent::Denied);
-                                        status_led::set_state(status_led::LedState::DeniedOrOffline);
-                                        println!("DENY: {}", c.reason);
+                                if topic == cmd_topic.as_str() {
+                                    if let Ok(c) = cmd::parse_cmd_slice(payload) {
+                                        if c.grant {
+                                            let _ = relay::RELAY_CHANNEL.try_send(c.pulse_ms);
+                                            let _ = PZ.try_send(BeepEvent::RelayPulse);
+                                            let _ = PZ.try_send(BeepEvent::Granted);
+                                            status_led::set_state(status_led::LedState::Grant);
+                                            println!("GRANT ({} ms): {}", c.pulse_ms, c.reason);
+                                        } else {
+                                            let _ = PZ.try_send(BeepEvent::Denied);
+                                            status_led::set_state(status_led::LedState::DeniedOrOffline);
+                                            println!("DENY: {}", c.reason);
+                                        }
                                     }
-                                }
-                            } else if topic == job_topic.as_str() {
-                                if let Ok(text) = core::str::from_utf8(payload) {
-                                    // Parse incoming provisioning job payload
-                                    if let Ok((job_p, _)) = serde_json_core::from_str::<crate::provision_flow::JobPayload>(text) {
-                                        println!("[prov] received job: {}", job_p.job_id);
-                                        let mut j_id = heapless::String::<32>::new();
-                                        let mut j_key = heapless::String::<32>::new();
-                                        let _ = j_id.push_str(job_p.job_id);
-                                        let _ = j_key.push_str(job_p.key);
-                                        let mut lock = PROV_JOB.lock().await;
-                                        *lock = Some((j_id, j_key));
-                                        let _ = PZ.try_send(BeepEvent::ProvisionArmed);
+                                } else if topic == job_topic.as_str() {
+                                    if let Ok(text) = core::str::from_utf8(payload) {
+                                        if let Ok((job_p, _)) =
+                                            serde_json_core::from_str::<crate::provision_flow::JobPayload>(text)
+                                        {
+                                            println!("[prov] received job: {}", job_p.job_id);
+                                            let mut j_id = heapless::String::<32>::new();
+                                            let mut j_key = heapless::String::<32>::new();
+                                            let _ = j_id.push_str(job_p.job_id);
+                                            let _ = j_key.push_str(job_p.key);
+                                            let mut lock = PROV_JOB.lock().await;
+                                            *lock = Some((j_id, j_key));
+                                            let _ = PZ.try_send(BeepEvent::ProvisionArmed);
+                                        }
                                     }
                                 }
                             }
+                            Ok(None) => {}
+                            Err(e) => {
+                                println!("[mqtt] session poll error: {:?}", e);
+                                blog!("mqtt poll error: {:?}", e);
+                                break;
+                            }
+                        },
+                        Either4::Second(auth_payload) => {
+                            let pkt = Publication::new(auth_topic.as_str(), auth_payload.as_str());
+                            if let Err(e) = session.publish(pkt).await {
+                                println!("[mqtt] auth publish error: {:?}", e);
+                                break;
+                            }
                         }
-                        Ok(None) => {}
-                        Err(e) => {
-                            blog!("mqtt drive error: {:?}", e);
-                            break;
+                        Either4::Third(claim_payload) => {
+                            let pkt = Publication::new(claim_topic.as_str(), claim_payload.as_str())
+                                .qos(minimq::QoS::AtLeastOnce);
+                            let _ = session.publish(pkt).await;
+                        }
+                        Either4::Fourth((job_id, ok, counter, reason)) => {
+                            let done = crate::provision_flow::build_done_json(job_id.as_str(), ok, counter, reason);
+                            let pkt = Publication::new(done_topic.as_str(), done.as_str())
+                                .qos(minimq::QoS::AtLeastOnce);
+                            let _ = session.publish(pkt).await;
                         }
                     }
-
-                    // Drain and publish any pending auth requests from the NFC runner.
-                    while let Ok(auth_payload) = AUTH_OUTBOUND.try_receive() {
-                        let pkt = Publication::new(auth_topic.as_str(), auth_payload.as_str());
-                        if session.publish(pkt).await.is_err() {
-                            break;
-                        }
-                    }
-
-                    // Drain and publish any claim requests from provisioning.
-                    while let Ok(claim_payload) = PROV_CLAIM_OUTBOUND.try_receive() {
-                        let pkt = Publication::new(claim_topic.as_str(), claim_payload.as_str())
-                            .qos(minimq::QoS::AtLeastOnce);
-                        let _ = session.publish(pkt).await;
-                    }
-
-                    // Drain and publish any done reports from provisioning.
-                    while let Ok((job_id, ok, counter, reason)) = PROV_DONE_OUTBOUND.try_receive() {
-                        let done = crate::provision_flow::build_done_json(job_id.as_str(), ok, counter, reason);
-                        let pkt = Publication::new(done_topic.as_str(), done.as_str())
-                            .qos(minimq::QoS::AtLeastOnce);
-                        let _ = session.publish(pkt).await;
-                    }
-
-                    Timer::after(Duration::from_millis(30)).await;
                 }
 
                 // If inner loop exits, session dropped.
