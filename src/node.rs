@@ -287,7 +287,14 @@ fn decode_key16(hex: &str, out: &mut [u8; 16]) -> bool {
                 loop {
                     // Drive MQTT with a bounded wait so NFC polling keeps flowing.
                     match embassy_time::with_timeout(
-                        Duration::from_millis(20),
+                        // 250 ms bound: long enough for poll() to complete real
+                        // work (SUBSCRIBE flushes, keepalive PINGREQs, SUBACK
+                        // processing) in a single pass. The original 20 ms bound
+                        // cancelled poll() mid-operation on nearly every call:
+                        // subscriptions took minutes to land and keepalives were
+                        // dropped outright (44 broker keepalive kills in one
+                        // night), causing the session-flap cascade.
+                        Duration::from_millis(250),
                         session.poll(),
                     )
                     .await
