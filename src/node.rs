@@ -105,6 +105,7 @@ async fn nfc_runner<I: pn532::Interface>(
     let mut debounce = tag_debounce::TagDebounce::new();
     let mut ndef_buf = [0u8; 256];
     let mut no_nfc_logged = false;
+    let mut nfc_down_ticks: u32 = 0;
 
     println!("[nfc] reader task started (independent from network)");
 
@@ -247,7 +248,15 @@ async fn nfc_runner<I: pn532::Interface>(
         } else {
             if !no_nfc_logged {
                 println!("[nfc] no reader initialized — idling NFC polling");
+                blog!("pn532 absent — reader down alarm active");
                 no_nfc_logged = true;
+                nfc_down_ticks = 0;
+            }
+            // Persistent failure tone: the node must not sit silent when it
+            // is not guarding the door. One NfcDown pattern every ~15 s.
+            nfc_down_ticks += 1;
+            if nfc_down_ticks % 15 == 0 {
+                let _ = PZ.try_send(BeepEvent::NfcDown);
             }
             Timer::after(Duration::from_secs(1)).await;
         }

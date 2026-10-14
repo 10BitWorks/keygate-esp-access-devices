@@ -39,6 +39,9 @@ pub enum BeepEvent {
     ProvisionFail,
     /// Node finished booting.
     Boot,
+    /// PN532 failed to initialize — the reader is dead and the node is
+    /// not guarding the door. Repeated periodically while absent.
+    NfcDown,
 }
 
 /// A single tone: `(frequency_hz, on_ms)`.
@@ -113,6 +116,12 @@ pub const PATTERN_TABLE: &[(BeepEvent, &[Tone])] = &[
         &[(3500, 150), (2600, 150), (2000, 150)],
     ),
     (BeepEvent::Boot, &[(2600, 60)]),
+    // Reader-dead alarm: three low tones, unmistakable next to the connect
+    // beeps (2000/2500 Hz) and the Denied double (1300 Hz).
+    (
+        BeepEvent::NfcDown,
+        &[(900, 180), (900, 180), (900, 180)],
+    ),
 ];
 
 /// Look up the feedback pattern for `event`.
@@ -344,7 +353,7 @@ pub use embedded::{PIEZO_CHANNEL, PiezoPins, PiezoReceiver, PiezoSender, piezo_t
 mod tests {
     use super::*;
 
-    const ALL_EVENTS: [BeepEvent; 9] = [
+    const ALL_EVENTS: [BeepEvent; 10] = [
         BeepEvent::TagDetected,
         BeepEvent::AuthSent,
         BeepEvent::Granted,
@@ -354,6 +363,7 @@ mod tests {
         BeepEvent::ProvisionOk,
         BeepEvent::ProvisionFail,
         BeepEvent::Boot,
+        BeepEvent::NfcDown,
     ];
 
     #[test]
