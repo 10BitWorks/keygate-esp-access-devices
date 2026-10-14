@@ -35,26 +35,39 @@ fi
 
 echo "Target port: $PORT"
 
-if ! zenity --question --title="KeyGate: ESP32 Flashing" \
-    --text="Target: $PORT\n\nClick OK, then IMMEDIATELY perform the BOOT dance:\n1. HOLD BOOT button\n2. TAP EN (RST) button once\n3. KEEP HOLDING BOOT for ~5 seconds\n4. RELEASE BOOT\n\nFlashing runs at 57600 baud with stub mode." 2>/dev/null; then
-    echo "Flashing cancelled."
-    exit 0
-fi
+# Check if chip is already in download/bootloader mode before prompting
+is_in_download_mode() {
+    timeout 2 espflash board-info --chip esp32 --port "$PORT" --before no-reset -B 57600 >/dev/null 2>&1
+}
 
 FLASHED=1
 for i in 1 2 3; do
     echo "=== Flash attempt $i @ 57600 baud (stub mode) ==="
+    
+    if is_in_download_mode; then
+        echo "Chip is already in download mode — flashing immediately!"
+    else
+        echo "Chip not in download mode; requesting bootloader dance..."
+        if [ "$i" -eq 1 ]; then
+            PROMPT_TITLE="KeyGate: ESP32 Flashing"
+            PROMPT_TEXT="Target: $PORT\n\nClick OK, then perform the BOOT dance:\n1. HOLD BOOT button\n2. TAP EN (RST) button once\n3. KEEP HOLDING BOOT for ~2 seconds\n4. RELEASE BOOT"
+        else
+            PROMPT_TITLE="KeyGate: Retry Flash"
+            PROMPT_TEXT="Attempt $((i-1)) failed or missed window.\n\nClick OK, then repeat the BOOT dance:\nHOLD BOOT -> TAP EN -> HOLD ~2s -> RELEASE"
+        fi
+
+        if ! zenity --question --title="$PROMPT_TITLE" --text="$PROMPT_TEXT" 2>/dev/null; then
+            echo "Flashing cancelled by user."
+            exit 0
+        fi
+    fi
+
     if timeout 300 espflash flash --chip esp32 --port "$PORT" --before no-reset -B 57600 --no-verify --partition-table partitions.csv --erase-parts otadata --target-app-partition ota_0 "$ELF"; then
         echo "Flash succeeded on attempt $i!"
         FLASHED=0
         break
     fi
     [ "$i" = 3 ] && break
-    if ! zenity --question --title="KeyGate: Retry Flash" \
-        --text="Attempt $i missed the bootloader window or timed out.\n\nClick OK, then IMMEDIATELY repeat the BOOT dance:\nHOLD BOOT -> TAP EN -> HOLD ~5s -> RELEASE" 2>/dev/null; then
-        echo "Retry cancelled by user."
-        break
-    fi
 done
 
 if [ "$FLASHED" -ne 0 ]; then
