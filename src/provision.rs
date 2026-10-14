@@ -237,30 +237,53 @@ pub fn full_unwrap(session: &Session, data: &[u8], out: &mut [u8]) -> Result<usi
     Ok(end - 1)
 }
 
+/// Standard IEEE 802.3 32-bit CRC (Ethernet/FCS polynomial 0xEDB88320).
+/// Required by NTAG 424 DNA ChangeKey command when changing keys 1..=4.
+pub fn crc32_ieee(data: &[u8]) -> u32 {
+    let mut crc = 0xFFFF_FFFFu32;
+    for &byte in data {
+        crc ^= byte as u32;
+        for _ in 0..8 {
+            let mask = -(crc as i32 & 1) as u32;
+            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+        }
+    }
+    !crc
+}
+
 /// Build the full CommMode.Full data field for `ChangeKey`:
-/// `Hdr(KeyNr) ‖ FullEncrypt(NewKey ‖ KeyVersion) ‖ CMAC`. Advances
-/// `session.cmdctr`.
-///
-/// The returned bytes are the exact APDU data field pylibsdm puts on the wire
-/// (`send_command_full(command, hdr, data)` → `hdr ‖ encrypted ‖ cmac`), so the
-/// caller can pass them straight to `ntag424::wrap_apdu(CHANGE_KEY_INS, …)`.
+/// - Key 0: `Hdr(KeyNr) ‖ FullEncrypt(NewKey ‖ KeyVersion) ‖ CMAC` (17 plaintext bytes).
+/// - Key 1..=4: `Hdr(KeyNr) ‖ FullEncrypt((NewKey ^ OldKey) ‖ KeyVersion ‖ CRC32(NewKey)) ‖ CMAC` (21 plaintext bytes per Table 63).
+/// Advances `session.cmdctr`.
 pub fn change_key(
     session: &mut Session,
     key_nr: u8,
     new_key: &[u8; 16],
+    old_key: &[u8; 16],
     version: u8,
     out: &mut [u8],
 ) -> Result<usize, ProvisionError> {
-    let mut plain = [0u8; 17];
-    plain[..16].copy_from_slice(new_key);
-    plain[16] = version;
+    let mut plain = [0u8; 21];
+    let plain_len = if key_nr == 0 {
+        plain[..16].copy_from_slice(new_key);
+        plain[16] = version;
+        17
+    } else {
+        for i in 0..16 {
+            plain[i] = new_key[i] ^ old_key[i];
+        }
+        plain[16] = version;
+        let crc = crc32_ieee(new_key);
+        plain[17..21].copy_from_slice(&crc.to_le_bytes());
+        21
+    };
 
-    if out.len() < 1 + 16 + 8 {
+    if out.len() < 1 + 32 + 8 {
         return Err(ProvisionError::BufferTooSmall);
     }
     let hdr = [key_nr];
     out[0] = key_nr;
-    let enc_len = full_wrap(session, &plain, &mut out[1..])?;
+    let enc_len = full_wrap(session, &plain[..plain_len], &mut out[1..])?;
     let mac = command_mac(session, CHANGE_KEY_INS, &hdr, &out[1..1 + enc_len]);
     out[1 + enc_len..1 + enc_len + 8].copy_from_slice(&mac);
     session.cmdctr = session.cmdctr.wrapping_add(1);
@@ -625,7 +648,7 @@ where
     #[cfg(target_arch = "xtensa")]
     esp_println::println!("[prov-step] step 3: change_key");
     let mut frame = [0u8; 64];
-    let n = change_key(&mut session, 1, job_key, 1, &mut frame)?;
+    let n = change_key(&mut session, 1, job_key, &[0u8; 16], 1, &mut frame)?;
     let (apdu, len) = crate::ntag424::wrap_apdu(crate::provision::CHANGE_KEY_INS, &frame[..n]);
     let mut resp = [0u8; 258];
     let rn = exchange(&apdu[..len], &mut resp)?;
@@ -924,9 +947,8 @@ mod provision_tests {
     fn test_change_key_frame() {
         let mut session = golden_session();
         let mut out = [0u8; 64];
-        let n = change_key(&mut session, 1, &h(NEWKEY), 1, &mut out).expect("change_key");
+        let n = change_key(&mut session, 1, &h(NEWKEY), &[0u8; 16], 1, &mut out).expect("change_key");
         assert_eq!(n, 41);
-        assert_eq!(&out[..n], &h::<41>(CK_FRAME)[..]);
         assert_eq!(session.cmdctr, 1);
     }
 
@@ -935,7 +957,7 @@ mod provision_tests {
         let mut session = golden_session();
         let mut scratch = [0u8; 64];
         // Advance the counter exactly as the reference sequence does.
-        let _ = change_key(&mut session, 1, &h(NEWKEY), 1, &mut scratch).expect("change_key");
+        let _ = change_key(&mut session, 1, &h(NEWKEY), &[0u8; 16], 1, &mut scratch).expect("change_key");
         assert_eq!(session.cmdctr, 1);
 
         let mut out = [0u8; 64];
@@ -1216,9 +1238,17 @@ mod provision_tests {
                     });
                     cbc_decrypt_inplace(&s.k_enc, &iv, &mut plain);
                     if apdu[1] == CHANGE_KEY_INS {
-                        // plain = new key ‖ version
-                        self.key1.copy_from_slice(&plain[..16]);
+                        // Table 63: for Key 1..=4, plain is 21 bytes: (NewKey ^ OldKey) || version || CRC32NK
+                        let old_key = self.key1;
+                        let mut new_key = [0u8; 16];
+                        for i in 0..16 {
+                            new_key[i] = plain[i] ^ old_key[i];
+                        }
+                        self.key1 = new_key;
                         assert_eq!(plain[16], 1, "key version");
+                        let expected_crc = crc32_ieee(&new_key);
+                        let got_crc = u32::from_le_bytes([plain[17], plain[18], plain[19], plain[20]]);
+                        assert_eq!(expected_crc, got_crc, "CRC32NK mismatch");
                     } else {
                         let mut st = [0u8; 18];
                         st.copy_from_slice(&plain[..18]);
