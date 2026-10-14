@@ -210,14 +210,17 @@ pub fn poll_tag<I: pn532::Interface, T: CountDown<Time = fugit::MillisDurationU3
 ) -> Result<Option<TagInfo>, NfcError> {
     // INLIST_ONE_ISO_A_TARGET: poll for 1 target at 106 kbps Type A.
     // When no tag is in the RF field, PN532 responds with NbTg=0 after its internal scan.
-    // 3000ms: measured tag-present responses on this module run 240-900 ms
-    // (RF scan + ISO-DEP activation), highly variable. 1000ms lost the race
-    // roughly half the time; 3 s gives decisive margin.
+    // 1500ms: measured tag-present responses run 240-900 ms, occasionally ~3 s.
+    // 3000ms gave decisive margin but a 3 s SYNCHRONOUS wait blocks the
+    // embassy executor (no MQTT poll) — two consecutive 3 s polls straddle
+    // minimq's 5 s PINGRESP grace and the broker session self-disconnects.
+    // 1500 ms keeps the worst-case executor block under that grace; missed
+    // slow responses are retried on the next poll ~30 ms later.
     let res = pn532
         .process(
             &Request::INLIST_ONE_ISO_A_TARGET,
             20,
-            fugit::MillisDurationU32::from_ticks(3000),
+            fugit::MillisDurationU32::from_ticks(1500),
         )
         .map_err(|e| {
             // Symptom-based diagnostics from the bench session

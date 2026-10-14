@@ -93,7 +93,7 @@ def readpkt(s):
     body=b""
     while len(body)<rl: body+=s.recv(rl-len(body))
     return h[0],body
-vh = mstr("MQTT")+bytes([5,0x02])+struct.pack(">H",170)+mstr("armprov-%d"%time.time())
+vh = mstr("MQTT")+bytes([4,0x02])+struct.pack(">H",170)+mstr("armprov-%d"%time.time())
 s=socket.create_connection((os.environ["BROKER_HOST"],1883),timeout=6)
 s.sendall(bytes([0x10])+rem(len(vh))+vh)
 readpkt(s)

@@ -365,7 +365,7 @@ fn decode_key16(hex: &str, out: &mut [u8; 16]) -> bool {
                         let now = Instant::now();
                         let now_ms = now.as_millis() as u64;
 
-                        // Periodic liveness probe (every 64 iterations, ~30 s):
+                        // Periodic liveness probe (every 24 iterations, ~10-15 s):
                         // a real GetFirmwareVersion round-trip. Catches the
                         // fake-ready wedge (STATUS says ready, RF core dead,
                         // every scan returns clean NbTg=0) that never produces
@@ -374,10 +374,10 @@ fn decode_key16(hex: &str, out: &mut [u8; 16]) -> bool {
                             use core::sync::atomic::{AtomicU32, Ordering};
                             static HEALTH_N: AtomicU32 = AtomicU32::new(0);
                             let it = HEALTH_N.fetch_add(1, Ordering::Relaxed);
-                            if it % 64 == 0 {
+                            if it % 24 == 0 {
                                 match nfc::health_check(pn) {
                                     Ok(fw) => {
-                                        if it % 640 == 0 {
+                                        if it % 240 == 0 {
                                             println!(
                                                 "[nfc] health ok fw={:02x}:{:02x}:{:02x}:{:02x} (iter {})",
                                                 fw[0], fw[1], fw[2], fw[3], it
