@@ -656,9 +656,12 @@ where
     let rn = exchange(&apdu[..len], &mut resp)?;
     check_status(&resp[..rn], 0x91, 0x00)?;
 
-    // 4) Write NDEF (NLEN + record) while the file is still openly writable.
+    // 4) Write NDEF (NLEN + record): re-select file E104 (native ChangeKey de-selects the file).
     #[cfg(target_arch = "xtensa")]
-    esp_println::println!("[prov-step] step 4: update_binary");
+    esp_println::println!("[prov-step] step 4: re-select file E104 & update_binary");
+    let n = exchange(&crate::ntag424::SELECT_NDEF_FILE_02_APDU, &mut resp)?;
+    check_status(&resp[..n], 0x90, 0x00)?;
+
     let apdu = [
         0x00,
         UPDATE_BINARY_INS,
