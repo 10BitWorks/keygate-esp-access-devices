@@ -39,6 +39,7 @@ pub async fn run<I: pn532::Interface>(
 
     let mut auth_topic = heapless::String::<96>::new();
     let mut cmd_topic = heapless::String::<96>::new();
+    let mut log_topic = heapless::String::<96>::new();
     let mut presence_topic = heapless::String::<96>::new();
     let mut job_topic = heapless::String::<96>::new();
     let mut claim_topic = heapless::String::<96>::new();
@@ -46,6 +47,7 @@ pub async fn run<I: pn532::Interface>(
     let _ = write!(&mut auth_topic, "access/{}/auth", config::DEVICE_ID);
     let _ = write!(&mut cmd_topic, "access/{}/cmd", config::DEVICE_ID);
     let _ = write!(&mut presence_topic, "access/{}/presence", config::DEVICE_ID);
+    let _ = write!(&mut log_topic, "access/{}/log", config::DEVICE_ID);
 
     // Audible connection progress: joining Wi-Fi first.
     piezo::set_conn_state(piezo::conn::WAIT_WIFI);
@@ -96,7 +98,7 @@ macro_rules! handle_prov_action {
                 }
             }
             ProvAction::ProvisionStart => {
-                println!("[prov] provisioning starting");
+                blog!("[prov] provisioning starting");
             }
             ProvAction::CompleteOk(job_id, counter) => {
                 let done = crate::provision_flow::build_done_json(job_id.as_str(), true, counter, "");
@@ -106,7 +108,7 @@ macro_rules! handle_prov_action {
                     println!("[prov] done publish failed: {:?}", e);
                 }
                 let _ = PZ.try_send(BeepEvent::ProvisionOk);
-                println!("[prov] SUCCESS (counter {})", counter);
+                blog!("[prov] SUCCESS (counter {})", counter);
             }
             ProvAction::Fail(job_id, reason) => {
                 let done = crate::provision_flow::build_done_json(job_id.as_str(), false, 0, reason);
@@ -158,7 +160,7 @@ fn decode_key16(hex: &str, out: &mut [u8; 16]) -> bool {
             match wifi_controller.connect_async().await {
                 Ok(_) => println!("WiFi connected"),
                 Err(e) => {
-                    println!("WiFi connection failed: {:?}", e);
+                    blog!("WiFi connection failed: {:?}", e);
                     Timer::after(Duration::from_secs(next_backoff(&mut backoff_secs))).await;
                     continue;
                 }
@@ -175,7 +177,7 @@ fn decode_key16(hex: &str, out: &mut [u8; 16]) -> bool {
             Timer::after(Duration::from_millis(500)).await;
         }
         if !dhcp_ok {
-            println!("DHCP timeout — retrying...");
+            blog!("DHCP timeout — retrying...");
             Timer::after(Duration::from_secs(next_backoff(&mut backoff_secs))).await;
             continue;
         }
@@ -273,10 +275,20 @@ fn decode_key16(hex: &str, out: &mut [u8; 16]) -> bool {
                 }
                 let job_filters = [TopicFilter::new(job_topic.as_str())];
                 if let Err(e) = session.subscribe(&job_filters, &[]).await {
-                    println!("subscribe failed: {:?}", e);
+                    blog!("subscribe failed: {:?}", e);
                     status_led::set_state(status_led::LedState::DeniedOrOffline);
                     Timer::after(Duration::from_secs(next_backoff(&mut backoff_secs))).await;
                     continue;
+                }
+
+                // Flush diagnostics buffered during previous (dead) sessions
+                // to access/{id}/log. QoS0; on failure the rest stays queued.
+                while let Some(line) = crate::diag::imp::pop() {
+                    let pkt = Publication::new(log_topic.as_str(), line.as_str());
+                    if session.publish(pkt).await.is_err() {
+                        blog!("log flush interrupted");
+                        break;
+                    }
                 }
 
                 let mut debounce = tag_debounce::TagDebounce::new();
@@ -342,7 +354,7 @@ fn decode_key16(hex: &str, out: &mut [u8; 16]) -> bool {
                         }
                         Ok(Ok(None)) => {}
                         Ok(Err(e)) => {
-                            println!("MQTT poll error: {:?}", e);
+                            blog!("mqtt poll error: {:?}", e);
                             break;
                         }
                         Err(_) => {} // No inbound packet within the window.
@@ -643,10 +655,12 @@ fn decode_key16(hex: &str, out: &mut [u8; 16]) -> bool {
                 // reconnect rate and starves every other task. Audible state
                 // drops to the slow reconnect beep.
                 piezo::set_conn_state(piezo::conn::RECONNECT);
-                Timer::after(Duration::from_secs(next_backoff(&mut backoff_secs))).await;
+                let wait = next_backoff(&mut backoff_secs);
+                blog!("mqtt session dropped — reconnect in {}s", wait);
+                Timer::after(Duration::from_secs(wait)).await;
             }
             Err(e) => {
-                println!("MQTT session connect failed: {:?}", e);
+                blog!("MQTT session connect failed: {:?}", e);
                 status_led::set_state(status_led::LedState::DeniedOrOffline);
                 Timer::after(Duration::from_secs(next_backoff(&mut backoff_secs))).await;
             }

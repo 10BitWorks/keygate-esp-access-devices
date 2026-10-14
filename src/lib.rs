@@ -1,6 +1,7 @@
 #![no_std]
 
 pub mod ntag424;
+pub mod diag;
 pub mod cmd;
 pub mod auth_msg;
 pub mod reader_supervisor;

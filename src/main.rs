@@ -14,6 +14,8 @@ use embassy_executor::Spawner;
 use esp_backtrace as _;
 use esp_hal::clock::CpuClock;
 
+#[macro_use]
+mod diag;
 mod auth_msg;
 mod board;
 mod cmd;
