@@ -981,6 +981,25 @@ mod provision_tests {
     }
 
     #[test]
+    fn test_change_key_an12196_apdu_match() {
+        let mut session = Session {
+            ti: h("7614281A"),
+            cmdctr: 2, // CmdCtr starts at 2 in Step 14
+            k_enc: h("4CF3CB41A22583A61E89B158D252FC53"),
+            k_mac: h("5529860B2FC5FB6154B7F28361D30BF9"),
+        };
+        let new_key = h::<16>("F3847D627727ED3BC9C4CC050489B966");
+        let old_key = [0u8; 16];
+        let mut frame = [0u8; 64];
+        let n = change_key(&mut session, 2, &new_key, &old_key, 1, &mut frame).expect("change_key");
+        assert_eq!(n, 41);
+        let (apdu, len) = crate::ntag424::wrap_apdu(CHANGE_KEY_INS, &frame[..n]);
+        let expected = h::<47>("90C4000029022CF362B7BF4311FF3BE1DAA295E8C68DE09050560D19B9E16C2393AE9CD1FAC75D0CE20BCD1D06E600");
+        assert_eq!(&apdu[..len], &expected[..]);
+        assert_eq!(session.cmdctr, 3);
+    }
+
+    #[test]
     fn test_verify_command_mac_accepts_and_rejects_tampered() {
         let session = golden_session();
         // CK_FRAME carries its Hdr byte up front; verify_command_mac expects

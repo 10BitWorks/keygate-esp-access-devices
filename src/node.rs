@@ -276,6 +276,7 @@ async fn execute_tag_provisioning<I: pn532::Interface>(
     key_hex: &str,
 ) {
     println!("[prov] provisioning tag (job {})...", job_id);
+    piezo::set_conn_state(piezo::conn::PROV_WRITING);
     status_led::set_state(status_led::LedState::TagReading);
 
     let mut rnda = [0u8; 16];
@@ -328,6 +329,8 @@ async fn execute_tag_provisioning<I: pn532::Interface>(
     let mut j_id = heapless::String::<32>::new();
     let _ = j_id.push_str(job_id);
     let _ = PROV_DONE_OUTBOUND.try_send((j_id, ok, counter, reason));
+
+    piezo::set_conn_state(piezo::conn::ONLINE);
 
     if ok {
         println!("[prov] tag successfully provisioned!");
@@ -579,6 +582,7 @@ async fn mqtt_runner(
                                     match action {
                                         ProvAction::Arm => {
                                             println!("[prov] job armed — tap blank tag now");
+                                            piezo::set_conn_state(piezo::conn::PROV_ARMED);
                                             let _ = PZ.try_send(BeepEvent::ProvisionArmed);
                                         }
                                         ProvAction::PublishClaim(claim) => {
@@ -591,6 +595,7 @@ async fn mqtt_runner(
                                         }
                                         ProvAction::Fail(j_id, reason) => {
                                             println!("[prov] job rejected: {}", reason);
+                                            piezo::set_conn_state(piezo::conn::ONLINE);
                                             let done = provision_flow::build_done_json(j_id.as_str(), false, 0, reason);
                                             let pkt = Publication::new(done_topic.as_str(), done.as_str())
                                                 .qos(minimq::QoS::AtLeastOnce);

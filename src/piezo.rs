@@ -73,6 +73,10 @@ pub mod conn {
     /// Lost the connection after having been online: one low beep every
     /// 15 s so an offline reader is noticed from across the room.
     pub const RECONNECT: u8 = 4;
+    /// Provisioning window open: continuous low beacon until tag tapped or timeout.
+    pub const PROV_ARMED: u8 = 5;
+    /// Tag held & provisioning in progress: continuous higher tone.
+    pub const PROV_WRITING: u8 = 6;
 }
 
 /// Current connection state (see [`conn`]).
@@ -260,7 +264,7 @@ mod embedded {
         let mut tick: u32 = 0;
         let mut online_announced = false;
         loop {
-            match with_timeout(Duration::from_millis(1000), rx.receive()).await {
+            match with_timeout(Duration::from_millis(500), rx.receive()).await {
                 Ok(event) => {
                     let pattern = pattern_for(event);
                     println!("[piezo] play {:?} ({} tone(s))", event, pattern.len());
@@ -269,28 +273,46 @@ mod embedded {
                 Err(_) => {
                     tick = tick.saturating_add(1);
                     match conn_state() {
-                        // Wait-state beeps every 10 s (tick % 10): the owner
-                        // found 1 s cadence too noisy.
                         super::conn::WAIT_WIFI => {
-                            if tick % 10 == 0 {
-                                play_pattern(&mut pins, &[(2000, 80)]).await
+                            if tick % 20 == 0 {
+                                play_pattern(&mut pins, &[(2000, 80)]).await;
                             }
                         }
                         super::conn::WAIT_MQTT => {
-                            if tick % 10 == 0 {
-                                play_pattern(&mut pins, &[(2500, 50), (2500, 50)]).await
+                            if tick % 20 == 0 {
+                                play_pattern(&mut pins, &[(2500, 50), (2500, 50)]).await;
                             }
                         }
                         super::conn::ONLINE => {
                             if !online_announced {
                                 online_announced = true;
-                                play_pattern(&mut pins, &[(1800, 90), (2400, 120)]).await;
+                                // Classic "Charge!" bugle fanfare: G - C - E - G ... E - G!
+                                play_pattern(
+                                    &mut pins,
+                                    &[
+                                        (1568, 80),
+                                        (2093, 80),
+                                        (2637, 80),
+                                        (3136, 140),
+                                        (2637, 80),
+                                        (3136, 260),
+                                    ],
+                                )
+                                .await;
                             }
                         }
                         super::conn::RECONNECT => {
-                            if tick % RECONNECT_TICKS == 0 {
+                            if tick % 30 == 0 {
                                 play_pattern(&mut pins, &[(1200, 150)]).await;
                             }
+                        }
+                        super::conn::PROV_ARMED => {
+                            // Continuous low beep every 500ms while window is open
+                            play_pattern(&mut pins, &[(1600, 60)]).await;
+                        }
+                        super::conn::PROV_WRITING => {
+                            // Continuous higher tone while provisioning is in progress
+                            play_pattern(&mut pins, &[(3000, 100)]).await;
                         }
                         _ => {}
                     }
