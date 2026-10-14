@@ -497,25 +497,30 @@ async fn mqtt_runner(
 
                 // Announce retained online presence.
                 let online = Publication::new(presence_topic.as_str(), "online").retain();
-                let _ = session.publish(online).await;
-
-                // Audible confirmation: online.
-                piezo::set_conn_state(piezo::conn::ONLINE);
+                if let Err(e) = session.publish(online).await {
+                    println!("[mqtt] presence publish failed: {:?}", e);
+                }
 
                 // Subscribe to command and provisioning topics.
                 let cmd_filters = [TopicFilter::new(cmd_topic.as_str())];
-                if session.subscribe(&cmd_filters, &[]).await.is_err() {
+                if let Err(e) = session.subscribe(&cmd_filters, &[]).await {
+                    println!("[mqtt] subscribe cmd failed: {:?}", e);
                     status_led::set_state(status_led::LedState::DeniedOrOffline);
                     Timer::after(Duration::from_secs(next_backoff(&mut backoff_secs))).await;
                     continue;
                 }
 
                 let job_filters = [TopicFilter::new(job_topic.as_str())];
-                if session.subscribe(&job_filters, &[]).await.is_err() {
+                if let Err(e) = session.subscribe(&job_filters, &[]).await {
+                    println!("[mqtt] subscribe job failed: {:?}", e);
                     status_led::set_state(status_led::LedState::DeniedOrOffline);
                     Timer::after(Duration::from_secs(next_backoff(&mut backoff_secs))).await;
                     continue;
                 }
+
+                println!("[mqtt] both subscriptions live — node fully online!");
+                // Audible confirmation: online (plays only when truly online & subscribed!).
+                piezo::set_conn_state(piezo::conn::ONLINE);
 
                 // Inner connected MQTT pump loop driven by select4.
                 // Connected MQTT pump loop: drain outbound queues then poll with bounded wait.
