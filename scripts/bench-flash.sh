@@ -73,7 +73,7 @@ done
 # Last resort: manual BOOT dance (only if auto entry died 3x).
 if [ "$FLASHED" -ne 0 ]; then
     if ! zenity --question --timeout=90 --title="KeyGate: Manual BOOT dance" \
-        --text="Automatic boot-mode entry failed 3 times.\n\nClick OK, then perform the BOOT dance:\n1. HOLD BOOT button\n2. TAP EN (RST) once\n3. KEEP HOLDING BOOT ~2 seconds\n4. RELEASE BOOT" 2>/dev/null; then
+        --text="Automatic boot-mode entry failed 3 times.\n\nClick OK, then perform the BOOT dance:\n1. HOLD BOOT button\n2. TAP EN (RST) once\n3. RELEASE BOOT\n(No hold needed — BOOT only has to be low at the moment EN rises.)" 2>/dev/null; then
         echo "Flashing cancelled."
         exit 1
     fi
@@ -89,7 +89,7 @@ if [ "$FLASHED" -ne 0 ]; then
 fi
 
 if zenity --question --title="KeyGate: Serial Monitoring" \
-    --text="Flash complete!\n\nClick OK to capture serial output (20 seconds).\nImmediately after clicking OK, TAP the EN button once to boot the node." 2>/dev/null; then
+    --text="Flash complete — the node auto-boots (bugle ~5s later).\n\nClick OK to capture serial output (20 seconds)." 2>/dev/null; then
     stty -F "$PORT" 115200 cs8 -cstopb -parenb raw -echo
     echo "=== Capturing serial from $PORT (20s) ==="
     timeout 20 cat "$PORT" || true
