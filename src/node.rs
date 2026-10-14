@@ -248,15 +248,24 @@ fn decode_key16(hex: &str, out: &mut [u8; 16]) -> bool {
                 // Connection is healthy again — reset the reconnect backoff.
                 backoff_secs = 1;
 
-                // Flush diagnostics buffered during previous (dead) sessions
-                // to access/{id}/log. QoS0; on failure the rest stays queued.
-                while let Some(line) = crate::diag::imp::pop() {
+                // Flush buffered diagnostics FIRST — but BOUNDED (max 4 lines,
+                // rest shed). Under EMQX's Queues feature, a 64-line QoS0 burst
+                // at session creation killed every session instantly — a
+                // self-sustaining spiral (churn refills the ring, the burst
+                // kills the session, repeat). Shed the backlog unconditionally.
+                let mut flushed = 0u8;
+                while flushed < 4 {
+                    let Some(line) = crate::diag::imp::pop() else {
+                        break;
+                    };
+                    flushed += 1;
                     let pkt = Publication::new(log_topic.as_str(), line.as_str());
                     if session.publish(pkt).await.is_err() {
                         blog!("log flush interrupted");
                         break;
                     }
                 }
+                while crate::diag::imp::pop().is_some() {}
 
                 // Announce presence (retained so late subscribers see "online").
                 let online = Publication::new(presence_topic.as_str(), "online").retain();
