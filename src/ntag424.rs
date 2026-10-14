@@ -78,8 +78,8 @@ pub fn derive_session_keys(
 
     // RndA[13..8] XOR RndB[15..10]
     for i in 0..6 {
-        sv1[8 + i] = rnd_a[2 + i] ^ rnd_b[0 + i];
-        sv2[8 + i] = rnd_a[2 + i] ^ rnd_b[0 + i];
+        sv1[8 + i] = rnd_a[2 + i] ^ rnd_b[i];
+        sv2[8 + i] = rnd_a[2 + i] ^ rnd_b[i];
     }
 
     // RndB[9..0]

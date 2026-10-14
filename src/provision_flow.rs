@@ -501,6 +501,21 @@ mod tests {
     }
 
     #[test]
+    fn test_real_verifier_keyed_claim_reply() {
+        let arm_payload = r#"{"expires_at":"2026-10-14T17:13:01.529037311+00:00","job_id":"acdf06bd7c4467d8a8868e70d258b274","key":"","sun_config":{"cmac_bytes":8,"key_version":1},"uid":""}"#;
+        let mut m = ProvMachine::new();
+        m.on_job(arm_payload, 1000, 90);
+        let uid = [0x04, 0x87, 0x53, 0x62, 0x1e, 0x18, 0x90];
+        let action = m.on_tap(uid, 2000, 15);
+        assert!(matches!(action, ProvAction::PublishClaim(_)));
+
+        let reply_payload = r#"{"expires_at":"2026-10-14T17:13:01.529037311+00:00","job_id":"acdf06bd7c4467d8a8868e70d258b274","key":"9530186383e98b89fe6c01070d598b85","sun_config":{"cmac_bytes":8,"key_version":1},"uid":"048753621e1890"}"#;
+        let action = m.on_claim(reply_payload, 2500);
+        assert_eq!(action, ProvAction::ProvisionStart);
+        assert!(matches!(m.state, ProvState::Provisioning(..)));
+    }
+
+    #[test]
     fn malformed_job_is_rejected() {
         let mut m = ProvMachine::new();
         assert_eq!(m.on_job("{not json", 0, 90), (None, ProvAction::None));

@@ -307,7 +307,11 @@ async fn execute_tag_provisioning<I: pn532::Interface>(
         Ok(report) => (true, report.counter, ""),
         Err(e) => {
             println!("[prov] provision sequence error: {:?}", e);
-            (false, 0, "provision error")
+            let reason = match e {
+                provision::ProvisionError::KeyMismatch => "key-mismatch",
+                _ => "provision error",
+            };
+            (false, 0, reason)
         }
     };
 
