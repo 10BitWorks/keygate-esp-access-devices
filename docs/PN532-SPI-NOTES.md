@@ -318,6 +318,29 @@ have the NDEF app and file 02 (256 B, free RW, keys all-zero). So the live
 `sequence error: Status(0x6A82)` is from a specific step, prime suspect:
 **the NDEF file SELECT**. AN12196 selects files by ISO file ID — NDEF = `E104`,
 CC = `E103`, proprietary = `E105` — while our sequence selects file number `02`
-(`SELECT_NDEF_FILE_02_APDU` in `src/ntag424.rs`). Per-step status prints in
-`provision_tag` will confirm; if the SELECT-by-02 is the failure, switch the
-file select to `E104` (and mirror in read_ndef).
+(`SELECT_NDEF_FILE_02_APDU` in `src/ntag424.rs`). Switched file select to `0xE1, 0x04`
+in commit `d1b570f`.
+
+## Architectural Breakthroughs & Flash Forensics (2026-10-14 ~04:00)
+
+### 1. Decoupled NFC and Network Runners (Full Offline Support)
+- Previously, NFC tag polling was trapped inside the synchronous MQTT session loop. Any Wi-Fi drop, DHCP negotiation delay, or broker reconnection blocked card reading completely.
+- Converted `node::run` to execute two concurrent async tasks via `embassy_futures::join::join`:
+  - `nfc_runner`: Dedicated task with ownership of the PN532. Polls every ~15-20 ms, handles card detection, immediate audible feedback, NDEF parsing, and enqueues auth requests to `AUTH_OUTBOUND`. Operates 100% offline without network connectivity.
+  - `mqtt_runner`: Dedicated task managing Wi-Fi, DHCP, MQTT session (`session.poll()`), and publishing queued auth and claim payloads.
+- Network latency or disconnects now have zero impact on reader responsiveness.
+
+### 2. Smooth Tag Detection & Blank Card Resilience
+- Aligned `nfc::poll_tag` with the proven Waveshare C6 (`xiao-c6`) architecture: fast 200 ms non-blocking poll returning `Option<TagInfo>`.
+- Removed `ResetPolicy` error-counting from normal polling: RF timeouts when no tag is present are normal and no longer cause hardware resets.
+- Added `nfc::cycle_rf_field(pn)` after card reads: power-cycles passive tags resting on the antenna back to ISO 14443-3 `Idle`, preventing ISO-DEP lockup and allowing clean debouncing on repeated taps.
+- Blank/unwritten cards (`nlen == 0` / `InvalidLength`) are handled gracefully as unwritten tags without triggering errors or crashes.
+
+### 3. Flash Bootloader Partition Table Gotcha (`otadata`)
+- The ESP32 partition table defines `ota_0` (offset `0x10000`) and `ota_1` (offset `0x1E0000`).
+- If `otadata` (`0xD000`, 8 KB) holds active partition sequence pointing to `ota_1`, the ESP-IDF bootloader boots `ota_1` regardless of `espflash` writing new binaries to `0x10000` (`ota_0`).
+- Fix: `scripts/bench-flash.sh` explicitly passes `--partition-table partitions.csv --erase-parts otadata --target-app-partition ota_0`. Erasing `otadata` forces the bootloader to always boot `ota_0`.
+
+### 4. 2-Step Wildcard Provisioning Protocol Invariant
+- The initial job payload from the verifier arrives with `key: ""` because key diversification requires the card's physical UID.
+- The node must publish `writer/<device>/claim` with the UID, keep the tag activated in target slot 1 (never cycling the RF field mid-flow), and execute `provision_tag` only after the keyed claim reply arrives on `writer/<device>/job`.
