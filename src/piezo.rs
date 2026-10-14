@@ -98,7 +98,7 @@ pub const PATTERN_TABLE: &[(BeepEvent, &[Tone])] = &[
     (BeepEvent::RelayPulse, &[(2600, 400)]),
     (
         BeepEvent::ProvisionArmed,
-        &[(3500, 80), (3500, 80), (3500, 80)],
+        &[(2400, 60), (2700, 60), (3000, 60)],
     ),
     (
         BeepEvent::ProvisionOk,
