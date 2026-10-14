@@ -49,25 +49,6 @@ async fn main(spawner: Spawner) -> ! {
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
     let peripherals = esp_hal::init(config);
 
-    // defmt transport (esp-println/defmt-espflash): carries dependency logs
-    // (minimq, esp-radio) over the UART; decode with `espflash monitor`.
-    #[cfg(any(target_arch = "riscv32", target_arch = "xtensa"))]
-    mod defmt_hooks {
-        // defmt 1.x expects the firmware to provide these two symbols.
-        #[unsafe(no_mangle)]
-        fn _defmt_panic() -> ! {
-            loop {
-                core::hint::spin_loop();
-            }
-        }
-
-        #[unsafe(no_mangle)]
-        fn _defmt_timestamp(_fmt: defmt::Formatter<'_>) {
-            // Millis since boot via the embassy driver (readable from sync code).
-            let _ = embassy_time::Instant::now().as_millis();
-        }
-    }
-
     // 3. Initialize board and platform seams.
     let setup = board::setup(peripherals);
 
