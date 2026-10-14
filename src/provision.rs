@@ -648,12 +648,20 @@ where
 
     // 3) ChangeKey 1 <- job key (CommMode.Full).
     #[cfg(target_arch = "xtensa")]
-    esp_println::println!("[prov-step] step 3: change_key");
+    {
+        esp_println::println!("[prov-step] step 3: change_key");
+        esp_println::println!("[prov-step] TI: {:02x?}, cmdctr: {}", session.ti, session.cmdctr);
+        esp_println::println!("[prov-step] job_key: {:02x?}", job_key);
+    }
     let mut frame = [0u8; 64];
     let n = change_key(&mut session, 1, job_key, &[0u8; 16], 1, &mut frame)?;
     let (apdu, len) = crate::ntag424::wrap_apdu(crate::provision::CHANGE_KEY_INS, &frame[..n]);
+    #[cfg(target_arch = "xtensa")]
+    esp_println::println!("[prov-step] ChangeKey APDU (len {}): {:02x?}", len, &apdu[..len]);
     let mut resp = [0u8; 258];
     let rn = exchange(&apdu[..len], &mut resp)?;
+    #[cfg(target_arch = "xtensa")]
+    esp_println::println!("[prov-step] ChangeKey resp (len {}): {:02x?}", rn, &resp[..rn]);
     check_status(&resp[..rn], 0x91, 0x00)?;
 
     // 4) Write NDEF (NLEN + record): re-select file E104 (native ChangeKey de-selects the file).
