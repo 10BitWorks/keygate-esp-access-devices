@@ -63,6 +63,18 @@ async fn main(spawner: Spawner) -> ! {
     // 5. Spawn the Embassy network runner task.
     spawner.spawn(net_task(setup.net_runner).unwrap());
 
+    // Timer-driver sanity probe: a real 1 s sleep must measure ~1000 ms on
+    // embassy's clock. A wildly different value means the time driver is not
+    // backing Instant/Timer (cycle-count fallback) — every timeout in the
+    // node would then fire instantly.
+    {
+        use embassy_time::{Duration, Instant, Timer};
+        let t0 = Instant::now();
+        Timer::after(Duration::from_millis(1000)).await;
+        let dt_ms = (Instant::now() - t0).as_millis();
+        esp_println::println!("[probe] Timer::after(1000ms) measured {} ms", dt_ms);
+    }
+
     // 6. Transfer control to the node runtime loop.
     node::run(
         setup.pn532,

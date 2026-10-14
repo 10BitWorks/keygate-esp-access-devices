@@ -253,12 +253,20 @@ fn decode_key16(hex: &str, out: &mut [u8; 16]) -> bool {
                 // Boot beep: the node is fully up.
                 let _ = PZ.try_send(BeepEvent::Boot);
 
-                // Subscribe to commands AND provisioning jobs in one call.
-                let filters = [
-                    TopicFilter::new(cmd_topic.as_str()),
-                    TopicFilter::new(job_topic.as_str()),
-                ];
-                if let Err(e) = session.subscribe(&filters, &[]).await {
+                // Subscribe to commands AND provisioning jobs. Two separate
+                // SUBSCRIBEs: minimq 0.12's multi-filter SUBSCRIBE encoding is
+                // untested upstream (only the single-filter path has a wire
+                // test) and EMQX rejects the combined packet with
+                // topic_filter_invalid, killing the session on every connect.
+                let cmd_filters = [TopicFilter::new(cmd_topic.as_str())];
+                if let Err(e) = session.subscribe(&cmd_filters, &[]).await {
+                    println!("subscribe failed: {:?}", e);
+                    status_led::set_state(status_led::LedState::DeniedOrOffline);
+                    Timer::after(Duration::from_secs(next_backoff(&mut backoff_secs))).await;
+                    continue;
+                }
+                let job_filters = [TopicFilter::new(job_topic.as_str())];
+                if let Err(e) = session.subscribe(&job_filters, &[]).await {
                     println!("subscribe failed: {:?}", e);
                     status_led::set_state(status_led::LedState::DeniedOrOffline);
                     Timer::after(Duration::from_secs(next_backoff(&mut backoff_secs))).await;
@@ -561,7 +569,30 @@ fn decode_key16(hex: &str, out: &mut [u8; 16]) -> bool {
 
                     // Cooperative yield to keep the executor responsive.
                     Timer::after(Duration::from_millis(30)).await;
+
+                    // Clock telemetry: every 1024 iterations, print the
+                    // embassy clock reading. With a healthy 30 ms cadence the
+                    // value should advance ~30 000 ms per print; a cycle-count
+                    // masquerading as ms advances millions.
+                    {
+                        use core::sync::atomic::{AtomicU32, Ordering};
+                        static ITER: AtomicU32 = AtomicU32::new(0);
+                        let it = ITER.fetch_add(1, Ordering::Relaxed);
+                        if it % 1024 == 0 {
+                            println!(
+                                "[probe] loop tick iter={} now_ms={}",
+                                it,
+                                Instant::now().as_millis()
+                            );
+                        }
+                    }
                 }
+
+                // Session died mid-loop (the tag loop only exits via break on
+                // transport/protocol failure). Honor the reconnect backoff
+                // here — without it a flapping broker pins the CPU at
+                // reconnect rate and starves every other task.
+                Timer::after(Duration::from_secs(next_backoff(&mut backoff_secs))).await;
             }
             Err(e) => {
                 println!("MQTT session connect failed: {:?}", e);
