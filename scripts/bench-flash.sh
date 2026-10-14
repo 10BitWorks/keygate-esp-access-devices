@@ -16,6 +16,15 @@ if [ ! -f "$ELF" ]; then
     exit 1
 fi
 
+# Archive the whole session (flash + boot capture) under bench-logs/, named
+# by the commit under test, so results from any build stay attributable.
+# Folder is gitignored; curated excerpts get committed into docs/evidence
+# by hand when they matter.
+SHA=$(git rev-parse --short HEAD 2>/dev/null || echo nogit)
+mkdir -p bench-logs
+LOG="bench-logs/${SHA}-$(date -u +%Y%m%d-%H%M%S).log"
+exec > >(tee -a "$LOG") 2>&1
+
 PORT=""
 for probe in 1 2 3; do
     PORT=$(ls /dev/ttyUSB* 2>/dev/null | head -1 || true)
@@ -34,6 +43,7 @@ if [ -z "$PORT" ]; then
 fi
 
 echo "Target port: $PORT"
+echo "Session log: $LOG (commit $SHA)"
 
 # Check if chip is already in download/bootloader mode before prompting
 is_in_download_mode() {

@@ -56,6 +56,12 @@
 
 ## Expected timing (regression baselines — measured 2026-10-14)
 
+**Bench boot logs are archived** under `bench-logs/<commit>-<UTC ts>.log`
+(gitignored) by `scripts/bench-flash.sh` and `scripts/bench-capture.py
+[duration_s] [--reset]` — every flash and follow-up capture for a build
+lands in one attributable file. Consult the matching file before claiming
+a regression or re-running an experiment.
+
 Healthy cadences on the ESP32 door bench. A deviation in a capture is a
 regression signal, not noise:
 
