@@ -531,9 +531,17 @@ where
 {
     use crate::ntag424::{SELECT_NDEF_APP_APDU, SELECT_NDEF_FILE_02_APDU};
     let mut resp = [0u8; 258];
+    #[cfg(target_arch = "xtensa")]
+    esp_println::println!("[prov-step] 1a: select NDEF app");
     let n = exchange(&SELECT_NDEF_APP_APDU, &mut resp)?;
+    #[cfg(target_arch = "xtensa")]
+    esp_println::println!("[prov-step] 1a status: {:02x?}", &resp[..n]);
     check_status(&resp[..n], 0x90, 0x00)?;
+    #[cfg(target_arch = "xtensa")]
+    esp_println::println!("[prov-step] 1b: select NDEF file E104");
     let n = exchange(&SELECT_NDEF_FILE_02_APDU, &mut resp)?;
+    #[cfg(target_arch = "xtensa")]
+    esp_println::println!("[prov-step] 1b status: {:02x?}", &resp[..n]);
     check_status(&resp[..n], 0x90, 0x00)?;
     Ok(())
 }
@@ -603,13 +611,19 @@ where
     let (file_len, offsets) = ndef_file_from_template(url_template, &mut file)?;
 
     // 1) Select NDEF application + file.
+    #[cfg(target_arch = "xtensa")]
+    esp_println::println!("[prov-step] step 1: select_ndef");
     select_ndef(exchange)?;
 
     // 2) Authenticate with factory key 0 — NEVER change key 0.
+    #[cfg(target_arch = "xtensa")]
+    esp_println::println!("[prov-step] step 2: authenticate_ev2_first");
     let factory = [0u8; 16];
     let mut session = authenticate_ev2_first(&factory, 0, rnda, exchange)?;
 
     // 3) ChangeKey 1 <- job key (CommMode.Full).
+    #[cfg(target_arch = "xtensa")]
+    esp_println::println!("[prov-step] step 3: change_key");
     let mut frame = [0u8; 64];
     let n = change_key(&mut session, 1, job_key, 1, &mut frame)?;
     let (apdu, len) = crate::ntag424::wrap_apdu(crate::provision::CHANGE_KEY_INS, &frame[..n]);
@@ -618,6 +632,8 @@ where
     check_status(&resp[..rn], 0x91, 0x00)?;
 
     // 4) Write NDEF (NLEN + record) while the file is still openly writable.
+    #[cfg(target_arch = "xtensa")]
+    esp_println::println!("[prov-step] step 4: update_binary");
     let apdu = [
         0x00,
         UPDATE_BINARY_INS,
@@ -632,6 +648,8 @@ where
     check_status(&resp[..rn], 0x90, 0x00)?;
 
     // 5) ChangeFileSettings on file 2: enable SDM mirrors (CommMode.Full).
+    #[cfg(target_arch = "xtensa")]
+    esp_println::println!("[prov-step] step 5: change_file_settings");
     let settings = sdm_settings_bytes(&offsets);
     let n = change_file_settings(&mut session, 2, &settings, &mut frame)?;
     let (apdu, len) =
@@ -640,6 +658,8 @@ where
     check_status(&resp[..rn], 0x91, 0x00)?;
 
     // 6) Read back through the active mirrors and verify locally.
+    #[cfg(target_arch = "xtensa")]
+    esp_println::println!("[prov-step] step 6: readback & verify");
     select_ndef(exchange)?;
     let nlen = read_file(exchange, &mut resp)?;
     let uri = crate::ntag424::extract_ndef_uri(&resp[2..2 + nlen])

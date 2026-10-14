@@ -134,6 +134,23 @@ async fn nfc_runner<I: pn532::Interface>(
                 }
             }
 
+            // If in ClaimWait state, wait for the keyed claim reply without polling or cycling RF!
+            let (is_claim_wait, prov_ready) = {
+                let m = PROV_MACHINE.lock().await;
+                (matches!(m.state, ProvState::ClaimWait(..)), m.pending_context())
+            };
+
+            if let Some((job_id, key_hex)) = prov_ready {
+                println!("[prov] keyed claim reply active — writing card now (job {})", job_id);
+                execute_tag_provisioning(pn, &job_id, &key_hex).await;
+                nfc::cycle_rf_field(pn);
+                continue;
+            } else if is_claim_wait {
+                // Keep target 1 intact while verifier computes diversified key!
+                Timer::after(Duration::from_millis(15)).await;
+                continue;
+            }
+
             // Fast, non-blocking poll (200 ms timeout in driver, returns Option<TagInfo>).
             let tag_opt = nfc::poll_tag(pn);
             let obs = tag_opt.as_ref().map(tag_debounce::TagObservation::from_tag_info);
@@ -166,25 +183,18 @@ async fn nfc_runner<I: pn532::Interface>(
                             let _ = PZ.try_send(BeepEvent::Denied);
                         }
                         ProvAction::ProvisionStart => {
-                            // Fixed-uid job with pre-provided key or immediate provisioning
+                            // Fixed-uid job with pre-provided key
                             let prov_ctx = {
                                 let m = PROV_MACHINE.lock().await;
                                 m.pending_context()
                             };
                             if let Some((job_id, key_hex)) = prov_ctx {
                                 execute_tag_provisioning(pn, &job_id, &key_hex).await;
+                                nfc::cycle_rf_field(pn);
                             }
                         }
                         _ => {
-                            // Check if keyed claim reply already arrived and we're ready to write
-                            let prov_ctx = {
-                                let m = PROV_MACHINE.lock().await;
-                                m.pending_context()
-                            };
-                            if let Some((job_id, key_hex)) = prov_ctx {
-                                execute_tag_provisioning(pn, &job_id, &key_hex).await;
-                            } else {
-                                // Standard authentication path: read NDEF message.
+                            // Standard authentication path: read NDEF message.
                                 let read_res = {
                                     let pn_ref: &mut _ = &mut *pn;
                                     let mut exchange = move |apdu: &[u8], out: &mut [u8]| -> Result<usize, ntag424::NdefError> {
@@ -235,7 +245,6 @@ async fn nfc_runner<I: pn532::Interface>(
                                 }
                             }
                         }
-                    }
 
                     // Only reset the RF field if not in an active provisioning flow
                     // (the card must remain activated in target slot 1 while awaiting the keyed claim reply).
@@ -246,17 +255,6 @@ async fn nfc_runner<I: pn532::Interface>(
                     if !in_prov {
                         nfc::cycle_rf_field(pn);
                     }
-                }
-            } else {
-                // If in ClaimWait/Provisioning state, check if the keyed job reply arrived while the card is held:
-                let prov_ctx = {
-                    let m = PROV_MACHINE.lock().await;
-                    m.pending_context()
-                };
-                if let Some((job_id, key_hex)) = prov_ctx {
-                    println!("[prov] keyed claim reply active — writing card now");
-                    execute_tag_provisioning(pn, &job_id, &key_hex).await;
-                    nfc::cycle_rf_field(pn);
                 }
             }
         } else {
@@ -293,7 +291,10 @@ async fn execute_tag_provisioning<I: pn532::Interface>(
         let mut report = provision::ProvisionReport { uid: [0; 7], counter: 0 };
         let mut exchange = move |apdu: &[u8], out: &mut [u8]| -> Result<usize, ntag424::NdefError> {
             let resp = nfc::in_data_exchange(pn, 1, apdu)
-                .map_err(|_| ntag424::NdefError::Transport)?;
+                .map_err(|e| {
+                    println!("[exchange] in_data_exchange error: {:?}", e);
+                    ntag424::NdefError::Transport
+                })?;
             if out.len() < resp.len() {
                 return Err(ntag424::NdefError::BufferTooSmall);
             }
