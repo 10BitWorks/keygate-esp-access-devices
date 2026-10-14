@@ -52,41 +52,60 @@ is_in_download_mode() {
 
 FLASHED=1
 
-# Automatic boot-mode entry (no buttons): esptool's classic DTR/RTS
-# sequence via scripts/force-download.py — bench-proven on this CP2102
-# clone (espflash's --before default-reset uses timing it rejects).
-# Then flash with --before no-reset (chip already in download mode).
+# Phase 1 — fully automatic (no buttons). scripts/force-download.py enters
+# download mode via the esptool DTR/RTS sequence (atomic DTR/RTS swap —
+# verified by ROM banner boot:0x3 DOWNLOAD_BOOT on this official DevKitC;
+# the earlier failures were a sleep between the swaps, not hardware).
 for i in 1 2 3; do
-    echo "=== Flash attempt $i @ 57600 baud ==="
-    if ! python3 scripts/force-download.py "$PORT"; then
-        echo "Auto boot-mode entry failed (attempt $i) — retrying."
-        sleep 1
-        continue
-    fi
-    if timeout 300 espflash flash --chip esp32 --port "$PORT" --before no-reset -B 57600 --no-verify --partition-table partitions.csv --erase-parts otadata --target-app-partition ota_0 "$ELF"; then
-        echo "Flash succeeded on attempt $i!"
+    echo "=== Flash attempt $i (automatic boot-mode entry) ==="
+    if python3 scripts/force-download.py "$PORT" \
+       && timeout 300 espflash flash --chip esp32 --port "$PORT" --before no-reset -B 57600 --no-verify --partition-table partitions.csv --erase-parts otadata --target-app-partition ota_0 "$ELF"; then
+        echo "Flash succeeded on attempt $i (buttonless)!"
         FLASHED=0
         break
     fi
+    sleep 1
 done
 
-# Last resort: manual BOOT dance (only if auto entry died 3x).
+# Phase 2 (fallback) — FLASH-WHEN-READY watcher: zero coordination. Retries
+# espflash every few seconds; whenever a manual BOOT dance happens (HOLD
+# BOOT -> TAP EN -> RELEASE, hold not required), the next attempt catches
+# it. Used only if automatic entry failed 3x (e.g. USB line stuck).
 if [ "$FLASHED" -ne 0 ]; then
-    if ! zenity --question --timeout=90 --title="KeyGate: Manual BOOT dance" \
-        --text="Automatic boot-mode entry failed 3 times.\n\nClick OK, then perform the BOOT dance:\n1. HOLD BOOT button\n2. TAP EN (RST) once\n3. RELEASE BOOT\n(No hold needed — BOOT only has to be low at the moment EN rises.)" 2>/dev/null; then
-        echo "Flashing cancelled."
-        exit 1
+    ARM_SECONDS="${KEYGATE_ARM_SECONDS:-420}"
+    echo "=== Auto entry failed — FLASH-WHEN-READY armed for ${ARM_SECONDS}s ==="
+    echo "    Do the BOOT dance at ANY time: HOLD BOOT -> TAP EN -> RELEASE."
+    command -v notify-send >/dev/null && notify-send "KeyGate flasher armed" \
+        "Auto entry failed. Do the BOOT dance any time in the next $((ARM_SECONDS / 60)) min." || true
+    if [ -n "${DISPLAY:-}" ] && command -v zenity >/dev/null; then
+        zenity --info --timeout=20 --title="KeyGate: flasher armed" \
+            --text="Automatic entry failed.\n\nWatcher armed for $((ARM_SECONDS / 60)) min.\nDo the BOOT dance at ANY time:\nHOLD BOOT -> TAP EN -> RELEASE" 2>/dev/null || true &
     fi
-    if timeout 300 espflash flash --chip esp32 --port "$PORT" --before no-reset -B 57600 --no-verify --partition-table partitions.csv --erase-parts otadata --target-app-partition ota_0 "$ELF"; then
-        echo "Flash succeeded (manual dance)!"
-        FLASHED=0
-    fi
+
+    DEADLINE=$(( $(date +%s) + ARM_SECONDS ))
+    ATTEMPT=0
+    while [ "$(date +%s)" -lt "$DEADLINE" ]; do
+        ATTEMPT=$((ATTEMPT + 1))
+        if OUT=$(timeout 120 espflash flash --chip esp32 --port "$PORT" --before no-reset -B 57600 --no-verify --partition-table partitions.csv --erase-parts otadata --target-app-partition ota_0 "$ELF" 2>&1); then
+            echo "$OUT" | rtk grep -vE "boot:|esp_image|ets Jul|rst:0x1|configsip|mode:DIO|load:|ho 8|entry |clk_drv|d_drv|SPIWP" || true
+            echo "Flash succeeded on watcher attempt $ATTEMPT!"
+            FLASHED=0
+            break
+        fi
+        sleep 3
+    done
 fi
 
 if [ "$FLASHED" -ne 0 ]; then
-    zenity --error --title="KeyGate: Flash Failed" --text="All flash attempts failed." 2>/dev/null || true
+    echo "All flash paths failed."
+    zenity --error --timeout=30 --title="KeyGate: Flash Failed" \
+        --text="Automatic entry failed and no BOOT dance was detected." 2>/dev/null || true
     exit 1
 fi
+
+# Entry left IO0 held low (glitch self-heal, see force-download.py); release
+# the strap and tap EN so the freshly flashed app boots before the capture.
+python3 scripts/force-download.py "$PORT" release || true
 
 if zenity --question --title="KeyGate: Serial Monitoring" \
     --text="Flash complete — the node auto-boots (bugle ~5s later).\n\nClick OK to capture serial output (20 seconds)." 2>/dev/null; then
