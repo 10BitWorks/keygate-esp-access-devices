@@ -3,6 +3,14 @@
 ## Toolchain
 - **Target:** `riscv32imac-unknown-none-elf` — standard bare-metal RISC-V target for ESP32-C6. Classic ESP32 door board uses `xtensa-esp32-none-elf` with `esp` toolchain.
 - **Flashing:** Use `espflash` (install via `cargo install espflash`).
+- **Bench flashing is buttonless** via `scripts/bench-flash.sh` (auto DTR/RTS
+  entry — atomic swap, see `scripts/force-download.py` for the circuit
+  truth table; dance-watcher only as fallback). If stub-start failures
+  cluster (`MemBegin timeout` in espflash, `Failed to start stub flasher`
+  in esptool), the chip is browning out under load — power-cycle the whole
+  bench; the script's retry loop absorbs transient stub deaths. esptool
+  venv fallback: `/tmp/opencode/esp-venv/bin/python -m esptool` (no-stub
+  ROM commands bypass a dead stub entirely).
 
 ## Hardware
 - **PN532 Connection:**
