@@ -620,12 +620,16 @@ async fn mqtt_runner(
 
                 // Subscribe to command, provisioning and OTA topics (one
                 // SUBSCRIBE carries them all).
+                // OTA topics at QoS1: image chunks must not be dropped (the
+                // 1KB rx buffer cannot absorb a line-rate chunk burst).
+                let qos1 = minimq::SubscriptionOptions::default()
+                    .maximum_qos(minimq::QoS::AtLeastOnce);
                 let filters = [
                     TopicFilter::new(cmd_topic.as_str()),
                     TopicFilter::new(job_topic.as_str()),
-                    TopicFilter::new(ota_meta_topic.as_str()),
-                    TopicFilter::new(ota_data_topic.as_str()),
-                    TopicFilter::new(ota_end_topic.as_str()),
+                    TopicFilter::new(ota_meta_topic.as_str()).options(qos1),
+                    TopicFilter::new(ota_data_topic.as_str()).options(qos1),
+                    TopicFilter::new(ota_end_topic.as_str()).options(qos1),
                 ];
                 if let Err(e) = session.subscribe(&filters, &[]).await {
                     println!("[mqtt] subscribe failed: {:?}", e);

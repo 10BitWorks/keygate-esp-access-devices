@@ -70,7 +70,10 @@ cli.publish(meta_t, json.dumps({"size": len(data), "crc32": f"{crc:08x}"}), qos=
 CHUNK = 512
 t0 = time.time()
 for off in range(0, len(data), CHUNK):
-    cli.publish(data_t, data[off:off + CHUNK], qos=1).wait_for_publish()
+    # wire format: [u32 LE offset][bytes] — idempotent under QoS1 dupes
+    pkt = off.to_bytes(4, "little") + data[off:off + CHUNK]
+    cli.publish(data_t, pkt, qos=1).wait_for_publish()
+    time.sleep(0.02)  # pace: the device erases/writes flash per chunk
     if (off // CHUNK) % 40 == 0:
         print(f"data: {off}/{len(data)} bytes")
 print(f"data: done in {time.time() - t0:.1f}s")

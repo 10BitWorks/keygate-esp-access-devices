@@ -19,6 +19,8 @@
 //! `24..28` ota_state (2 = VALID), `28..32` CRC32 of the 4 seq bytes via
 //! the ROM `crc32_le(0, bytes)` (LSB, poly 0x04c11db7, fin ~0) — verified
 //! against live flash: seq=1 -> 0x4743989a.
+use esp_println::println;
+
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::mutex::Mutex;
 use embedded_storage::nor_flash::NorFlash;
@@ -125,15 +127,18 @@ fn current_seq(flash: &mut FlashStorage) -> u32 {
 /// `ota/meta`: validate, pick the inactive slot, erase it for the image.
 pub async fn on_meta(payload: &[u8]) {
     let Some(meta) = parse_meta(payload) else {
+        println!("[ota] meta: unparsable");
         crate::blog!("ota meta: unparsable");
         return;
     };
     if meta.size == 0 || meta.size % 4 != 0 || meta.size as usize > 0x1c2_000 {
+        println!("[ota] meta: bad size {}", meta.size);
         crate::blog!("ota meta: bad size {}", meta.size);
         return;
     }
     let mut flash_guard = FLASH.lock().await;
     let Some(flash) = flash_guard.as_mut() else {
+        println!("[ota] flash not initialized");
         crate::blog!("ota: flash not initialized");
         return;
     };
@@ -149,11 +154,13 @@ pub async fn on_meta(payload: &[u8]) {
     match flash.erase(target_off, erase_to) {
         Ok(()) => {}
         Err(e) => {
-            crate::blog!("ota: erase failed {:?}", e);
+            println!("[ota] erase failed {:?}", e);
+        crate::blog!("ota: erase failed {:?}", e);
             return;
         }
     }
 
+    println!("[ota] begin {}B -> slot{} (seq {})", meta.size, target_idx, target_seq);
     crate::blog!(
         "ota: begin {}B -> slot{} (seq {}), erase ok",
         meta.size,
@@ -172,8 +179,15 @@ pub async fn on_meta(payload: &[u8]) {
     });
 }
 
-/// `ota/data`: write one chunk at the running offset.
-pub async fn on_data(chunk: &[u8]) {
+/// `ota/data`: wire format `[u32 LE offset][bytes]`. The offset makes the
+/// handler idempotent under QoS1 duplicate delivery: duplicates are
+/// ignored, gaps abort the transfer.
+pub async fn on_data(payload: &[u8]) {
+    if payload.len() < 4 {
+        return;
+    }
+    let off = u32::from_le_bytes(payload[0..4].try_into().unwrap()) as usize;
+    let chunk = &payload[4..];
     let mut guard = FLASH.lock().await;
     let Some(flash) = guard.as_mut() else {
         return;
@@ -182,20 +196,32 @@ pub async fn on_data(chunk: &[u8]) {
     let Some(rx) = state.as_mut() else {
         return;
     };
+    if off != rx.written as usize {
+        if off < rx.written as usize {
+            return; // QoS1 duplicate — already written
+        }
+        crate::blog!("ota: gap at {} (expected {}) — aborting", off, rx.written);
+        println!("[ota] gap at {} (expected {}) — aborting", off, rx.written);
+        *state = None;
+        return;
+    }
     if rx.written + chunk.len() as u32 > rx.size {
+        println!("[ota] overflow");
         crate::blog!("ota: overflow {} > {}", rx.written + chunk.len() as u32, rx.size);
         *state = None;
         return;
     }
     let pos = rx.target_off + rx.written;
     if flash.write(pos, chunk).is_err() {
+        println!("[ota] write failed @{}", pos);
         crate::blog!("ota: write failed @{}", pos);
         *state = None;
         return;
     }
     rx.crc_got = crc32_update(rx.crc_got, chunk);
     rx.written += chunk.len() as u32;
-    if rx.written % (64 * 1024) == 0 {
+    if rx.written % (128 * 1024) == 0 {
+        println!("[ota] {}/{} bytes", rx.written, rx.size);
         crate::blog!("ota: {}/{} bytes", rx.written, rx.size);
     }
 }
@@ -208,10 +234,15 @@ pub async fn on_end() {
     };
     let mut state = RX.lock().await;
     let Some(rx) = state.as_mut() else {
+        println!("[ota] end: no transfer in progress");
         crate::blog!("ota end: no transfer in progress");
         return;
     };
     if rx.written != rx.size || rx.crc_got != rx.crc_want {
+        println!(
+            "[ota] verify FAILED ({} of {} bytes, crc {:08x} != {:08x})",
+            rx.written, rx.size, rx.crc_got, rx.crc_want
+        );
         crate::blog!(
             "ota: verify FAILED ({} of {} bytes, crc {:08x} != {:08x}) — keeping old build",
             rx.written,
@@ -226,6 +257,7 @@ pub async fn on_end() {
     // Re-read otadata, build both entries in RAM, erase, rewrite.
     let mut ot = [0u8; 64];
     if flash.read(OTADATA_OFF, &mut ot).is_err() {
+        println!("[ota] otadata read failed");
         crate::blog!("ota: otadata read failed");
         return;
     }
@@ -258,10 +290,15 @@ pub async fn on_end() {
     if flash.erase(OTADATA_OFF, OTADATA_OFF + 0x1000).is_err()
         || flash.write(OTADATA_OFF, &sector).is_err()
     {
+        println!("[ota] otadata write failed — old build keeps running");
         crate::blog!("ota: otadata write failed — old build keeps running");
         return;
     }
 
+    println!(
+        "[ota] verified {} bytes, slot{} seq{} ACTIVE — rebooting",
+        rx.size, new_idx, new_seq
+    );
     crate::blog!(
         "ota: verified {} bytes, slot{} seq{} ACTIVE — rebooting",
         rx.size,
