@@ -35,19 +35,25 @@ meta_t = f"access/{DEVICE}/ota/meta"
 data_t = f"access/{DEVICE}/ota/data"
 end_t = f"access/{DEVICE}/ota/end"
 log_t = f"access/{DEVICE}/log"
+status_t = f"access/{DEVICE}/ota/status"
 
-state = {"logs": [], "connected": False}
+state = {"logs": [], "statuses": [], "connected": False}
 
 
 def on_connect(c, userdata, flags, rc, props=None):
     state["connected"] = True
-    c.subscribe(log_t)
+    c.subscribe(log_t, qos=1)
+    c.subscribe(status_t, qos=1)
 
 
 def on_message(c, userdata, msg):
     line = msg.payload.decode("utf-8", "replace")
-    state["logs"].append(line)
-    print(f"[node] {line}")
+    if msg.topic == status_t:
+        state["statuses"].append(line)
+        print(f"[status] {line}")
+    else:
+        state["logs"].append(line)
+        print(f"[node] {line}")
 
 
 cli = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="ota-push")
@@ -67,6 +73,26 @@ time.sleep(0.5)
 print(f"meta -> {meta_t}")
 cli.publish(meta_t, json.dumps({"size": len(data), "crc32": f"{crc:08x}"}), qos=1).wait_for_publish()
 
+print("waiting for device to finish batched erase (status: receiving)...")
+t_wait = time.time()
+erased = False
+while time.time() - t_wait < 45:
+    for s in state["statuses"]:
+        if "receiving" in s:
+            erased = True
+            break
+        if "failed" in s or "aborted" in s:
+            print(f"erase failed: {s}")
+            sys.exit(3)
+    if erased:
+        break
+    time.sleep(0.2)
+
+if not erased:
+    print("timeout waiting for device erase completion — check node")
+    sys.exit(3)
+
+print("device ready — streaming data chunks...")
 CHUNK = 512
 t0 = time.time()
 for off in range(0, len(data), CHUNK):

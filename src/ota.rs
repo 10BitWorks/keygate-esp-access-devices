@@ -88,12 +88,29 @@ struct Rx {
     crc_got: u32,
     written: u32,
     target_off: u32,
-    erased_to: u32,
+    erase_end: u32,
+    erase_next: u32,
+    erasing: bool,
     target_seq: u32,
     target_idx: usize,
 }
 
 static RX: Mutex<CriticalSectionRawMutex, Option<Rx>> = Mutex::new(None);
+
+/// Status messages for `access/<id>/ota/status` (drained by the MQTT task).
+pub static STATUS_OUTBOUND: embassy_sync::channel::Channel<
+    CriticalSectionRawMutex,
+    heapless::String<128>,
+    4,
+> = embassy_sync::channel::Channel::new();
+
+fn status(msg: &str) {
+    println!("[ota] {}", msg);
+    let mut s = heapless::String::<128>::new();
+    use core::fmt::Write as _;
+    let _ = write!(s, "{}", msg);
+    let _ = STATUS_OUTBOUND.try_send(s);
+}
 static FLASH: Mutex<CriticalSectionRawMutex, Option<FlashStorage<'static>>> =
     Mutex::new(None);
 
@@ -146,34 +163,24 @@ pub async fn on_meta(payload: &[u8]) {
     let target_seq = cur + 1;
     let target_idx = ((target_seq - 1) % 2) as usize;
     let (target_off, target_len) = OTA_SLOTS[target_idx];
-    let erase_to = target_off + meta.size.div_ceil(SECTOR) * SECTOR;
-    let _ = erase_to.min(target_off + target_len);
+    let erase_end = target_off + meta.size.div_ceil(SECTOR) * SECTOR;
+    let _ = target_len;
 
-    // Erase the region now (sector-stepped inside esp-storage, interrupts
-    // disabled per sector by the driver's critical section).
-    match flash.erase(target_off, erase_to) {
-        Ok(()) => {}
-        Err(e) => {
-            println!("[ota] erase failed {:?}", e);
-        crate::blog!("ota: erase failed {:?}", e);
-            return;
-        }
-    }
+    // Erase in small batches from the pump loop (erase_tick): a single
+    // 175-sector blocking erase wedges the whole executor if the flash
+    // chip hiccups — the watchdog then reboots and the OLD build keeps
+    // guarding the door (otadata is only written after full verification).
+    status("begin: erasing");
 
-    println!("[ota] begin {}B -> slot{} (seq {})", meta.size, target_idx, target_seq);
-    crate::blog!(
-        "ota: begin {}B -> slot{} (seq {}), erase ok",
-        meta.size,
-        target_idx,
-        target_seq
-    );
     *RX.lock().await = Some(Rx {
         size: meta.size,
         crc_want: meta.crc32,
         crc_got: 0,
         written: 0,
         target_off,
-        erased_to: erase_to,
+        erase_end,
+        erase_next: target_off,
+        erasing: true,
         target_seq,
         target_idx,
     });
@@ -205,6 +212,11 @@ pub async fn on_data(payload: &[u8]) {
         *state = None;
         return;
     }
+    if rx.erasing {
+        status("busy: still erasing (host should retry meta)");
+        *state = None;
+        return;
+    }
     if rx.written + chunk.len() as u32 > rx.size {
         println!("[ota] overflow");
         crate::blog!("ota: overflow {} > {}", rx.written + chunk.len() as u32, rx.size);
@@ -226,6 +238,42 @@ pub async fn on_data(payload: &[u8]) {
     }
 }
 
+/// Erase up to `ERASE_BATCH` sectors per call; called every pump-loop pass
+/// while a transfer is in the erasing phase. Each batch is bounded (~
+/// 100-400 ms), so the executor, Wi-Fi and the watchdog stay live.
+const ERASE_BATCH: u32 = 4;
+
+/// Returns true when no batched erase is pending.
+pub async fn erase_tick() -> bool {
+    let mut guard = FLASH.lock().await;
+    let Some(flash) = guard.as_mut() else {
+        return true;
+    };
+    let mut state = RX.lock().await;
+    let Some(rx) = state.as_mut() else {
+        return true;
+    };
+    if !rx.erasing {
+        return true;
+    }
+    for _ in 0..ERASE_BATCH {
+        if rx.erase_next >= rx.erase_end {
+            rx.erasing = false;
+            status("receiving: erase complete — send data");
+            return true;
+        }
+        let r = flash.erase(rx.erase_next, rx.erase_next + SECTOR);
+        if r.is_err() {
+            status("erase failed — transfer aborted");
+            println!("[ota] erase failed at {:#x}", rx.erase_next);
+            *state = None;
+            return true;
+        }
+        rx.erase_next += SECTOR;
+    }
+    false
+}
+
 /// `ota/end`: verify, write the otadata entries, reboot.
 pub async fn on_end() {
     let mut guard = FLASH.lock().await;
@@ -238,6 +286,10 @@ pub async fn on_end() {
         crate::blog!("ota end: no transfer in progress");
         return;
     };
+    if rx.erasing {
+        status("end: still erasing — ignored");
+        return;
+    }
     if rx.written != rx.size || rx.crc_got != rx.crc_want {
         println!(
             "[ota] verify FAILED ({} of {} bytes, crc {:08x} != {:08x})",

@@ -76,6 +76,7 @@ pub struct Setup<I: pn532::Interface, T: piezo::ToneDriver> {
     pub led_pin: esp_hal::gpio::Output<'static>,
     pub piezo_tone: T,
     pub flash: esp_storage::FlashStorage<'static>,
+    pub wdt: esp_hal::timer::timg::Wdt<esp_hal::peripherals::TIMG1<'static>>,
     // Consumed by the node feedback hooks (task T7), which receive this sender
     // through `node::run`. Until those hooks land the field is intentionally
     // unread; silence the dead-code lint the same way `board.rs` does elsewhere.
@@ -510,6 +511,14 @@ pub fn setup(
         ch: ch0,
     };
     let flash = esp_storage::FlashStorage::new(peripherals.FLASH);
+    // Task watchdog on TIMG1: any wedged task (flash op, driver bug)
+    // reboots the node within 30s — the old build keeps guarding.
+    let mut wdt = esp_hal::timer::timg::Wdt::<esp_hal::peripherals::TIMG1<'static>>::new();
+    wdt.enable();
+    wdt.set_timeout(
+        esp_hal::timer::timg::MwdtStage::Stage0,
+        esp_hal::time::Duration::from_secs(30),
+    );
     core::mem::forget(Output::new(
         peripherals.GPIO10,
         Level::Low,
@@ -554,6 +563,7 @@ pub fn setup(
         led_pin,
         piezo_tone,
         flash,
+        wdt,
         piezo_tx: piezo::PIEZO_CHANNEL.sender(),
         wifi_controller: net_parts.wifi_controller,
         stack: net_parts.stack,
@@ -617,6 +627,14 @@ pub fn setup(
         ch: ch0,
     };
     let flash = esp_storage::FlashStorage::new(peripherals.FLASH);
+    // Task watchdog on TIMG1: any wedged task (flash op, driver bug)
+    // reboots the node within 30s — the old build keeps guarding.
+    let mut wdt = esp_hal::timer::timg::Wdt::<esp_hal::peripherals::TIMG1<'static>>::new();
+    wdt.enable();
+    wdt.set_timeout(
+        esp_hal::timer::timg::MwdtStage::Stage0,
+        esp_hal::time::Duration::from_secs(30),
+    );
     core::mem::forget(Output::new(
         peripherals.GPIO33,
         Level::Low,
@@ -681,6 +699,7 @@ pub fn setup(
         led_pin,
         piezo_tone,
         flash,
+        wdt,
         piezo_tx: piezo::PIEZO_CHANNEL.sender(),
         wifi_controller: net_parts.wifi_controller,
         stack: net_parts.stack,

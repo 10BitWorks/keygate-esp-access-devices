@@ -64,10 +64,11 @@ pub async fn run<I: pn532::Interface>(
     reader_reset: Option<esp_hal::gpio::Output<'static>>,
     stack: embassy_net::Stack<'static>,
     wifi_controller: esp_radio::wifi::WifiController<'static>,
+    wdt: esp_hal::timer::timg::Wdt<esp_hal::peripherals::TIMG1<'static>>,
 ) -> ! {
     embassy_futures::join::join(
         nfc_runner(pn532, reader_reset),
-        mqtt_runner(stack, wifi_controller),
+        mqtt_runner(stack, wifi_controller, wdt),
     )
     .await;
 
@@ -387,6 +388,7 @@ async fn execute_tag_provisioning<I: pn532::Interface>(
 async fn mqtt_runner(
     stack: embassy_net::Stack<'static>,
     mut wifi_controller: esp_radio::wifi::WifiController<'static>,
+    mut wdt: esp_hal::timer::timg::Wdt<esp_hal::peripherals::TIMG1<'static>>,
 ) -> ! {
     static TCP_RX: static_cell::StaticCell<[u8; 1024]> = static_cell::StaticCell::new();
     static TCP_TX: static_cell::StaticCell<[u8; 1024]> = static_cell::StaticCell::new();
@@ -408,6 +410,7 @@ async fn mqtt_runner(
     let mut ota_meta_topic = heapless::String::<96>::new();
     let mut ota_data_topic = heapless::String::<96>::new();
     let mut ota_end_topic = heapless::String::<96>::new();
+    let mut ota_status_topic = heapless::String::<96>::new();
 
     let _ = write!(&mut auth_topic, "access/{}/auth", config::DEVICE_ID);
     let _ = write!(&mut cmd_topic, "access/{}/cmd", config::DEVICE_ID);
@@ -419,6 +422,7 @@ async fn mqtt_runner(
     let _ = write!(&mut ota_meta_topic, "access/{}/ota/meta", config::DEVICE_ID);
     let _ = write!(&mut ota_data_topic, "access/{}/ota/data", config::DEVICE_ID);
     let _ = write!(&mut ota_end_topic, "access/{}/ota/end", config::DEVICE_ID);
+    let _ = write!(&mut ota_status_topic, "access/{}/ota/status", config::DEVICE_ID);
 
     let broker_port: u16 = config::MQTT_PORT.parse().unwrap_or(1883);
     let mut backoff_secs: u64 = 1;
@@ -682,10 +686,25 @@ async fn mqtt_runner(
                     }
 
                     // 4. Drive MQTT with a bounded 100 ms wait (as documented in minimq examples).
+                    // Watchdog: if ANY task wedges (e.g. a flash op), the
+                    // 30s WDT reboots and the OLD build keeps guarding.
+                    wdt.feed();
+                    // OTA: advance the batched erase; drain status messages.
+                    ota::erase_tick().await;
+                    while let Ok(status) = crate::ota::STATUS_OUTBOUND.try_receive() {
+                        let pkt = minimq::Publication::new(ota_status_topic.as_str(), status.as_str())
+                            .qos(minimq::QoS::AtLeastOnce);
+                        if let Err(e) = session.publish(pkt).await {
+                            println!("[mqtt] ota status publish failed: {:?}", e);
+                            break;
+                        }
+                    }
+
                     match embassy_time::with_timeout(Duration::from_millis(100), session.poll()).await {
                         Ok(Ok(Some(msg))) => {
                             let topic = msg.topic();
                             let payload = msg.payload();
+                            println!("[mqtt] rx {} ({}B)", topic, payload.len());
 
                             if topic == ota_meta_topic.as_str() {
                                 ota::on_meta(payload).await;

@@ -93,6 +93,7 @@ async fn main(spawner: Spawner) -> ! {
         setup.reader_reset,
         setup.stack,
         setup.wifi_controller,
+        setup.wdt,
     )
     .await
 }
