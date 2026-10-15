@@ -21,7 +21,9 @@ pub const PIEZO_CHANNEL_CAPACITY: usize = 8;
 /// Discrete feedback events the rest of the firmware can request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BeepEvent {
-    /// A tag was sighted.
+    /// A tag was sighted. Wake-up event only — the audible announcement is
+    /// the UID melody (see [`FIELD_UID`]/[`generate_melody`]); the pattern
+    /// table maps this event to silence.
     TagDetected,
     /// An auth request was published to the broker.
     AuthSent,
@@ -86,22 +88,110 @@ pub mod conn {
 pub static CONN_STATE: core::sync::atomic::AtomicU8 =
     core::sync::atomic::AtomicU8::new(conn::BOOT);
 
-/// A tag is physically in the RF field. While set, the piezo task drones a
-/// continuous tone (see `IN_FIELD_HZ`/`IN_FIELD_CHUNK_MS`); the drone stops
-/// within one chunk of the flag clearing.
-pub static TAG_IN_FIELD: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(false);
+/// ---- In-field identity melody -----------------------------------------
+///
+/// While a tag is physically in the RF field, the piezo plays a repeating
+/// 4-beat measure derived from that card's UID (FNV-1a → base-10 digits;
+/// each digit picks a pentatonic pitch and quarter-vs-short+rest rhythm).
+/// The card audibly announces itself — and it works for every ISO14443-A
+/// card, DNA or not.
 
-/// Publish whether a tag is currently in the RF field.
-pub fn set_tag_in_field(on: bool) {
-    TAG_IN_FIELD.store(on, core::sync::atomic::Ordering::Relaxed);
+/// Standard pentatonic frequencies in Hz (C6, D6, E6, G6, A6).
+pub const PENTATONIC_FREQS: [u32; 5] = [1047, 1175, 1319, 1568, 1760];
+
+/// One beat: a quarter note (200 ms tone) or a short note (100 ms) plus rest.
+pub const BEAT_DURATION_MS: u32 = 250;
+
+pub struct Beep {
+    pub freq: u32,
+    pub tone_duration_ms: u32,
+    pub rest_duration_ms: u32,
 }
 
-/// Pitch of the continuous in-field drone (Hz).
-const IN_FIELD_HZ: u32 = 2100;
-/// Chunk length (ms): back-to-back chunks sound continuous, and each
-/// boundary is a preemption/exit checkpoint.
-const IN_FIELD_CHUNK_MS: u32 = 50;
+/// The user's spec struct — derive the basics so beats compare in tests and
+/// array-initialize in `melody_from_sequence`.
+impl PartialEq for Beep {
+    fn eq(&self, other: &Self) -> bool {
+        self.freq == other.freq
+            && self.tone_duration_ms == other.tone_duration_ms
+            && self.rest_duration_ms == other.rest_duration_ms
+    }
+}
+impl Eq for Beep {}
+impl core::fmt::Debug for Beep {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            f,
+            "Beep({} Hz, {} ms + {} ms rest)",
+            self.freq, self.tone_duration_ms, self.rest_duration_ms
+        )
+    }
+}
+impl Clone for Beep {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl Copy for Beep {}
+
+/// FNV-1a 32-bit hash of the raw UID bytes.
+fn hash_uid(uid: &[u8]) -> u32 {
+    let mut hash: u32 = 2166136261;
+    for &byte in uid {
+        hash ^= byte as u32;
+        hash = hash.wrapping_mul(16777619);
+    }
+    hash
+}
+
+/// Map a base-10 digit sequence (LSB first, 10 combinations per beat:
+/// digit % 5 = pentatonic pitch, digit >= 5 = eighth note + rest) to beats.
+fn melody_from_sequence(mut sequence_val: u32) -> [Beep; 4] {
+    let mut melody: [Beep; 4] = [Beep {
+        freq: 0,
+        tone_duration_ms: 0,
+        rest_duration_ms: 0,
+    }; 4];
+
+    for beat in melody.iter_mut() {
+        let digit = sequence_val % 10;
+        sequence_val /= 10;
+
+        let pitch_index = (digit % 5) as usize;
+        let is_short = digit >= 5;
+
+        let tone_duration = if is_short { 100 } else { 200 };
+
+        *beat = Beep {
+            freq: PENTATONIC_FREQS[pitch_index],
+            tone_duration_ms: tone_duration,
+            rest_duration_ms: BEAT_DURATION_MS - tone_duration,
+        };
+    }
+    melody
+}
+
+/// A card's signature measure: 4 beats from its UID.
+pub fn generate_melody(uid: &[u8]) -> [Beep; 4] {
+    melody_from_sequence(hash_uid(uid) % 10_000)
+}
+
+/// UID of the tag currently in the RF field (empty = field clear).
+pub static FIELD_UID: embassy_sync::mutex::Mutex<
+    embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex,
+    heapless::Vec<u8, 10>,
+> = embassy_sync::mutex::Mutex::new(heapless::Vec::new());
+
+/// Publish the in-field tag's UID (empty slice = tag left the field).
+pub async fn set_field_uid(uid: &[u8]) {
+    let mut guard = FIELD_UID.lock().await;
+    guard.clear();
+    for &b in uid {
+        if guard.push(b).is_err() {
+            break;
+        }
+    }
+}
 
 /// Publish a new connection state for the audible progress beeps.
 pub fn set_conn_state(state: u8) {
@@ -115,7 +205,10 @@ const RECONNECT_TICKS: u32 = 15;
 /// first entry of each pattern is the leading beep; multi-tone patterns are
 /// separated at play time by [`TONE_GAP_MS`].
 pub const PATTERN_TABLE: &[(BeepEvent, &[Tone])] = &[
-    (BeepEvent::TagDetected, &[(2600, 60)]),
+    // Sightings are announced by the UID melody (see FIELD_UID), not a
+    // chirp — TagDetected remains as the wake-up event that pulls the piezo
+    // task out of its idle wait the moment a card lands.
+    (BeepEvent::TagDetected, &[]),
     (BeepEvent::AuthSent, &[(2600, 40)]),
     // Verdict: single short chirp. The relay click and the door itself are
     // the primary grant feedback; no fanfare after the tag has left.
@@ -281,13 +374,16 @@ mod embedded {
 
     /// Drain feedback events and play their patterns forever.
     ///
-    /// While a tag is in the field ([`TAG_IN_FIELD`]), the task drones a
-    /// continuous tone in short preemptible chunks: each chunk boundary
-    /// checks for queued events (a verdict chirp preempts the drone) and
-    /// for field-exit (the drone stops the moment the tag leaves). Between
-    /// events (1 s tick) the connection state drives audible progress:
-    /// single beep while joining Wi-Fi, double beep while joining MQTT, a
-    /// rising confirmation when online, and a slow beep every 15 s while
+    /// While a card is in the field, its UID-derived measure (see
+    /// [`generate_melody`]) repeats: the card audibly announces itself. The
+    /// TagDetected event (empty pattern) wakes the idle wait instantly on a
+    /// sighting so the melody starts without lag. Every beat awaits its
+    /// rest — the executor always gets a slice (no starvation) — and each
+    /// rest doubles as a checkpoint: field exit, card swap, or a queued
+    /// event (verdict chirp) preempts the measure. Between events (1 s
+    /// tick) the connection state drives audible progress: single beep
+    /// while joining Wi-Fi, double beep while joining MQTT, a rising
+    /// confirmation when online, and a slow beep every 15 s while
     /// reconnecting after a drop.
     pub async fn run(rx: PiezoReceiver, mut pins: PiezoPins) -> ! {
         pins.idle();
@@ -296,19 +392,28 @@ mod embedded {
         let mut tick: u32 = 0;
         let mut online_announced = false;
         loop {
-            // Continuous in-field drone: back-to-back chunks sound
-            // continuous; every chunk boundary is a preemption point.
-            // CRITICAL: play_tone busy-waits, so this loop MUST yield each
-            // iteration — a never-awaiting task starves the whole
-            // cooperative executor and the flag would never clear.
-            while TAG_IN_FIELD.load(core::sync::atomic::Ordering::Relaxed) {
-                if let Ok(event) = rx.try_receive() {
-                    let pattern = pattern_for(event);
-                    println!("[piezo] play {:?} ({} tone(s))", event, pattern.len());
-                    play_pattern(&mut pins, &pattern).await;
-                } else {
-                    play_tone(&mut pins, IN_FIELD_HZ, IN_FIELD_CHUNK_MS);
-                    embassy_futures::yield_now().await;
+            // In-field identity melody. Every beat awaits its rest — this
+            // loop always yields, never starves the executor.
+            loop {
+                let field = FIELD_UID.lock().await.clone();
+                if field.is_empty() {
+                    break;
+                }
+                for beat in generate_melody(&field) {
+                    if FIELD_UID.lock().await.as_slice() != field.as_slice() {
+                        break; // card left or swapped mid-measure
+                    }
+                    if let Ok(event) = rx.try_receive() {
+                        let pattern = pattern_for(event);
+                        if !pattern.is_empty() {
+                            println!("[piezo] play {:?} ({} tone(s))", event, pattern.len());
+                            play_pattern(&mut pins, &pattern).await;
+                        }
+                    }
+                    play_tone(&mut pins, beat.freq, beat.tone_duration_ms);
+                    if beat.rest_duration_ms > 0 {
+                        Timer::after(Duration::from_millis(beat.rest_duration_ms as u64)).await;
+                    }
                 }
             }
             match with_timeout(Duration::from_millis(500), rx.receive()).await {
@@ -408,6 +513,12 @@ mod tests {
     fn pattern_table_is_well_formed() {
         assert!(!PATTERN_TABLE.is_empty(), "pattern table must not be empty");
         for (event, tones) in PATTERN_TABLE {
+            // TagDetected is the documented exception: wake-up event only —
+            // sightings are announced by the UID melody, not a chirp.
+            if *event == BeepEvent::TagDetected {
+                assert!(tones.is_empty(), "TagDetected must stay a silent wake");
+                continue;
+            }
             assert!(!tones.is_empty(), "{event:?} has an empty pattern");
             for &(freq_hz, on_ms) in *tones {
                 assert!(
@@ -430,6 +541,9 @@ mod tests {
             "table has one entry per event"
         );
         for event in ALL_EVENTS {
+            if event == BeepEvent::TagDetected {
+                continue; // silent wake — see pattern_table_is_well_formed
+            }
             assert!(
                 !pattern_for(event).is_empty(),
                 "{event:?} has no pattern in the lookup"
@@ -458,5 +572,66 @@ mod tests {
             matches!(&overflow, Err(TrySendError::Full(BeepEvent::Granted))),
             "9th try_send must drop with Full, got {overflow:?}"
         );
+    }
+
+    #[test]
+    fn melody_beats_are_well_formed() {
+        for uid in [
+            &b""[..],
+            b"\x04\x87\x53\x62\x1e\x18\x90",
+            b"\x04\x5c\x64\x62\x1e\x18\x90",
+            b"\x11\x22\x33\x44",
+        ] {
+            for beat in generate_melody(uid) {
+                assert!(
+                    PENTATONIC_FREQS.contains(&beat.freq),
+                    "pitch {} Hz off the pentatonic scale",
+                    beat.freq
+                );
+                assert!(
+                    beat.tone_duration_ms == 100 || beat.tone_duration_ms == 200,
+                    "tone {} ms is neither eighth nor quarter",
+                    beat.tone_duration_ms
+                );
+                assert_eq!(
+                    beat.tone_duration_ms + beat.rest_duration_ms,
+                    BEAT_DURATION_MS,
+                    "beat must fill exactly one measure slot"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn melody_is_deterministic_and_uid_sensitive() {
+        let a = generate_melody(b"\x04\x87\x53\x62\x1e\x18\x90");
+        assert_eq!(a, generate_melody(b"\x04\x87\x53\x62\x1e\x18\x90"));
+        // Two real card UIDs: overwhelmingly unlikely to share a measure.
+        let b = generate_melody(b"\x04\x5c\x64\x62\x1e\x18\x90");
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn melody_digit_mapping_is_lsb_first_quarter_or_short() {
+        // Sequence 0: digit 0 -> pitch 0, quarter note (200 ms + 50 ms rest).
+        let m = melody_from_sequence(0);
+        assert!(m.iter().all(|b| b.freq == 1047 && b.tone_duration_ms == 200));
+
+        // Sequence 5: digit 5 -> pitch 0, eighth note + rest (100 + 150).
+        let m = melody_from_sequence(5);
+        assert_eq!(m[0].freq, 1047);
+        assert_eq!(m[0].tone_duration_ms, 100);
+        assert_eq!(m[0].rest_duration_ms, 150);
+
+        // Sequence 1234: digits extracted LSB-first 4,3,2,1 -> all quarters,
+        // pitches A6, G6, E6, D6 in that beat order.
+        let m = melody_from_sequence(1234);
+        let freqs: [u32; 4] = [m[0].freq, m[1].freq, m[2].freq, m[3].freq];
+        assert_eq!(freqs, [1760, 1568, 1319, 1175]);
+        assert!(m.iter().all(|b| b.tone_duration_ms == 200));
+
+        // Sequence 9999: digit 9 -> pitch 4, short, every beat.
+        let m = melody_from_sequence(9999);
+        assert!(m.iter().all(|b| b.freq == 1760 && b.tone_duration_ms == 100));
     }
 }

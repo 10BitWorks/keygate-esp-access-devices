@@ -155,9 +155,9 @@ async fn nfc_runner<I: pn532::Interface>(
                 continue;
             } else if is_claim_wait {
                 // Keep target 1 intact while verifier computes diversified key!
-                // No polling in this state: clear the in-field flag so the
-                // drone cannot outlive the tap that armed the window.
-                piezo::set_tag_in_field(false);
+                // No polling in this state: clear the field UID so the melody
+                // cannot outlive the tap that armed the window.
+                piezo::set_field_uid(&[]).await;
                 Timer::after(Duration::from_millis(15)).await;
                 continue;
             }
@@ -166,9 +166,14 @@ async fn nfc_runner<I: pn532::Interface>(
             let tag_opt = nfc::poll_tag(pn);
             let obs = tag_opt.as_ref().map(tag_debounce::TagObservation::from_tag_info);
 
-            // Continuous in-field tone: driven directly by the poll result,
-            // so it stops the instant the tag leaves the RF field.
-            piezo::set_tag_in_field(tag_opt.is_some());
+            // In-field identity melody source: the held card's UID drives
+            // its signature measure, and an empty field silences it.
+            match &tag_opt {
+                Some(t) => {
+                    piezo::set_field_uid(&t.uid[..t.uid_len as usize]).await;
+                }
+                None => piezo::set_field_uid(&[]).await,
+            }
 
             if let Some(ev) = debounce.observe(now, obs) {
                 // Audible feedback: immediate beep on every physical tag detection.
@@ -299,8 +304,8 @@ async fn execute_tag_provisioning<I: pn532::Interface>(
 ) {
     println!("[prov] provisioning tag (job {})...", job_id);
     // The write-progress tone (conn::PROV_WRITING) owns the sound here; the
-    // in-field drone must not fight it (the tag obviously stays in the field).
-    piezo::set_tag_in_field(false);
+    // identity melody must not fight it (the tag obviously stays in field).
+    piezo::set_field_uid(&[]).await;
     piezo::set_conn_state(piezo::conn::PROV_WRITING);
     status_led::set_state(status_led::LedState::TagReading);
 
