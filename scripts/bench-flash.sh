@@ -2,7 +2,15 @@
 set -euo pipefail
 
 # KeyGate ESP32 Bench Flashing & Capture Helper
-# Interactive Zenity-gated workflow optimized for classic ESP32 devkits with CH340 adapters.
+#
+# FLASH PATH: esptool --no-stub (ROM commands only). The stub path
+# (espflash, esptool with stub) dies on this bench — stub start / MemBegin
+# timeouts cluster regardless of entry method (button dance, DTR/RTS auto,
+# in-process), while ROM-only commands (erase/write/verify) have succeeded
+# in every session. Cost: ~4-5 min per flash at 57600 baud. Benefit: fully
+# unattended, no BOOT dance, no stub.
+# scripts/force-download.py 'release' boots the app afterwards (the write
+# leaves the chip in download mode).
 
 export PATH="$HOME/.guix-profile/bin:$PATH"
 export DISPLAY="${DISPLAY:-:0}"
@@ -18,8 +26,6 @@ fi
 
 # Archive the whole session (flash + boot capture) under bench-logs/, named
 # by the commit under test, so results from any build stay attributable.
-# Folder is gitignored; curated excerpts get committed into docs/evidence
-# by hand when they matter.
 SHA=$(git rev-parse --short HEAD 2>/dev/null || echo nogit)
 mkdir -p bench-logs
 LOG="bench-logs/${SHA}-$(date -u +%Y%m%d-%H%M%S).log"
@@ -45,66 +51,46 @@ fi
 echo "Target port: $PORT"
 echo "Session log: $LOG (commit $SHA)"
 
-# Check if chip is already in download/bootloader mode before prompting
-is_in_download_mode() {
-    timeout 2 espflash board-info --chip esp32 --port "$PORT" --before no-reset -B 57600 >/dev/null 2>&1
-}
+# esptool venv (self-provisioning; uv is in the guix profile).
+ESPTOOL_VEN="${ESPTOOL_VEN:-/tmp/opencode/esp-venv}"
+if ! "$ESPTOOL_VEN/bin/python" -m esptool version >/dev/null 2>&1; then
+    echo "Provisioning esptool venv at $ESPTOOL_VEN..."
+    uv venv "$ESPTOOL_VEN"
+    uv pip install --python "$ESPTOOL_VEN/bin/python" esptool
+fi
+ESP="$ESPTOOL_VEN/bin/python -m esptool"
+
+# Build the app image (same header espflash produced: DIO / 40 MHz / 4 MB).
+rm -f /tmp/keygate-app.bin
+echo "=== Building app image (elf2image) ==="
+$ESP --chip esp32 elf2image --flash-mode dio --flash-freq 40m --flash-size 4MB \
+    --output /tmp/keygate-app.bin "$ELF" || { echo "elf2image failed"; exit 1; }
 
 FLASHED=1
-
-# Phase 1 — fully automatic (no buttons). scripts/force-download.py enters
-# download mode via the esptool DTR/RTS sequence (atomic DTR/RTS swap —
-# verified by ROM banner boot:0x3 DOWNLOAD_BOOT on this official DevKitC;
-# the earlier failures were a sleep between the swaps, not hardware).
 for i in 1 2 3; do
-    echo "=== Flash attempt $i (automatic boot-mode entry) ==="
-    if python3 scripts/force-download.py "$PORT" \
-       && timeout 300 espflash flash --chip esp32 --port "$PORT" --before no-reset -B 57600 --no-verify --partition-table partitions.csv --erase-parts otadata --target-app-partition ota_0 "$ELF"; then
-        echo "Flash succeeded on attempt $i (buttonless)!"
+    echo "=== Flash attempt $i (esptool no-stub, ~4-5 min) ==="
+    if timeout 120 $ESP --chip esp32 --port "$PORT" --baud 57600 \
+            --before default-reset --after no-reset --no-stub \
+            erase-region 0xd000 0x2000 \
+       && timeout 900 $ESP --chip esp32 --port "$PORT" --baud 57600 \
+            --before default-reset --after no-reset --no-stub \
+            write-flash 0x10000 /tmp/keygate-app.bin; then
+        echo "Flash succeeded on attempt $i (no-stub)!"
         FLASHED=0
         break
     fi
-    sleep 1
+    echo "attempt $i failed — retrying."
+    sleep 2
 done
 
-# Phase 2 (fallback) — FLASH-WHEN-READY watcher: zero coordination. Retries
-# espflash every few seconds; whenever a manual BOOT dance happens (HOLD
-# BOOT -> TAP EN -> RELEASE, hold not required), the next attempt catches
-# it. Used only if automatic entry failed 3x (e.g. USB line stuck).
 if [ "$FLASHED" -ne 0 ]; then
-    ARM_SECONDS="${KEYGATE_ARM_SECONDS:-420}"
-    echo "=== Auto entry failed — FLASH-WHEN-READY armed for ${ARM_SECONDS}s ==="
-    echo "    Do the BOOT dance at ANY time: HOLD BOOT -> TAP EN -> RELEASE."
-    command -v notify-send >/dev/null && notify-send "KeyGate flasher armed" \
-        "Auto entry failed. Do the BOOT dance any time in the next $((ARM_SECONDS / 60)) min." || true
-    if [ -n "${DISPLAY:-}" ] && command -v zenity >/dev/null; then
-        zenity --info --timeout=20 --title="KeyGate: flasher armed" \
-            --text="Automatic entry failed.\n\nWatcher armed for $((ARM_SECONDS / 60)) min.\nDo the BOOT dance at ANY time:\nHOLD BOOT -> TAP EN -> RELEASE" 2>/dev/null || true &
-    fi
-
-    DEADLINE=$(( $(date +%s) + ARM_SECONDS ))
-    ATTEMPT=0
-    while [ "$(date +%s)" -lt "$DEADLINE" ]; do
-        ATTEMPT=$((ATTEMPT + 1))
-        if OUT=$(timeout 120 espflash flash --chip esp32 --port "$PORT" --before no-reset -B 57600 --no-verify --partition-table partitions.csv --erase-parts otadata --target-app-partition ota_0 "$ELF" 2>&1); then
-            echo "$OUT" | rtk grep -vE "boot:|esp_image|ets Jul|rst:0x1|configsip|mode:DIO|load:|ho 8|entry |clk_drv|d_drv|SPIWP" || true
-            echo "Flash succeeded on watcher attempt $ATTEMPT!"
-            FLASHED=0
-            break
-        fi
-        sleep 3
-    done
-fi
-
-if [ "$FLASHED" -ne 0 ]; then
-    echo "All flash paths failed."
     zenity --error --timeout=30 --title="KeyGate: Flash Failed" \
-        --text="Automatic entry failed and no BOOT dance was detected." 2>/dev/null || true
+        --text="No-stub flash failed 3 times. Power-cycle the bench and retry." 2>/dev/null || true
     exit 1
 fi
 
-# Entry left IO0 held low (glitch self-heal, see force-download.py); release
-# the strap and tap EN so the freshly flashed app boots before the capture.
+# The write leaves the chip in download mode (IO0 strap held); release and
+# tap EN so the freshly flashed app boots before the capture.
 python3 scripts/force-download.py "$PORT" release || true
 
 if zenity --question --title="KeyGate: Serial Monitoring" \
