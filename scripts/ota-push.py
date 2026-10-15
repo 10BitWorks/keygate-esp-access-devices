@@ -42,8 +42,7 @@ state = {"logs": [], "statuses": [], "connected": False, "subbed": False}
 
 def on_connect(c, userdata, flags, rc, props=None):
     state["connected"] = True
-    c.subscribe(log_t, qos=1)
-    c.subscribe(status_t, qos=1)
+    c.subscribe([(log_t, 1), (status_t, 1)])
 
 
 def on_subscribe(c, userdata, mid, reason_codes, props=None):
@@ -73,7 +72,7 @@ for _ in range(50):
 if not state["subbed"]:
     print("broker connect/subscribe failed")
     sys.exit(1)
-time.sleep(0.5)
+time.sleep(1.0)
 
 print(f"meta -> {meta_t}")
 cli.publish(meta_t, json.dumps({"size": len(data), "crc32": f"{crc:08x}"}, separators=(',', ':')), qos=1).wait_for_publish()

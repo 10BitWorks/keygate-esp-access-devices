@@ -480,7 +480,8 @@ pub fn setup(
     // Passive piezo disc on GPIO9, driven by LEDC hardware PWM (zero CPU
     // during tones). GPIO10 (old bridge leg B) idles low, forgotten so the
     // pad keeps its level for the life of the process.
-    let ledc = esp_hal::ledc::Ledc::new(peripherals.LEDC);
+    let mut ledc = esp_hal::ledc::Ledc::new(peripherals.LEDC);
+    ledc.set_global_slow_clock(esp_hal::ledc::LSGlobalClkSource::APBClk);
     // The channel stores one shared timer reference at configure time
     // (frozen); a second aliased handle lives in LedcTone for per-note
     // frequency changes — esp-hal Timer handles alias the same registers.
@@ -596,7 +597,8 @@ pub fn setup(
     // Passive piezo disc on GPIO32, driven by LEDC hardware PWM (zero CPU
     // during tones). GPIO33 (old bridge leg B) idles low, forgotten so the
     // pad keeps its level for the life of the process.
-    let ledc = esp_hal::ledc::Ledc::new(peripherals.LEDC);
+    let mut ledc = esp_hal::ledc::Ledc::new(peripherals.LEDC);
+    ledc.set_global_slow_clock(esp_hal::ledc::LSGlobalClkSource::APBClk);
     // The channel stores one shared timer reference at configure time
     // (frozen); a second aliased handle lives in LedcTone for per-note
     // frequency changes — esp-hal Timer handles alias the same registers.
