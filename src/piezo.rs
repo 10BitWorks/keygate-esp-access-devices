@@ -101,7 +101,7 @@ pub fn set_tag_in_field(on: bool) {
 const IN_FIELD_HZ: u32 = 2100;
 /// Chunk length (ms): back-to-back chunks sound continuous, and each
 /// boundary is a preemption/exit checkpoint.
-const IN_FIELD_CHUNK_MS: u32 = 250;
+const IN_FIELD_CHUNK_MS: u32 = 50;
 
 /// Publish a new connection state for the audible progress beeps.
 pub fn set_conn_state(state: u8) {
@@ -298,6 +298,9 @@ mod embedded {
         loop {
             // Continuous in-field drone: back-to-back chunks sound
             // continuous; every chunk boundary is a preemption point.
+            // CRITICAL: play_tone busy-waits, so this loop MUST yield each
+            // iteration — a never-awaiting task starves the whole
+            // cooperative executor and the flag would never clear.
             while TAG_IN_FIELD.load(core::sync::atomic::Ordering::Relaxed) {
                 if let Ok(event) = rx.try_receive() {
                     let pattern = pattern_for(event);
@@ -305,6 +308,7 @@ mod embedded {
                     play_pattern(&mut pins, &pattern).await;
                 } else {
                     play_tone(&mut pins, IN_FIELD_HZ, IN_FIELD_CHUNK_MS);
+                    embassy_futures::yield_now().await;
                 }
             }
             match with_timeout(Duration::from_millis(500), rx.receive()).await {
