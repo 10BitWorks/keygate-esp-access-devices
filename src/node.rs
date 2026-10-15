@@ -228,6 +228,7 @@ async fn nfc_runner<I: pn532::Interface>(
                             };
                             if let Some((job_id, key_hex)) = prov_ctx {
                                 execute_tag_provisioning(pn, &job_id, &key_hex).await;
+                                let _ = nfc::release_target(pn, 1);
                             }
                         }
                         _ => {
@@ -288,6 +289,9 @@ async fn nfc_runner<I: pn532::Interface>(
                                         status_led::set_state(status_led::LedState::MqttConnected);
                                     }
                                 }
+                                // Release target 1 so the card returns to idle state and can
+                                // continue to be detected on subsequent poll cycles while held.
+                                let _ = nfc::release_target(pn, 1);
                             }
                         }
                     }

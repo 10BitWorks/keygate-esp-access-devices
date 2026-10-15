@@ -30,7 +30,7 @@ use esp_storage::FlashStorage;
 /// Partition geometry (partitions.csv, auto-placed offsets confirmed by
 /// the second-stage boot log and a live otadata decode).
 const OTADATA_OFF: u32 = 0xd000;
-const OTA_SLOTS: [(u32, u32); 2] = [(0x1000_0, 0x1c2_000), (0x1d2_000, 0x1c2_000)];
+const OTA_SLOTS: [(u32, u32); 2] = [(0x1_0000, 0x1c_2000), (0x1e_0000, 0x1c_2000)];
 const SECTOR: u32 = 0x1000;
 
 /// Streaming transfer CRC32 — zlib-compatible so the host script's

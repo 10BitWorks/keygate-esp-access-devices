@@ -136,14 +136,15 @@ impl Clone for Beep {
 impl Copy for Beep {}
 
 /// Bugle fanfare played on connecting: Eb5 -> Ab5 -> C6 -> Eb6 -> (rest) -> C6 -> Eb6 (long).
-/// Modeled from `sound/bugle.mid` at 220 BPM (136 ms steps).
+/// Modeled from `sound/bugle.mid` at half-tempo / full-beat steps (272 ms per note):
+/// the rising arpeggio takes ~1.08s, matching the LMMS project perception.
 pub const BUGLE_CALL: &[Beep] = &[
-    Beep { freq: 622, tone_duration_ms: 136, rest_duration_ms: 0 },
-    Beep { freq: 831, tone_duration_ms: 136, rest_duration_ms: 0 },
-    Beep { freq: 1047, tone_duration_ms: 136, rest_duration_ms: 0 },
-    Beep { freq: 1245, tone_duration_ms: 136, rest_duration_ms: 136 },
-    Beep { freq: 1047, tone_duration_ms: 136, rest_duration_ms: 0 },
-    Beep { freq: 1245, tone_duration_ms: 273, rest_duration_ms: 0 },
+    Beep { freq: 622, tone_duration_ms: 272, rest_duration_ms: 0 },
+    Beep { freq: 831, tone_duration_ms: 272, rest_duration_ms: 0 },
+    Beep { freq: 1047, tone_duration_ms: 272, rest_duration_ms: 0 },
+    Beep { freq: 1245, tone_duration_ms: 272, rest_duration_ms: 180 },
+    Beep { freq: 1047, tone_duration_ms: 272, rest_duration_ms: 0 },
+    Beep { freq: 1245, tone_duration_ms: 545, rest_duration_ms: 0 },
 ];
 
 /// FNV-1a 32-bit hash of the raw UID bytes.
@@ -608,13 +609,13 @@ mod tests {
             .iter()
             .map(|b| b.tone_duration_ms + b.rest_duration_ms)
             .sum();
-        // 6 x 136 ms slots + 1 x 273 ms (double note) = 1089 ms (~1.09 s, matches 4 measures @ 220 BPM)
-        assert_eq!(total_ms, 1089);
+        // 4 x 272 ms (rising arpeggio ~1.08s) + 180 ms rest + 272 ms + 545 ms = 2085 ms (~2.08s)
+        assert_eq!(total_ms, 2085);
         assert_eq!(BUGLE_CALL[0].freq, 622); // Eb5
         assert_eq!(BUGLE_CALL[1].freq, 831); // Ab5
         assert_eq!(BUGLE_CALL[2].freq, 1047); // C6
         assert_eq!(BUGLE_CALL[3].freq, 1245); // Eb6
-        assert_eq!(BUGLE_CALL[3].rest_duration_ms, 136); // breath rest
+        assert_eq!(BUGLE_CALL[3].rest_duration_ms, 180); // breath rest
         assert_eq!(BUGLE_CALL[4].freq, 1047); // C6
         assert_eq!(BUGLE_CALL[5].freq, 1245); // Eb6
     }

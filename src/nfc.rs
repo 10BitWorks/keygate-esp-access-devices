@@ -336,6 +336,23 @@ pub fn in_data_exchange<'a, I: pn532::Interface, T: CountDown<Time = fugit::Mill
     Ok(&resp[1..])
 }
 
+/// Release a selected target in the PN532 (InRelease).
+///
+/// Returns target 1 (or 2) back to idle state on both the PN532 and the card,
+/// allowing subsequent InListPassiveTarget calls to smoothly see the resting card.
+pub fn release_target<I: pn532::Interface, T: CountDown<Time = fugit::MillisDurationU32>, const N: usize>(
+    pn532: &mut Pn532<I, T, N>,
+    target: u8,
+) -> Result<(), NfcError> {
+    let req = match target {
+        1 => &Request::RELEASE_TAG_1,
+        2 => &Request::RELEASE_TAG_2,
+        _ => &Request::RELEASE_TAG_1,
+    };
+    let _ = pn532.process(req, 1, fugit::MillisDurationU32::from_ticks(100));
+    Ok(())
+}
+
 
 
 
