@@ -68,12 +68,19 @@ pub struct OtaMeta {
 /// Parse `{"size":N,"crc32":"XXXXXXXX"}` without heap allocation.
 pub fn parse_meta(payload: &[u8]) -> Option<OtaMeta> {
     let s = core::str::from_utf8(payload).ok()?;
-    let size_pos = s.find("\"size\":")?;
-    let after = &s[size_pos + 7..];
-    let size_end = after.find([',', '}'])?;
-    let size: u32 = after[..size_end].trim().parse().ok()?;
-    let crc_pos = s.find("\"crc32\":\"")?;
-    let crc_hex = &s[crc_pos + 9..];
+    let size_pos = s.find("\"size\"")?;
+    let after_size = &s[size_pos + 6..];
+    let colon_pos = after_size.find(':')?;
+    let after_colon = &after_size[colon_pos + 1..];
+    let size_end = after_colon.find([',', '}'])?;
+    let size: u32 = after_colon[..size_end].trim().parse().ok()?;
+
+    let crc_key_pos = s.find("\"crc32\"")?;
+    let after_crc = &s[crc_key_pos + 7..];
+    let colon_crc = after_crc.find(':')?;
+    let after_colon_crc = after_crc[colon_crc + 1..].trim_start();
+    let quote_start = after_colon_crc.find('"')?;
+    let crc_hex = &after_colon_crc[quote_start + 1..];
     OtaMeta {
         size,
         crc32: hex8(crc_hex.get(..8)?)?,

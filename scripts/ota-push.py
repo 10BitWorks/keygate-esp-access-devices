@@ -37,13 +37,17 @@ end_t = f"access/{DEVICE}/ota/end"
 log_t = f"access/{DEVICE}/log"
 status_t = f"access/{DEVICE}/ota/status"
 
-state = {"logs": [], "statuses": [], "connected": False}
+state = {"logs": [], "statuses": [], "connected": False, "subbed": False}
 
 
 def on_connect(c, userdata, flags, rc, props=None):
     state["connected"] = True
     c.subscribe(log_t, qos=1)
     c.subscribe(status_t, qos=1)
+
+
+def on_subscribe(c, userdata, mid, reason_codes, props=None):
+    state["subbed"] = True
 
 
 def on_message(c, userdata, msg):
@@ -58,20 +62,21 @@ def on_message(c, userdata, msg):
 
 cli = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="ota-push")
 cli.on_connect = on_connect
+cli.on_subscribe = on_subscribe
 cli.on_message = on_message
 cli.connect(BROKER, 1883, keepalive=30)
 cli.loop_start()
 for _ in range(50):
-    if state["connected"]:
+    if state["subbed"]:
         break
     time.sleep(0.1)
-if not state["connected"]:
-    print("broker connect failed")
+if not state["subbed"]:
+    print("broker connect/subscribe failed")
     sys.exit(1)
 time.sleep(0.5)
 
 print(f"meta -> {meta_t}")
-cli.publish(meta_t, json.dumps({"size": len(data), "crc32": f"{crc:08x}"}), qos=1).wait_for_publish()
+cli.publish(meta_t, json.dumps({"size": len(data), "crc32": f"{crc:08x}"}, separators=(',', ':')), qos=1).wait_for_publish()
 
 print("waiting for device to finish batched erase (status: receiving)...")
 t_wait = time.time()
