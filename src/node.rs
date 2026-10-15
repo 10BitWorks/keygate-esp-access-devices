@@ -28,6 +28,7 @@ use crate::{
     provision_flow::{self, ProvAction, ProvMachine, ProvState},
     relay, status_led, tag_debounce,
 };
+use crate::ota;
 use crate::piezo::{self, BeepEvent};
 use crate::piezo::PIEZO_CHANNEL as PZ;
 
@@ -404,6 +405,9 @@ async fn mqtt_runner(
     let mut job_topic = heapless::String::<96>::new();
     let mut claim_topic = heapless::String::<96>::new();
     let mut done_topic = heapless::String::<96>::new();
+    let mut ota_meta_topic = heapless::String::<96>::new();
+    let mut ota_data_topic = heapless::String::<96>::new();
+    let mut ota_end_topic = heapless::String::<96>::new();
 
     let _ = write!(&mut auth_topic, "access/{}/auth", config::DEVICE_ID);
     let _ = write!(&mut cmd_topic, "access/{}/cmd", config::DEVICE_ID);
@@ -412,6 +416,9 @@ async fn mqtt_runner(
     let _ = write!(&mut job_topic, "writer/{}/job", config::DEVICE_ID);
     let _ = write!(&mut claim_topic, "writer/{}/claim", config::DEVICE_ID);
     let _ = write!(&mut done_topic, "writer/{}/done", config::DEVICE_ID);
+    let _ = write!(&mut ota_meta_topic, "access/{}/ota/meta", config::DEVICE_ID);
+    let _ = write!(&mut ota_data_topic, "access/{}/ota/data", config::DEVICE_ID);
+    let _ = write!(&mut ota_end_topic, "access/{}/ota/end", config::DEVICE_ID);
 
     let broker_port: u16 = config::MQTT_PORT.parse().unwrap_or(1883);
     let mut backoff_secs: u64 = 1;
@@ -611,24 +618,23 @@ async fn mqtt_runner(
                     println!("[mqtt] presence publish failed: {:?}", e);
                 }
 
-                // Subscribe to command and provisioning topics.
-                let cmd_filters = [TopicFilter::new(cmd_topic.as_str())];
-                if let Err(e) = session.subscribe(&cmd_filters, &[]).await {
-                    println!("[mqtt] subscribe cmd failed: {:?}", e);
+                // Subscribe to command, provisioning and OTA topics (one
+                // SUBSCRIBE carries them all).
+                let filters = [
+                    TopicFilter::new(cmd_topic.as_str()),
+                    TopicFilter::new(job_topic.as_str()),
+                    TopicFilter::new(ota_meta_topic.as_str()),
+                    TopicFilter::new(ota_data_topic.as_str()),
+                    TopicFilter::new(ota_end_topic.as_str()),
+                ];
+                if let Err(e) = session.subscribe(&filters, &[]).await {
+                    println!("[mqtt] subscribe failed: {:?}", e);
                     status_led::set_state(status_led::LedState::DeniedOrOffline);
                     Timer::after(Duration::from_secs(next_backoff(&mut backoff_secs))).await;
                     continue;
                 }
 
-                let job_filters = [TopicFilter::new(job_topic.as_str())];
-                if let Err(e) = session.subscribe(&job_filters, &[]).await {
-                    println!("[mqtt] subscribe job failed: {:?}", e);
-                    status_led::set_state(status_led::LedState::DeniedOrOffline);
-                    Timer::after(Duration::from_secs(next_backoff(&mut backoff_secs))).await;
-                    continue;
-                }
-
-                println!("[mqtt] both subscriptions live — node fully online!");
+                println!("[mqtt] all subscriptions live — node fully online!");
                 blog!("subscriptions live — online");
                 // Audible confirmation: online (plays only when truly online & subscribed!).
                 piezo::set_conn_state(piezo::conn::ONLINE);
@@ -677,7 +683,13 @@ async fn mqtt_runner(
                             let topic = msg.topic();
                             let payload = msg.payload();
 
-                            if topic == cmd_topic.as_str() {
+                            if topic == ota_meta_topic.as_str() {
+                                ota::on_meta(payload).await;
+                            } else if topic == ota_data_topic.as_str() {
+                                ota::on_data(payload).await;
+                            } else if topic == ota_end_topic.as_str() {
+                                ota::on_end().await;
+                            } else if topic == cmd_topic.as_str() {
                                 if let Ok(c) = cmd::parse_cmd_slice(payload) {
                                     if c.grant {
                                         // Door timing is LOCAL policy — the

@@ -40,8 +40,8 @@ serde-json-core = "0.5"
 
 [features]
 default = ["chip-esp32c6", "board-xiao-c6"]
-chip-esp32c6 = ["dep:esp-hal", "esp-hal/esp32c6", "dep:esp-backtrace", "esp-backtrace/esp32c6", "dep:esp-println", "esp-println/esp32c6", "dep:esp-radio", "esp-radio/esp32c6", "dep:esp-rtos", "esp-rtos/esp32c6", "dep:esp-bootloader-esp-idf", "esp-bootloader-esp-idf/esp32c6"]
-chip-esp32 = ["dep:esp-hal", "esp-hal/esp32", "dep:esp-backtrace", "esp-backtrace/esp32", "dep:esp-println", "esp-println/esp32", "dep:esp-radio", "esp-radio/esp32", "dep:esp-rtos", "esp-rtos/esp32", "dep:esp-bootloader-esp-idf", "esp-bootloader-esp-idf/esp32"]
+chip-esp32c6 = ["dep:esp-hal", "esp-hal/esp32c6", "dep:esp-backtrace", "esp-backtrace/esp32c6", "dep:esp-println", "esp-println/esp32c6", "dep:esp-radio", "esp-radio/esp32c6", "dep:esp-rtos", "esp-rtos/esp32c6", "dep:esp-bootloader-esp-idf", "esp-bootloader-esp-idf/esp32c6", "dep:esp-storage", "esp-storage/esp32c6"]
+chip-esp32 = ["dep:esp-hal", "esp-hal/esp32", "dep:esp-backtrace", "esp-backtrace/esp32", "dep:esp-println", "esp-println/esp32", "dep:esp-radio", "esp-radio/esp32", "dep:esp-rtos", "esp-rtos/esp32", "dep:esp-bootloader-esp-idf", "esp-bootloader-esp-idf/esp32", "dep:esp-storage", "esp-storage/esp32"]
 board-xiao-c6 = []
 board-esp32-devkit-door = []
 # Bench diagnostics: wire-level spy (write frames, STATUS transitions, response dumps,
@@ -51,6 +51,8 @@ nfc-spy = []
 [target.'cfg(any(target_arch = "riscv32", target_arch = "xtensa"))'.dependencies]
 # ESP32 HAL and runtime
 esp-hal = { version = "1.1", optional = true, features = ["unstable"] }
+esp-storage = { version = "0.8", optional = true, default-features = false, features = ["critical-section"] }
+embedded-storage = "0.3"
 esp-backtrace = { version = "0.19", optional = true, features = ["panic-handler", "println"] }
 esp-println = { version = "0.17", optional = true, default-features = false, features = ["auto"] }
 esp-radio = { version = "0.18.0", optional = true, features = ["wifi", "unstable"] }

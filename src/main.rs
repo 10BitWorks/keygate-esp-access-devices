@@ -23,6 +23,7 @@ mod config;
 mod nfc;
 mod node;
 mod ntag424;
+mod ota;
 mod piezo;
 mod platform;
 mod provision;
@@ -61,6 +62,7 @@ async fn main(spawner: Spawner) -> ! {
 
     // 3. Initialize board and platform seams.
     let setup = board::setup(peripherals);
+    ota::init_flash(setup.flash).await;
 
     // 4. Spawn the status LED and relay tasks.
     //    Each task takes ownership of its pin.

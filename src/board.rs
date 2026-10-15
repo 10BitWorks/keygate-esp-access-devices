@@ -75,6 +75,7 @@ pub struct Setup<I: pn532::Interface, T: piezo::ToneDriver> {
     pub relay_pin: esp_hal::gpio::Output<'static>,
     pub led_pin: esp_hal::gpio::Output<'static>,
     pub piezo_tone: T,
+    pub flash: esp_storage::FlashStorage<'static>,
     // Consumed by the node feedback hooks (task T7), which receive this sender
     // through `node::run`. Until those hooks land the field is intentionally
     // unread; silence the dead-code lint the same way `board.rs` does elsewhere.
@@ -508,6 +509,7 @@ pub fn setup(
         timer: timer_for_freq,
         ch: ch0,
     };
+    let flash = esp_storage::FlashStorage::new(peripherals.FLASH);
     core::mem::forget(Output::new(
         peripherals.GPIO10,
         Level::Low,
@@ -551,6 +553,7 @@ pub fn setup(
         relay_pin,
         led_pin,
         piezo_tone,
+        flash,
         piezo_tx: piezo::PIEZO_CHANNEL.sender(),
         wifi_controller: net_parts.wifi_controller,
         stack: net_parts.stack,
@@ -613,6 +616,7 @@ pub fn setup(
         timer: timer_for_freq,
         ch: ch0,
     };
+    let flash = esp_storage::FlashStorage::new(peripherals.FLASH);
     core::mem::forget(Output::new(
         peripherals.GPIO33,
         Level::Low,
@@ -676,6 +680,7 @@ pub fn setup(
         relay_pin,
         led_pin,
         piezo_tone,
+        flash,
         piezo_tx: piezo::PIEZO_CHANNEL.sender(),
         wifi_controller: net_parts.wifi_controller,
         stack: net_parts.stack,
