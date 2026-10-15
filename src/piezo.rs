@@ -99,8 +99,9 @@ pub static CONN_STATE: core::sync::atomic::AtomicU8 =
 /// Standard pentatonic frequencies in Hz (C6, D6, E6, G6, A6).
 pub const PENTATONIC_FREQS: [u32; 5] = [1047, 1175, 1319, 1568, 1760];
 
-/// One beat: a quarter note (200 ms tone) or a short note (100 ms) plus rest.
-pub const BEAT_DURATION_MS: u32 = 250;
+/// One beat: a quarter note (400 ms tone) or a short note (160 ms) plus rest.
+/// 400 ms (150 BPM) makes each note clearly audible and distinct.
+pub const BEAT_DURATION_MS: u32 = 400;
 
 pub struct Beep {
     pub freq: u32,
@@ -134,6 +135,17 @@ impl Clone for Beep {
 }
 impl Copy for Beep {}
 
+/// Bugle fanfare played on connecting: Eb5 -> Ab5 -> C6 -> Eb6 -> (rest) -> C6 -> Eb6 (long).
+/// Modeled from `sound/bugle.mid` at 220 BPM (136 ms steps).
+pub const BUGLE_CALL: &[Beep] = &[
+    Beep { freq: 622, tone_duration_ms: 136, rest_duration_ms: 0 },
+    Beep { freq: 831, tone_duration_ms: 136, rest_duration_ms: 0 },
+    Beep { freq: 1047, tone_duration_ms: 136, rest_duration_ms: 0 },
+    Beep { freq: 1245, tone_duration_ms: 136, rest_duration_ms: 136 },
+    Beep { freq: 1047, tone_duration_ms: 136, rest_duration_ms: 0 },
+    Beep { freq: 1245, tone_duration_ms: 273, rest_duration_ms: 0 },
+];
+
 /// FNV-1a 32-bit hash of the raw UID bytes.
 fn hash_uid(uid: &[u8]) -> u32 {
     let mut hash: u32 = 2166136261;
@@ -160,9 +172,9 @@ fn melody_from_sequence(mut sequence_val: u32) -> [Beep; 4] {
         let pitch_index = (digit % 5) as usize;
         let is_short = digit >= 5;
 
-        // Quarters touch: a quarter note fills the whole 250 ms beat
-        // (no rest); eighths are 100 ms followed by a 150 ms rest.
-        let tone_duration = if is_short { 100 } else { 250 };
+        // Quarters touch: a quarter note fills the whole 400 ms beat
+        // (no rest); eighths are 160 ms followed by a 240 ms rest.
+        let tone_duration = if is_short { 160 } else { 400 };
 
         *beat = Beep {
             freq: PENTATONIC_FREQS[pitch_index],
@@ -211,7 +223,8 @@ pub const PATTERN_TABLE: &[(BeepEvent, &[Tone])] = &[
     // chirp — TagDetected remains as the wake-up event that pulls the piezo
     // task out of its idle wait the moment a card lands.
     (BeepEvent::TagDetected, &[]),
-    (BeepEvent::AuthSent, &[(2600, 40)]),
+    // Auth request: silent so it does not interrupt the card's melody.
+    (BeepEvent::AuthSent, &[]),
     // Verdict: single short chirp. The relay click and the door itself are
     // the primary grant feedback; no fanfare after the tag has left.
     (BeepEvent::Granted, &[(3200, 100)]),
@@ -318,6 +331,17 @@ mod embedded {
         tone.stop();
     }
 
+    /// Play an exact melody of notes and rests without synthetic gaps.
+    async fn play_melody<T: ToneDriver>(tone: &mut T, melody: &[Beep]) {
+        for beat in melody {
+            play_tone(tone, beat.freq, beat.tone_duration_ms).await;
+            if beat.rest_duration_ms > 0 {
+                Timer::after(Duration::from_millis(beat.rest_duration_ms as u64)).await;
+            }
+        }
+        tone.stop();
+    }
+
     fn conn_state() -> u8 {
         super::CONN_STATE.load(core::sync::atomic::Ordering::Relaxed)
     }
@@ -392,21 +416,7 @@ mod embedded {
                         super::conn::ONLINE => {
                             if !online_announced {
                                 online_announced = true;
-                                // Classic "Charge!" bugle fanfare: G - C - E - G^ - E - G^!
-                                // 4th/5th notes halved vs the original dotted rhythm, whole
-                                // thing at 0.8x duration (20% faster). Base was 40ms.
-                                play_pattern(
-                                    &mut tone,
-                                    &[
-                                        (1568, 32),
-                                        (2093, 32),
-                                        (2637, 32),
-                                        (3136, 28),
-                                        (2637, 16),
-                                        (3136, 104),
-                                    ],
-                                )
-                                .await;
+                                play_melody(&mut tone, BUGLE_CALL).await;
                             }
                         }
                         super::conn::RECONNECT => {
@@ -465,10 +475,10 @@ mod tests {
     fn pattern_table_is_well_formed() {
         assert!(!PATTERN_TABLE.is_empty(), "pattern table must not be empty");
         for (event, tones) in PATTERN_TABLE {
-            // TagDetected is the documented exception: wake-up event only —
-            // sightings are announced by the UID melody, not a chirp.
-            if *event == BeepEvent::TagDetected {
-                assert!(tones.is_empty(), "TagDetected must stay a silent wake");
+            // TagDetected and AuthSent are silent so as not to interrupt
+            // the in-field card melody.
+            if *event == BeepEvent::TagDetected || *event == BeepEvent::AuthSent {
+                assert!(tones.is_empty(), "{event:?} must stay silent");
                 continue;
             }
             assert!(!tones.is_empty(), "{event:?} has an empty pattern");
@@ -493,8 +503,8 @@ mod tests {
             "table has one entry per event"
         );
         for event in ALL_EVENTS {
-            if event == BeepEvent::TagDetected {
-                continue; // silent wake — see pattern_table_is_well_formed
+            if event == BeepEvent::TagDetected || event == BeepEvent::AuthSent {
+                continue; // silent wake / silent auth
             }
             assert!(
                 !pattern_for(event).is_empty(),
@@ -541,7 +551,7 @@ mod tests {
                     beat.freq
                 );
                 assert!(
-                    beat.tone_duration_ms == 100 || beat.tone_duration_ms == 250,
+                    beat.tone_duration_ms == 160 || beat.tone_duration_ms == 400,
                     "tone {} ms is neither eighth nor quarter",
                     beat.tone_duration_ms
                 );
@@ -566,28 +576,46 @@ mod tests {
     #[test]
     fn melody_digit_mapping_is_lsb_first_quarter_or_short() {
         // Sequence 0: digit 0 -> pitch 0, quarter note — quarters touch:
-        // full 250 ms beat, no rest.
+        // full 400 ms beat, no rest.
         let m = melody_from_sequence(0);
         assert!(
             m.iter()
-                .all(|b| b.freq == 1047 && b.tone_duration_ms == 250 && b.rest_duration_ms == 0)
+                .all(|b| b.freq == 1047 && b.tone_duration_ms == 400 && b.rest_duration_ms == 0)
         );
 
-        // Sequence 5: digit 5 -> pitch 0, eighth note + rest (100 + 150).
+        // Sequence 5: digit 5 -> pitch 0, eighth note + rest (160 + 240).
         let m = melody_from_sequence(5);
         assert_eq!(m[0].freq, 1047);
-        assert_eq!(m[0].tone_duration_ms, 100);
-        assert_eq!(m[0].rest_duration_ms, 150);
+        assert_eq!(m[0].tone_duration_ms, 160);
+        assert_eq!(m[0].rest_duration_ms, 240);
 
         // Sequence 1234: digits extracted LSB-first 4,3,2,1 -> all quarters,
         // pitches A6, G6, E6, D6 in that beat order.
         let m = melody_from_sequence(1234);
         let freqs: [u32; 4] = [m[0].freq, m[1].freq, m[2].freq, m[3].freq];
         assert_eq!(freqs, [1760, 1568, 1319, 1175]);
-        assert!(m.iter().all(|b| b.tone_duration_ms == 250));
+        assert!(m.iter().all(|b| b.tone_duration_ms == 400));
 
         // Sequence 9999: digit 9 -> pitch 4, short, every beat.
         let m = melody_from_sequence(9999);
-        assert!(m.iter().all(|b| b.freq == 1760 && b.tone_duration_ms == 100));
+        assert!(m.iter().all(|b| b.freq == 1760 && b.tone_duration_ms == 160));
+    }
+
+    #[test]
+    fn bugle_call_matches_midi_spec() {
+        assert_eq!(BUGLE_CALL.len(), 6);
+        let total_ms: u32 = BUGLE_CALL
+            .iter()
+            .map(|b| b.tone_duration_ms + b.rest_duration_ms)
+            .sum();
+        // 6 x 136 ms slots + 1 x 273 ms (double note) = 1089 ms (~1.09 s, matches 4 measures @ 220 BPM)
+        assert_eq!(total_ms, 1089);
+        assert_eq!(BUGLE_CALL[0].freq, 622); // Eb5
+        assert_eq!(BUGLE_CALL[1].freq, 831); // Ab5
+        assert_eq!(BUGLE_CALL[2].freq, 1047); // C6
+        assert_eq!(BUGLE_CALL[3].freq, 1245); // Eb6
+        assert_eq!(BUGLE_CALL[3].rest_duration_ms, 136); // breath rest
+        assert_eq!(BUGLE_CALL[4].freq, 1047); // C6
+        assert_eq!(BUGLE_CALL[5].freq, 1245); // Eb6
     }
 }

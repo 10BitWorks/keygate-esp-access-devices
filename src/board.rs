@@ -35,12 +35,19 @@ use crate::{
 
 /// LEDC hardware-PWM tone driver: the peripheral emits the waveform from
 /// its own clock — zero CPU during a tone, true parallelism with every
-/// other task. Single-ended drive (bridge leg B idles low).
+/// other task.
+///
+/// Bridge drive: Channel 0 (leg A) and Channel 1 (leg B) share Timer 0 at
+/// 50% duty. Channel 1 has its `hpoint` set to 128 (180° out of phase
+/// relative to Channel 0's hpoint of 0). This gives full 6.6V peak-to-peak
+/// differential voltage across the piezo disc when playing, and 0V DC
+/// when idle (both channels at 0% duty).
 pub struct LedcTone {
     /// Private aliased handle for per-note frequency reconfiguration
     /// (esp-hal Timer handles alias the same registers by design).
     timer: esp_hal::ledc::timer::Timer<'static, esp_hal::ledc::LowSpeed>,
-    ch: esp_hal::ledc::channel::Channel<'static, esp_hal::ledc::LowSpeed>,
+    ch0: esp_hal::ledc::channel::Channel<'static, esp_hal::ledc::LowSpeed>,
+    ch1: esp_hal::ledc::channel::Channel<'static, esp_hal::ledc::LowSpeed>,
 }
 
 /// Concrete piezo task for this board: the embassy task macro forbids
@@ -60,11 +67,13 @@ impl piezo::ToneDriver for LedcTone {
                 frequency: esp_hal::time::Rate::from_hz(freq_hz),
             })
             .ok();
-        self.ch.set_duty(50).ok();
+        self.ch0.set_duty(50).ok();
+        self.ch1.set_duty(50).ok();
     }
 
     fn stop(&mut self) {
-        self.ch.set_duty(0).ok();
+        self.ch0.set_duty(0).ok();
+        self.ch1.set_duty(0).ok();
     }
 }
 
@@ -507,9 +516,23 @@ pub fn setup(
         drive_mode: esp_hal::gpio::DriveMode::PushPull,
     })
     .unwrap();
+    let mut ch1 = ledc.channel::<esp_hal::ledc::LowSpeed>(
+        esp_hal::ledc::channel::Number::Channel1,
+        peripherals.GPIO10,
+    );
+    ch1.configure(esp_hal::ledc::channel::config::Config {
+        timer: &*t_frozen,
+        duty_pct: 0,
+        drive_mode: esp_hal::gpio::DriveMode::PushPull,
+    })
+    .unwrap();
+    let ledc_reg = unsafe { &*esp_hal::peripherals::LEDC::regs() };
+    ledc_reg.ch(1).hpoint().write(|w| unsafe { w.hpoint().bits(128) });
+
     let piezo_tone = LedcTone {
         timer: timer_for_freq,
-        ch: ch0,
+        ch0,
+        ch1,
     };
     let flash = esp_storage::FlashStorage::new(peripherals.FLASH);
     // Task watchdog on TIMG1: any wedged task (flash op, driver bug)
@@ -520,11 +543,6 @@ pub fn setup(
         esp_hal::timer::timg::MwdtStage::Stage0,
         esp_hal::time::Duration::from_secs(30),
     );
-    core::mem::forget(Output::new(
-        peripherals.GPIO10,
-        Level::Low,
-        OutputConfig::default(),
-    ));
     // 5 & 6. Initialize Wi-Fi and network stack via platform helpers.
     let rng = esp_hal::rng::Rng::new();
     let net_parts = platform::net(peripherals.WIFI, rng);
@@ -624,9 +642,23 @@ pub fn setup(
         drive_mode: esp_hal::gpio::DriveMode::PushPull,
     })
     .unwrap();
+    let mut ch1 = ledc.channel::<esp_hal::ledc::LowSpeed>(
+        esp_hal::ledc::channel::Number::Channel1,
+        peripherals.GPIO33,
+    );
+    ch1.configure(esp_hal::ledc::channel::config::Config {
+        timer: &*t_frozen,
+        duty_pct: 0,
+        drive_mode: esp_hal::gpio::DriveMode::PushPull,
+    })
+    .unwrap();
+    let ledc_reg = unsafe { &*esp_hal::peripherals::LEDC::regs() };
+    ledc_reg.lsch(1).hpoint().write(|w| unsafe { w.hpoint().bits(128) });
+
     let piezo_tone = LedcTone {
         timer: timer_for_freq,
-        ch: ch0,
+        ch0,
+        ch1,
     };
     let flash = esp_storage::FlashStorage::new(peripherals.FLASH);
     // Task watchdog on TIMG1: any wedged task (flash op, driver bug)
@@ -637,11 +669,6 @@ pub fn setup(
         esp_hal::timer::timg::MwdtStage::Stage0,
         esp_hal::time::Duration::from_secs(30),
     );
-    core::mem::forget(Output::new(
-        peripherals.GPIO33,
-        Level::Low,
-        OutputConfig::default(),
-    ));
 
     // Hardware reset pin RSTO on GPIO19 (repurposed from MISO).
     // The 8-pin harness was slid one slot up the right column; GPIO19's INPUT buffer is the

@@ -168,21 +168,36 @@ async fn nfc_runner<I: pn532::Interface>(
             let tag_opt = nfc::poll_tag(pn);
             let obs = tag_opt.as_ref().map(tag_debounce::TagObservation::from_tag_info);
 
-            // In-field identity melody source: the held card's UID drives
-            // its signature measure, and an empty field silences it.
-            match &tag_opt {
-                Some(t) => {
-                    piezo::set_field_uid(&t.uid[..t.uid_len as usize]).await;
+            // Update debounce state machine FIRST, so presence tracking
+            // filters out PN532 RF polling flicker while a tag rests on the reader.
+            let tap_event = debounce.observe(now, obs);
+
+            // In-field identity melody: driven by the debounced presence state.
+            // Raw `poll_tag` flickers to None when an activated tag is already
+            // in target slot 1; `debounce.state()` holds `Tapped` continuously
+            // as long as the card is on the reader, and only transitions to
+            // `Idle` when the tag is physically removed.
+            match debounce.state() {
+                tag_debounce::State::Tapped { uid, uid_len } => {
+                    piezo::set_field_uid(&uid[..uid_len as usize]).await;
                 }
-                None => piezo::set_field_uid(&[]).await,
+                tag_debounce::State::Removing {
+                    last_uid,
+                    last_uid_len,
+                    ..
+                } => {
+                    piezo::set_field_uid(&last_uid[..last_uid_len as usize]).await;
+                }
+                tag_debounce::State::Idle => {
+                    piezo::set_field_uid(&[]).await;
+                }
             }
 
-            if let Some(ev) = debounce.observe(now, obs) {
-                // Audible feedback: immediate beep on every physical tag detection.
+            if let Some(ev) = tap_event {
+                // Audible feedback: immediate wake on every physical tag detection.
                 let _ = PZ.try_send(BeepEvent::TagDetected);
                 TAP_T0_MS.store(uptime_ms(), core::sync::atomic::Ordering::Relaxed);
 
-                // SAK 0x20 => ISO 14443-4 (DESFire / NTAG 424 DNA).
                 if ev.sak == 0x20 {
                     status_led::set_state(status_led::LedState::TagReading);
 
