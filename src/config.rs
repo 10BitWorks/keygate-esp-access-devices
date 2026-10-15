@@ -41,6 +41,13 @@ pub const RELAY_ACTIVE_LOW: &str = match option_env!("RELAY_ACTIVE_LOW") {
     None => "true",
 };
 
+/// How long the door strike stays released on a grant — LOCAL door policy.
+///
+/// The verifier's contract is accept/deny only; how this node drives its own
+/// relay is nobody else's business. 3 s is the minimum a person needs to
+/// hear the chirp, reach the handle, and pull the door open.
+pub const RELAY_HOLD_MS: u32 = 3000;
+
 /// SUN provisioning URL template (T4).
 ///
 /// The three empty placeholders (`uid=`, `c=`, `cmac=`) are where the NTAG 424

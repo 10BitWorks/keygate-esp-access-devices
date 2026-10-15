@@ -23,6 +23,10 @@ pub const PIEZO_CHANNEL_CAPACITY: usize = 8;
 pub enum BeepEvent {
     /// A tag was sighted.
     TagDetected,
+    /// A tag is still physically in the RF field — periodic tick while held.
+    /// Sent only while the poll reports presence, so it stops the moment the
+    /// tag leaves. Distinct pitch from TagDetected.
+    TagInField,
     /// An auth request was published to the broker.
     AuthSent,
     /// Access granted.
@@ -99,8 +103,13 @@ const RECONNECT_TICKS: u32 = 15;
 /// separated at play time by [`TONE_GAP_MS`].
 pub const PATTERN_TABLE: &[(BeepEvent, &[Tone])] = &[
     (BeepEvent::TagDetected, &[(2600, 60)]),
+    // In-field tick: soft, low, short — clearly "still here", must not
+    // compete with the TagDetected chirp or the verdict tones.
+    (BeepEvent::TagInField, &[(2100, 40)]),
     (BeepEvent::AuthSent, &[(2600, 40)]),
-    (BeepEvent::Granted, &[(3200, 120), (3200, 120)]),
+    // Verdict: single short chirp. The relay click and the door itself are
+    // the primary grant feedback; no fanfare after the tag has left.
+    (BeepEvent::Granted, &[(3200, 100)]),
     (BeepEvent::Denied, &[(1300, 150), (1300, 150)]),
     (BeepEvent::RelayPulse, &[(2600, 400)]),
     (
@@ -353,8 +362,9 @@ pub use embedded::{PIEZO_CHANNEL, PiezoPins, PiezoReceiver, PiezoSender, piezo_t
 mod tests {
     use super::*;
 
-    const ALL_EVENTS: [BeepEvent; 10] = [
+    const ALL_EVENTS: [BeepEvent; 11] = [
         BeepEvent::TagDetected,
+        BeepEvent::TagInField,
         BeepEvent::AuthSent,
         BeepEvent::Granted,
         BeepEvent::Denied,

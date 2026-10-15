@@ -48,6 +48,15 @@ pub static PROV_DONE_OUTBOUND: Channel<
 /// Shared provisioning state machine coordinating the 2-step enrollment protocol between runners.
 pub static PROV_MACHINE: Mutex<CriticalSectionRawMutex, ProvMachine> = Mutex::new(ProvMachine::new());
 
+/// Millis-since-boot at the last physical tag detection: t0 for the
+/// tap→verdict latency measurement printed on every GRANT/DENY. u32 wraps at
+/// ~49 days — harmless for a delta measured within seconds of a tap.
+pub static TAP_T0_MS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+fn uptime_ms() -> u32 {
+    embassy_time::Instant::now().as_millis() as u32
+}
+
 /// Main node entry point running both decoupled runners concurrently.
 pub async fn run<I: pn532::Interface>(
     pn532: Option<Pn532<I, Pn532Delay, 300>>,
@@ -106,6 +115,8 @@ async fn nfc_runner<I: pn532::Interface>(
     let mut ndef_buf = [0u8; 256];
     let mut no_nfc_logged = false;
     let mut nfc_down_ticks: u32 = 0;
+    // Last time the in-field tick beeped while a tag was physically present.
+    let mut last_field_tick: Option<Instant> = None;
 
     println!("[nfc] reader task started (independent from network)");
 
@@ -154,9 +165,27 @@ async fn nfc_runner<I: pn532::Interface>(
             let tag_opt = nfc::poll_tag(pn);
             let obs = tag_opt.as_ref().map(tag_debounce::TagObservation::from_tag_info);
 
+            // Continuous in-field tone: tick while a tag is physically in the
+            // RF field, stop the instant it leaves. This is the "reader sees
+            // the card" feedback — gated on the poll result, not on events.
+            match tag_opt {
+                Some(_) => {
+                    let due = match last_field_tick {
+                        None => true,
+                        Some(t) => now.duration_since(t) >= Duration::from_millis(500),
+                    };
+                    if due {
+                        let _ = PZ.try_send(BeepEvent::TagInField);
+                        last_field_tick = Some(now);
+                    }
+                }
+                None => last_field_tick = None,
+            }
+
             if let Some(ev) = debounce.observe(now, obs) {
                 // Audible feedback: immediate beep on every physical tag detection.
                 let _ = PZ.try_send(BeepEvent::TagDetected);
+                TAP_T0_MS.store(uptime_ms(), core::sync::atomic::Ordering::Relaxed);
 
                 // SAK 0x20 => ISO 14443-4 (DESFire / NTAG 424 DNA).
                 if ev.sak == 0x20 {
@@ -208,7 +237,14 @@ async fn nfc_runner<I: pn532::Interface>(
                                 };
 
                                 match read_res {
-                                    Ok(n) => match ntag424::extract_ndef_uri(&ndef_buf[..n]) {
+                                    Ok(n) => {
+                                        println!(
+                                            "[latency] ndef read done +{} ms",
+                                            uptime_ms().saturating_sub(
+                                                TAP_T0_MS.load(core::sync::atomic::Ordering::Relaxed)
+                                            )
+                                        );
+                                        match ntag424::extract_ndef_uri(&ndef_buf[..n]) {
                                         Ok(uri) => match ntag424::parse_sun_url(uri) {
                                             Ok(sun) => {
                                                 let mut payload = heapless::String::<256>::new();
@@ -234,7 +270,8 @@ async fn nfc_runner<I: pn532::Interface>(
                                             println!("NDEF URI error: {:?}", e);
                                             status_led::set_state(status_led::LedState::MqttConnected);
                                         }
-                                    },
+                                    }
+                                    }
                                     Err(e) => {
                                         // Blank / unwritten tag — perfectly normal.
                                         println!("NDEF read: unwritten/blank tag ({:?})", e);
@@ -647,15 +684,24 @@ async fn mqtt_runner(
                             if topic == cmd_topic.as_str() {
                                 if let Ok(c) = cmd::parse_cmd_slice(payload) {
                                     if c.grant {
-                                        let _ = relay::RELAY_CHANNEL.try_send(c.pulse_ms);
-                                        let _ = PZ.try_send(BeepEvent::RelayPulse);
+                                        // Door timing is LOCAL policy — the
+                                        // verifier says accept/deny, nothing more.
+                                        let _ =
+                                            relay::RELAY_CHANNEL.try_send(config::RELAY_HOLD_MS);
                                         let _ = PZ.try_send(BeepEvent::Granted);
                                         status_led::set_state(status_led::LedState::Grant);
-                                        println!("GRANT ({} ms): {}", c.pulse_ms, c.reason);
+                                        let dt = uptime_ms().saturating_sub(TAP_T0_MS.load(core::sync::atomic::Ordering::Relaxed));
+                                        println!(
+                                            "GRANT (hold {} ms, +{} ms since tap): {}",
+                                            config::RELAY_HOLD_MS,
+                                            dt,
+                                            c.reason
+                                        );
                                     } else {
                                         let _ = PZ.try_send(BeepEvent::Denied);
                                         status_led::set_state(status_led::LedState::DeniedOrOffline);
-                                        println!("DENY: {}", c.reason);
+                                        let dt = uptime_ms().saturating_sub(TAP_T0_MS.load(core::sync::atomic::Ordering::Relaxed));
+                                        println!("DENY (+{} ms since tap): {}", dt, c.reason);
                                     }
                                 }
                             } else if topic == job_topic.as_str() {

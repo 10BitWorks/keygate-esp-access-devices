@@ -7,9 +7,14 @@
 use serde::Deserialize;
 
 /// Inbound door command payload published by the verifier.
+///
+/// The verifier's contract is accept/deny only — `grant` + `reason`. Door
+/// timing is LOCAL policy (`config::RELAY_HOLD_MS`); `pulse_ms` is accepted
+/// for payload compatibility and ignored.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct CmdMessage<'a> {
     pub grant: bool,
+    #[serde(default)]
     pub pulse_ms: u32,
     pub reason: &'a str,
 }
