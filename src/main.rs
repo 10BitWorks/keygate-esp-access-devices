@@ -67,7 +67,7 @@ async fn main(spawner: Spawner) -> ! {
     spawner.spawn(status_led::status_led_task(setup.led_pin).unwrap());
     spawner.spawn(relay::relay_task(setup.relay_pin).unwrap());
     spawner.spawn(
-        piezo::piezo_task(piezo::PIEZO_CHANNEL.receiver(), setup.piezo_pins).unwrap(),
+        board::piezo_task(piezo::PIEZO_CHANNEL.receiver(), setup.piezo_tone).unwrap(),
     );
 
     // 5. Spawn the Embassy network runner task.

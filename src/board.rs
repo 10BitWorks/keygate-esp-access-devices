@@ -4,6 +4,8 @@
 //! so the core orchestration in `main.rs` and node logic remain board-agnostic.
 
 use esp_hal::gpio::{Level, Output, OutputConfig};
+#[cfg(any(feature = "board-esp32-devkit-door", feature = "board-xiao-c6"))]
+use esp_hal::ledc::{channel::ChannelIFace, timer::TimerIFace};
 #[cfg(feature = "board-xiao-c6")]
 use esp_hal::{
     i2c::master::{Config as I2cConfig, I2c},
@@ -31,13 +33,48 @@ use crate::{
     platform,
 };
 
+/// LEDC hardware-PWM tone driver: the peripheral emits the waveform from
+/// its own clock — zero CPU during a tone, true parallelism with every
+/// other task. Single-ended drive (bridge leg B idles low).
+pub struct LedcTone {
+    /// Private aliased handle for per-note frequency reconfiguration
+    /// (esp-hal Timer handles alias the same registers by design).
+    timer: esp_hal::ledc::timer::Timer<'static, esp_hal::ledc::LowSpeed>,
+    ch: esp_hal::ledc::channel::Channel<'static, esp_hal::ledc::LowSpeed>,
+}
+
+/// Concrete piezo task for this board: the embassy task macro forbids
+/// generics, so the LedcTone driver is bound here and the generic logic
+/// lives in [`piezo::run`].
+#[embassy_executor::task]
+pub async fn piezo_task(rx: piezo::PiezoReceiver, tone: LedcTone) -> ! {
+    piezo::run(rx, tone).await
+}
+
+impl piezo::ToneDriver for LedcTone {
+    fn start(&mut self, freq_hz: u32) {
+        self.timer
+            .configure(esp_hal::ledc::timer::config::Config {
+                duty: esp_hal::ledc::timer::config::Duty::Duty8Bit,
+                clock_source: esp_hal::ledc::timer::LSClockSource::APBClk,
+                frequency: esp_hal::time::Rate::from_hz(freq_hz),
+            })
+            .ok();
+        self.ch.set_duty(50).ok();
+    }
+
+    fn stop(&mut self) {
+        self.ch.set_duty(0).ok();
+    }
+}
+
 /// Hardware and network resources initialized for a board.
-pub struct Setup<I: pn532::Interface> {
+pub struct Setup<I: pn532::Interface, T: piezo::ToneDriver> {
     pub pn532: Option<Pn532<I, Pn532Delay, 300>>,
     pub reader_reset: Option<esp_hal::gpio::Output<'static>>,
     pub relay_pin: esp_hal::gpio::Output<'static>,
     pub led_pin: esp_hal::gpio::Output<'static>,
-    pub piezo_pins: piezo::PiezoPins,
+    pub piezo_tone: T,
     // Consumed by the node feedback hooks (task T7), which receive this sender
     // through `node::run`. Until those hooks land the field is intentionally
     // unread; silence the dead-code lint the same way `board.rs` does elsewhere.
@@ -422,7 +459,9 @@ pub type DoorNfcIface = pn532::spi::SPIInterface<DoorSoftSpiDevice>;
 /// before ever trusting it.
 
 #[cfg(feature = "board-xiao-c6")]
-pub fn setup(peripherals: esp_hal::peripherals::Peripherals) -> Setup<XiaoNfcIface> {
+pub fn setup(
+    peripherals: esp_hal::peripherals::Peripherals,
+) -> Setup<XiaoNfcIface, LedcTone> {
     // 3. Initialize the RTOS scheduler.
     let timg0 = esp_hal::timer::timg::TimerGroup::new(peripherals.TIMG0);
     let sw_interrupt =
@@ -436,16 +475,44 @@ pub fn setup(peripherals: esp_hal::peripherals::Peripherals) -> Setup<XiaoNfcIfa
     let led_pin = Output::new(peripherals.GPIO15, Level::High, OutputConfig::default());
     let relay_pin = Output::new(peripherals.GPIO1, Level::High, OutputConfig::default());
 
-    // Passive piezo disc, bridge-driven on GPIO9/GPIO10 (both legs idle low).
-    let piezo_pins = piezo::PiezoPins::new(
-        Output::new(peripherals.GPIO9, Level::Low, OutputConfig::default()),
-        Output::new(peripherals.GPIO10, Level::Low, OutputConfig::default()),
+    // Passive piezo disc on GPIO9, driven by LEDC hardware PWM (zero CPU
+    // during tones). GPIO10 (old bridge leg B) idles low, forgotten so the
+    // pad keeps its level for the life of the process.
+    let ledc = esp_hal::ledc::Ledc::new(peripherals.LEDC);
+    // The channel stores one shared timer reference at configure time
+    // (frozen); a second aliased handle lives in LedcTone for per-note
+    // frequency changes — esp-hal Timer handles alias the same registers.
+    static LEDC_TIMER: static_cell::StaticCell<esp_hal::ledc::timer::Timer<'static, esp_hal::ledc::LowSpeed>> =
+        static_cell::StaticCell::new();
+    let t_frozen: &'static mut esp_hal::ledc::timer::Timer<'static, esp_hal::ledc::LowSpeed> =
+        LEDC_TIMER.init(ledc.timer::<esp_hal::ledc::LowSpeed>(esp_hal::ledc::timer::Number::Timer0));
+    t_frozen
+        .configure(esp_hal::ledc::timer::config::Config {
+            duty: esp_hal::ledc::timer::config::Duty::Duty8Bit,
+            clock_source: esp_hal::ledc::timer::LSClockSource::APBClk,
+            frequency: esp_hal::time::Rate::from_hz(1047),
+        })
+        .unwrap();
+    let timer_for_freq = ledc.timer::<esp_hal::ledc::LowSpeed>(esp_hal::ledc::timer::Number::Timer0);
+    let mut ch0 = ledc.channel::<esp_hal::ledc::LowSpeed>(
+        esp_hal::ledc::channel::Number::Channel0,
+        peripherals.GPIO9,
     );
-    println!(
-        "piezo: bridge on GPIO{} / GPIO{}",
-        PIEZO_PINS.0, PIEZO_PINS.1
-    );
-
+    ch0.configure(esp_hal::ledc::channel::config::Config {
+        timer: &*t_frozen,
+        duty_pct: 0,
+        drive_mode: esp_hal::gpio::DriveMode::PushPull,
+    })
+    .unwrap();
+    let piezo_tone = LedcTone {
+        timer: timer_for_freq,
+        ch: ch0,
+    };
+    core::mem::forget(Output::new(
+        peripherals.GPIO10,
+        Level::Low,
+        OutputConfig::default(),
+    ));
     // 5 & 6. Initialize Wi-Fi and network stack via platform helpers.
     let rng = esp_hal::rng::Rng::new();
     let net_parts = platform::net(peripherals.WIFI, rng);
@@ -483,7 +550,7 @@ pub fn setup(peripherals: esp_hal::peripherals::Peripherals) -> Setup<XiaoNfcIfa
         reader_reset,
         relay_pin,
         led_pin,
-        piezo_pins,
+        piezo_tone,
         piezo_tx: piezo::PIEZO_CHANNEL.sender(),
         wifi_controller: net_parts.wifi_controller,
         stack: net_parts.stack,
@@ -492,7 +559,9 @@ pub fn setup(peripherals: esp_hal::peripherals::Peripherals) -> Setup<XiaoNfcIfa
 }
 
 #[cfg(feature = "board-esp32-devkit-door")]
-pub fn setup(peripherals: esp_hal::peripherals::Peripherals) -> Setup<DoorNfcIface> {
+pub fn setup(
+    peripherals: esp_hal::peripherals::Peripherals,
+) -> Setup<DoorNfcIface, LedcTone> {
     // 3. Initialize the RTOS scheduler (arch-uniform with xiao-c6).
     let timg0 = esp_hal::timer::timg::TimerGroup::new(peripherals.TIMG0);
     let sw_interrupt =
@@ -511,15 +580,44 @@ pub fn setup(peripherals: esp_hal::peripherals::Peripherals) -> Setup<DoorNfcIfa
     let led_pin = Output::new(peripherals.GPIO2, Level::High, OutputConfig::default());
     let relay_pin = Output::new(peripherals.GPIO13, Level::High, OutputConfig::default());
 
-    // Passive piezo disc, bridge-driven on GPIO32/GPIO33 (both legs idle low).
-    let piezo_pins = piezo::PiezoPins::new(
-        Output::new(peripherals.GPIO32, Level::Low, OutputConfig::default()),
-        Output::new(peripherals.GPIO33, Level::Low, OutputConfig::default()),
+    // Passive piezo disc on GPIO32, driven by LEDC hardware PWM (zero CPU
+    // during tones). GPIO33 (old bridge leg B) idles low, forgotten so the
+    // pad keeps its level for the life of the process.
+    let ledc = esp_hal::ledc::Ledc::new(peripherals.LEDC);
+    // The channel stores one shared timer reference at configure time
+    // (frozen); a second aliased handle lives in LedcTone for per-note
+    // frequency changes — esp-hal Timer handles alias the same registers.
+    static LEDC_TIMER: static_cell::StaticCell<esp_hal::ledc::timer::Timer<'static, esp_hal::ledc::LowSpeed>> =
+        static_cell::StaticCell::new();
+    let t_frozen: &'static mut esp_hal::ledc::timer::Timer<'static, esp_hal::ledc::LowSpeed> =
+        LEDC_TIMER.init(ledc.timer::<esp_hal::ledc::LowSpeed>(esp_hal::ledc::timer::Number::Timer0));
+    t_frozen
+        .configure(esp_hal::ledc::timer::config::Config {
+            duty: esp_hal::ledc::timer::config::Duty::Duty8Bit,
+            clock_source: esp_hal::ledc::timer::LSClockSource::APBClk,
+            frequency: esp_hal::time::Rate::from_hz(1047),
+        })
+        .unwrap();
+    let timer_for_freq = ledc.timer::<esp_hal::ledc::LowSpeed>(esp_hal::ledc::timer::Number::Timer0);
+    let mut ch0 = ledc.channel::<esp_hal::ledc::LowSpeed>(
+        esp_hal::ledc::channel::Number::Channel0,
+        peripherals.GPIO32,
     );
-    println!(
-        "piezo: bridge on GPIO{} / GPIO{}",
-        PIEZO_PINS.0, PIEZO_PINS.1
-    );
+    ch0.configure(esp_hal::ledc::channel::config::Config {
+        timer: &*t_frozen,
+        duty_pct: 0,
+        drive_mode: esp_hal::gpio::DriveMode::PushPull,
+    })
+    .unwrap();
+    let piezo_tone = LedcTone {
+        timer: timer_for_freq,
+        ch: ch0,
+    };
+    core::mem::forget(Output::new(
+        peripherals.GPIO33,
+        Level::Low,
+        OutputConfig::default(),
+    ));
 
     // Hardware reset pin RSTO on GPIO19 (repurposed from MISO).
     // The 8-pin harness was slid one slot up the right column; GPIO19's INPUT buffer is the
@@ -577,7 +675,7 @@ pub fn setup(peripherals: esp_hal::peripherals::Peripherals) -> Setup<DoorNfcIfa
         reader_reset,
         relay_pin,
         led_pin,
-        piezo_pins,
+        piezo_tone,
         piezo_tx: piezo::PIEZO_CHANNEL.sender(),
         wifi_controller: net_parts.wifi_controller,
         stack: net_parts.stack,

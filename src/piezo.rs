@@ -160,7 +160,9 @@ fn melody_from_sequence(mut sequence_val: u32) -> [Beep; 4] {
         let pitch_index = (digit % 5) as usize;
         let is_short = digit >= 5;
 
-        let tone_duration = if is_short { 100 } else { 200 };
+        // Quarters touch: a quarter note fills the whole 250 ms beat
+        // (no rest); eighths are 100 ms followed by a 150 ms rest.
+        let tone_duration = if is_short { 100 } else { 250 };
 
         *beat = Beep {
             freq: PENTATONIC_FREQS[pitch_index],
@@ -249,6 +251,16 @@ pub fn pattern_for(event: BeepEvent) -> &'static [Tone] {
     &[]
 }
 
+/// A tone generator. `start` begins emitting `freq_hz` and returns — the
+/// hardware (LEDC PWM) keeps the wave going with zero CPU; `stop` silences
+/// the output. Split start/stop so the melody loop can `await` each note
+/// duration while the sound runs entirely in hardware, in parallel with
+/// every other task.
+pub trait ToneDriver {
+    fn start(&mut self, freq_hz: u32);
+    fn stop(&mut self);
+}
+
 /// Hardware-facing section: pins, channel, and the async play loop.
 ///
 /// Compiled only for the embedded targets. The host test build (x86_64) sees only
@@ -260,14 +272,7 @@ mod embedded {
     use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
     use embassy_sync::channel::{Channel, Receiver, Sender};
     use embassy_time::{Duration, Timer, with_timeout};
-    use esp_hal::gpio::{Level, Output};
     use esp_println::println;
-
-    /// Approximate cost of one `spin_delay` iteration at 240 MHz.
-    ///
-    /// Matches the `spin_delay(ns / 12)` convention already used by the door
-    /// soft-SPI driver in `board.rs` (~10-16 ns/iteration).
-    const NS_PER_SPIN: u64 = 12;
 
     /// Channel delivering feedback events to the piezo task.
     ///
@@ -282,47 +287,9 @@ mod embedded {
     pub type PiezoReceiver =
         Receiver<'static, CriticalSectionRawMutex, BeepEvent, PIEZO_CHANNEL_CAPACITY>;
 
-    /// The two GPIO legs that drive the passive disc differentially.
-    pub struct PiezoPins {
-        /// Bridge leg A.
-        pub a: Output<'static>,
-        /// Bridge leg B.
-        pub b: Output<'static>,
-    }
-
-    impl PiezoPins {
-        /// Construct the pair from two already-owned output pins.
-        pub fn new(a: Output<'static>, b: Output<'static>) -> Self {
-            Self { a, b }
-        }
-
-        /// Leave the disc un-driven: both legs low, no DC across the disc.
-        fn idle(&mut self) {
-            self.a.set_level(Level::Low);
-            self.b.set_level(Level::Low);
-        }
-    }
-
-    /// Real-time busy-wait, materialized so the optimizer cannot delete it.
-    ///
-    /// Plain `core::hint::spin_loop()` loops are side-effect-free and LLVM
-    /// collapses them entirely in release builds — every ms-scale delay in the
-    /// door driver silently vanished before `black_box` was added per iteration.
-    /// Copied verbatim from `board.rs` so the C6 board (which never had a copy)
-    /// can share the proven helper. ~2-4 cycles/iteration at 240 MHz.
-    #[inline(never)]
-    fn spin_delay(iterations: u32) {
-        for i in 0..iterations {
-            core::hint::black_box(i);
-        }
-    }
-
-    /// Bit-bang one tone on the bridge.
-    ///
-    /// Blocks for approximately `on_ms`. The play loop is the only caller, so this
-    /// blocks its own task rather than any hook site. Both legs are returned to
-    /// low on exit so the disc never sits under DC bias.
-    fn play_tone(pins: &mut PiezoPins, freq_hz: u32, on_ms: u32) {
+    /// Emit one tone through the tone driver, awaiting its duration. The
+    /// hardware emits the waveform; this task just sleeps.
+    async fn play_tone<T: ToneDriver>(tone: &mut T, freq_hz: u32, on_ms: u32) {
         if freq_hz == 0 || on_ms == 0 {
             return;
         }
@@ -334,38 +301,21 @@ mod embedded {
             (ON_MS_MIN..=ON_MS_MAX).contains(&on_ms),
             "tone duration {on_ms} ms out of bounds"
         );
-
-        // Half-period of the square wave in nanoseconds.
-        let half_ns = 1_000_000_000u64 / (2 * freq_hz as u64);
-        let half_spins = ((half_ns / NS_PER_SPIN).max(1)) as u32;
-        let half_count = (on_ms as u64 * 1_000_000) / half_ns;
-
-        let mut leg_a_high = false;
-        for _ in 0..half_count {
-            if leg_a_high {
-                pins.a.set_level(Level::High);
-                pins.b.set_level(Level::Low);
-            } else {
-                pins.a.set_level(Level::Low);
-                pins.b.set_level(Level::High);
-            }
-            leg_a_high = !leg_a_high;
-            spin_delay(half_spins);
-        }
-
-        pins.idle();
+        tone.start(freq_hz);
+        Timer::after(Duration::from_millis(on_ms as u64)).await;
+        tone.stop();
     }
 
-    /// Play a pattern with inter-tone gaps, returning the pins to idle.
-    async fn play_pattern(pins: &mut PiezoPins, pattern: &[Tone]) {
+    /// Play a pattern with inter-tone gaps, leaving the output silent.
+    async fn play_pattern<T: ToneDriver>(tone: &mut T, pattern: &[Tone]) {
         for (i, &(freq_hz, on_ms)) in pattern.iter().enumerate() {
             if i > 0 {
-                pins.idle();
+                tone.stop();
                 Timer::after(Duration::from_millis(TONE_GAP_MS as u64)).await;
             }
-            play_tone(pins, freq_hz, on_ms);
+            play_tone(tone, freq_hz, on_ms).await;
         }
-        pins.idle();
+        tone.stop();
     }
 
     fn conn_state() -> u8 {
@@ -385,9 +335,9 @@ mod embedded {
     /// while joining Wi-Fi, double beep while joining MQTT, a rising
     /// confirmation when online, and a slow beep every 15 s while
     /// reconnecting after a drop.
-    pub async fn run(rx: PiezoReceiver, mut pins: PiezoPins) -> ! {
-        pins.idle();
-        println!("[piezo] bridge driver ready (idle both-low)");
+    pub async fn run<T: ToneDriver>(rx: PiezoReceiver, mut tone: T) -> ! {
+        tone.stop();
+        println!("[piezo] LEDC tone driver ready (hardware PWM)");
 
         let mut tick: u32 = 0;
         let mut online_announced = false;
@@ -407,10 +357,12 @@ mod embedded {
                         let pattern = pattern_for(event);
                         if !pattern.is_empty() {
                             println!("[piezo] play {:?} ({} tone(s))", event, pattern.len());
-                            play_pattern(&mut pins, &pattern).await;
+                            play_pattern(&mut tone, &pattern).await;
                         }
                     }
-                    play_tone(&mut pins, beat.freq, beat.tone_duration_ms);
+                    // Full-length notes: the hardware PWM emits the waveform
+                    // while this task awaits — the NFC task keeps its slice.
+                    play_tone(&mut tone, beat.freq, beat.tone_duration_ms).await;
                     if beat.rest_duration_ms > 0 {
                         Timer::after(Duration::from_millis(beat.rest_duration_ms as u64)).await;
                     }
@@ -419,20 +371,22 @@ mod embedded {
             match with_timeout(Duration::from_millis(500), rx.receive()).await {
                 Ok(event) => {
                     let pattern = pattern_for(event);
-                    println!("[piezo] play {:?} ({} tone(s))", event, pattern.len());
-                    play_pattern(&mut pins, &pattern).await;
+                    if !pattern.is_empty() {
+                        println!("[piezo] play {:?} ({} tone(s))", event, pattern.len());
+                        play_pattern(&mut tone, &pattern).await;
+                    }
                 }
                 Err(_) => {
                     tick = tick.saturating_add(1);
                     match conn_state() {
                         super::conn::WAIT_WIFI => {
                             if tick % 20 == 0 {
-                                play_pattern(&mut pins, &[(2000, 80)]).await;
+                                play_pattern(&mut tone, &[(2000, 80)]).await;
                             }
                         }
                         super::conn::WAIT_MQTT => {
                             if tick % 20 == 0 {
-                                play_pattern(&mut pins, &[(2500, 50), (2500, 50)]).await;
+                                play_pattern(&mut tone, &[(2500, 50), (2500, 50)]).await;
                             }
                         }
                         super::conn::ONLINE => {
@@ -442,7 +396,7 @@ mod embedded {
                                 // 4th/5th notes halved vs the original dotted rhythm, whole
                                 // thing at 0.8x duration (20% faster). Base was 40ms.
                                 play_pattern(
-                                    &mut pins,
+                                    &mut tone,
                                     &[
                                         (1568, 32),
                                         (2093, 32),
@@ -457,20 +411,20 @@ mod embedded {
                         }
                         super::conn::RECONNECT => {
                             if tick % 30 == 0 {
-                                play_pattern(&mut pins, &[(1200, 150)]).await;
+                                play_pattern(&mut tone, &[(1200, 150)]).await;
                             }
                         }
                         super::conn::PROV_ARMED => {
                             // Continuous low beep every 500ms while window is open
-                            play_pattern(&mut pins, &[(1600, 60)]).await;
+                            play_pattern(&mut tone, &[(1600, 60)]).await;
                         }
                         super::conn::PROV_WRITING => {
                             // Continuous higher tone while provisioning is in progress
-                            play_pattern(&mut pins, &[(3000, 100)]).await;
+                            play_pattern(&mut tone, &[(3000, 100)]).await;
                         }
                         _ => {}
                     }
-                    pins.idle();
+                    tone.stop();
                 }
             }
             if conn_state() != super::conn::ONLINE {
@@ -479,18 +433,16 @@ mod embedded {
         }
     }
 
-    /// Embassy task wrapper around [`run`].
-    #[embassy_executor::task]
-    pub async fn piezo_task(rx: PiezoReceiver, pins: PiezoPins) -> ! {
-        run(rx, pins).await
-    }
+    // NOTE: no #[embassy_executor::task] here — the macro forbids generics.
+    // Each board defines a concrete task wrapping [`run`] with its own
+    // ToneDriver (see board.rs).
 }
 
 #[cfg(any(target_arch = "riscv32", target_arch = "xtensa"))]
 // `run` and `PiezoReceiver` are the public API surface for the play loop; until
 // the node hooks call through them they are referenced only inside `embedded`.
 #[allow(unused_imports)]
-pub use embedded::{PIEZO_CHANNEL, PiezoPins, PiezoReceiver, PiezoSender, piezo_task, run};
+pub use embedded::{PIEZO_CHANNEL, PiezoReceiver, PiezoSender, run};
 
 #[cfg(test)]
 mod tests {
@@ -589,7 +541,7 @@ mod tests {
                     beat.freq
                 );
                 assert!(
-                    beat.tone_duration_ms == 100 || beat.tone_duration_ms == 200,
+                    beat.tone_duration_ms == 100 || beat.tone_duration_ms == 250,
                     "tone {} ms is neither eighth nor quarter",
                     beat.tone_duration_ms
                 );
@@ -613,9 +565,13 @@ mod tests {
 
     #[test]
     fn melody_digit_mapping_is_lsb_first_quarter_or_short() {
-        // Sequence 0: digit 0 -> pitch 0, quarter note (200 ms + 50 ms rest).
+        // Sequence 0: digit 0 -> pitch 0, quarter note — quarters touch:
+        // full 250 ms beat, no rest.
         let m = melody_from_sequence(0);
-        assert!(m.iter().all(|b| b.freq == 1047 && b.tone_duration_ms == 200));
+        assert!(
+            m.iter()
+                .all(|b| b.freq == 1047 && b.tone_duration_ms == 250 && b.rest_duration_ms == 0)
+        );
 
         // Sequence 5: digit 5 -> pitch 0, eighth note + rest (100 + 150).
         let m = melody_from_sequence(5);
@@ -628,7 +584,7 @@ mod tests {
         let m = melody_from_sequence(1234);
         let freqs: [u32; 4] = [m[0].freq, m[1].freq, m[2].freq, m[3].freq];
         assert_eq!(freqs, [1760, 1568, 1319, 1175]);
-        assert!(m.iter().all(|b| b.tone_duration_ms == 200));
+        assert!(m.iter().all(|b| b.tone_duration_ms == 250));
 
         // Sequence 9999: digit 9 -> pitch 4, short, every beat.
         let m = melody_from_sequence(9999);
