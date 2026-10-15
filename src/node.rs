@@ -115,8 +115,6 @@ async fn nfc_runner<I: pn532::Interface>(
     let mut ndef_buf = [0u8; 256];
     let mut no_nfc_logged = false;
     let mut nfc_down_ticks: u32 = 0;
-    // Last time the in-field tick beeped while a tag was physically present.
-    let mut last_field_tick: Option<Instant> = None;
 
     println!("[nfc] reader task started (independent from network)");
 
@@ -157,6 +155,9 @@ async fn nfc_runner<I: pn532::Interface>(
                 continue;
             } else if is_claim_wait {
                 // Keep target 1 intact while verifier computes diversified key!
+                // No polling in this state: clear the in-field flag so the
+                // drone cannot outlive the tap that armed the window.
+                piezo::set_tag_in_field(false);
                 Timer::after(Duration::from_millis(15)).await;
                 continue;
             }
@@ -165,22 +166,9 @@ async fn nfc_runner<I: pn532::Interface>(
             let tag_opt = nfc::poll_tag(pn);
             let obs = tag_opt.as_ref().map(tag_debounce::TagObservation::from_tag_info);
 
-            // Continuous in-field tone: tick while a tag is physically in the
-            // RF field, stop the instant it leaves. This is the "reader sees
-            // the card" feedback — gated on the poll result, not on events.
-            match tag_opt {
-                Some(_) => {
-                    let due = match last_field_tick {
-                        None => true,
-                        Some(t) => now.duration_since(t) >= Duration::from_millis(500),
-                    };
-                    if due {
-                        let _ = PZ.try_send(BeepEvent::TagInField);
-                        last_field_tick = Some(now);
-                    }
-                }
-                None => last_field_tick = None,
-            }
+            // Continuous in-field tone: driven directly by the poll result,
+            // so it stops the instant the tag leaves the RF field.
+            piezo::set_tag_in_field(tag_opt.is_some());
 
             if let Some(ev) = debounce.observe(now, obs) {
                 // Audible feedback: immediate beep on every physical tag detection.
@@ -310,6 +298,9 @@ async fn execute_tag_provisioning<I: pn532::Interface>(
     key_hex: &str,
 ) {
     println!("[prov] provisioning tag (job {})...", job_id);
+    // The write-progress tone (conn::PROV_WRITING) owns the sound here; the
+    // in-field drone must not fight it (the tag obviously stays in the field).
+    piezo::set_tag_in_field(false);
     piezo::set_conn_state(piezo::conn::PROV_WRITING);
     status_led::set_state(status_led::LedState::TagReading);
 

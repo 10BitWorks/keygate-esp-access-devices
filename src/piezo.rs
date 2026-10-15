@@ -23,10 +23,6 @@ pub const PIEZO_CHANNEL_CAPACITY: usize = 8;
 pub enum BeepEvent {
     /// A tag was sighted.
     TagDetected,
-    /// A tag is still physically in the RF field — periodic tick while held.
-    /// Sent only while the poll reports presence, so it stops the moment the
-    /// tag leaves. Distinct pitch from TagDetected.
-    TagInField,
     /// An auth request was published to the broker.
     AuthSent,
     /// Access granted.
@@ -90,6 +86,23 @@ pub mod conn {
 pub static CONN_STATE: core::sync::atomic::AtomicU8 =
     core::sync::atomic::AtomicU8::new(conn::BOOT);
 
+/// A tag is physically in the RF field. While set, the piezo task drones a
+/// continuous tone (see `IN_FIELD_HZ`/`IN_FIELD_CHUNK_MS`); the drone stops
+/// within one chunk of the flag clearing.
+pub static TAG_IN_FIELD: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Publish whether a tag is currently in the RF field.
+pub fn set_tag_in_field(on: bool) {
+    TAG_IN_FIELD.store(on, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Pitch of the continuous in-field drone (Hz).
+const IN_FIELD_HZ: u32 = 2100;
+/// Chunk length (ms): back-to-back chunks sound continuous, and each
+/// boundary is a preemption/exit checkpoint.
+const IN_FIELD_CHUNK_MS: u32 = 250;
+
 /// Publish a new connection state for the audible progress beeps.
 pub fn set_conn_state(state: u8) {
     CONN_STATE.store(state, core::sync::atomic::Ordering::Relaxed);
@@ -103,9 +116,6 @@ const RECONNECT_TICKS: u32 = 15;
 /// separated at play time by [`TONE_GAP_MS`].
 pub const PATTERN_TABLE: &[(BeepEvent, &[Tone])] = &[
     (BeepEvent::TagDetected, &[(2600, 60)]),
-    // In-field tick: soft, low, short — clearly "still here", must not
-    // compete with the TagDetected chirp or the verdict tones.
-    (BeepEvent::TagInField, &[(2100, 40)]),
     (BeepEvent::AuthSent, &[(2600, 40)]),
     // Verdict: single short chirp. The relay click and the door itself are
     // the primary grant feedback; no fanfare after the tag has left.
@@ -271,7 +281,11 @@ mod embedded {
 
     /// Drain feedback events and play their patterns forever.
     ///
-    /// Between events (1 s tick) the connection state drives audible progress:
+    /// While a tag is in the field ([`TAG_IN_FIELD`]), the task drones a
+    /// continuous tone in short preemptible chunks: each chunk boundary
+    /// checks for queued events (a verdict chirp preempts the drone) and
+    /// for field-exit (the drone stops the moment the tag leaves). Between
+    /// events (1 s tick) the connection state drives audible progress:
     /// single beep while joining Wi-Fi, double beep while joining MQTT, a
     /// rising confirmation when online, and a slow beep every 15 s while
     /// reconnecting after a drop.
@@ -282,6 +296,17 @@ mod embedded {
         let mut tick: u32 = 0;
         let mut online_announced = false;
         loop {
+            // Continuous in-field drone: back-to-back chunks sound
+            // continuous; every chunk boundary is a preemption point.
+            while TAG_IN_FIELD.load(core::sync::atomic::Ordering::Relaxed) {
+                if let Ok(event) = rx.try_receive() {
+                    let pattern = pattern_for(event);
+                    println!("[piezo] play {:?} ({} tone(s))", event, pattern.len());
+                    play_pattern(&mut pins, &pattern).await;
+                } else {
+                    play_tone(&mut pins, IN_FIELD_HZ, IN_FIELD_CHUNK_MS);
+                }
+            }
             match with_timeout(Duration::from_millis(500), rx.receive()).await {
                 Ok(event) => {
                     let pattern = pattern_for(event);
@@ -362,9 +387,8 @@ pub use embedded::{PIEZO_CHANNEL, PiezoPins, PiezoReceiver, PiezoSender, piezo_t
 mod tests {
     use super::*;
 
-    const ALL_EVENTS: [BeepEvent; 11] = [
+    const ALL_EVENTS: [BeepEvent; 10] = [
         BeepEvent::TagDetected,
-        BeepEvent::TagInField,
         BeepEvent::AuthSent,
         BeepEvent::Granted,
         BeepEvent::Denied,
