@@ -147,6 +147,18 @@ pub const BUGLE_CALL: &[Beep] = &[
     Beep { freq: 1245, tone_duration_ms: 272, rest_duration_ms: 0 },
 ];
 
+/// Cobalt door Pi accepted tune: Super Mario Bros theme opening riff
+/// (E6 - E6 - E6 - C6 - E6 - G6), from `Front Door/cobalt/my_piezo_pwm.py`.
+/// Total duration: 1038 ms (~1.04s).
+pub const MARIO_THEME_RIFF: &[Beep] = &[
+    Beep { freq: 1319, tone_duration_ms: 83, rest_duration_ms: 42 },
+    Beep { freq: 1319, tone_duration_ms: 83, rest_duration_ms: 166 },
+    Beep { freq: 1319, tone_duration_ms: 83, rest_duration_ms: 166 },
+    Beep { freq: 1047, tone_duration_ms: 83, rest_duration_ms: 0 },
+    Beep { freq: 1319, tone_duration_ms: 83, rest_duration_ms: 166 },
+    Beep { freq: 1568, tone_duration_ms: 83, rest_duration_ms: 0 },
+];
+
 /// FNV-1a 32-bit hash of the raw UID bytes.
 fn hash_uid(uid: &[u8]) -> u32 {
     let mut hash: u32 = 2166136261;
@@ -226,9 +238,19 @@ pub const PATTERN_TABLE: &[(BeepEvent, &[Tone])] = &[
     (BeepEvent::TagDetected, &[]),
     // Auth request: silent so it does not interrupt the card's melody.
     (BeepEvent::AuthSent, &[]),
-    // Verdict: Cobalt door Pi "Mario Coin" (B5 988 Hz 50 ms -> E6 1319 Hz 400 ms).
-    // Deferred until card removal so it never steps on the signature melody.
-    (BeepEvent::Granted, &[(988, 50), (1319, 400)]),
+    // Verdict: Cobalt door Pi Super Mario Bros theme opening riff
+    // (E6-E6-E6-C6-E6-G6). Deferred until card removal so it never steps on the melody.
+    (
+        BeepEvent::Granted,
+        &[
+            (1319, 83),
+            (1319, 83),
+            (1319, 83),
+            (1047, 83),
+            (1319, 83),
+            (1568, 83),
+        ],
+    ),
     (BeepEvent::Denied, &[(1300, 150), (1300, 150)]),
     (BeepEvent::RelayPulse, &[(2600, 400)]),
     (
@@ -415,12 +437,12 @@ mod embedded {
             // Card was removed from the reader (field is empty).
             // If a verdict arrived while the card was held, play it NOW!
             if let Some(verdict) = pending_verdict.take() {
-                let pattern = pattern_for(verdict);
-                if !pattern.is_empty() {
-                    println!("[piezo] play deferred {:?} ({} tone(s))", verdict, pattern.len());
-                    if verdict == BeepEvent::Granted {
-                        play_pattern_seamless(&mut tone, &pattern).await;
-                    } else {
+                println!("[piezo] play deferred {:?}", verdict);
+                if verdict == BeepEvent::Granted {
+                    play_melody(&mut tone, MARIO_THEME_RIFF).await;
+                } else {
+                    let pattern = pattern_for(verdict);
+                    if !pattern.is_empty() {
                         play_pattern(&mut tone, &pattern).await;
                     }
                 }
@@ -428,12 +450,12 @@ mod embedded {
 
             match with_timeout(Duration::from_millis(500), rx.receive()).await {
                 Ok(event) => {
-                    let pattern = pattern_for(event);
-                    if !pattern.is_empty() {
-                        println!("[piezo] play {:?} ({} tone(s))", event, pattern.len());
-                        if event == BeepEvent::Granted {
-                            play_pattern_seamless(&mut tone, &pattern).await;
-                        } else {
+                    println!("[piezo] play {:?}", event);
+                    if event == BeepEvent::Granted {
+                        play_melody(&mut tone, MARIO_THEME_RIFF).await;
+                    } else {
+                        let pattern = pattern_for(event);
+                        if !pattern.is_empty() {
                             play_pattern(&mut tone, &pattern).await;
                         }
                     }
@@ -655,5 +677,21 @@ mod tests {
         assert_eq!(BUGLE_CALL[3].rest_duration_ms, 136); // breath rest
         assert_eq!(BUGLE_CALL[4].freq, 1047); // C6
         assert_eq!(BUGLE_CALL[5].freq, 1245); // Eb6
+    }
+
+    #[test]
+    fn mario_theme_riff_matches_cobalt_spec() {
+        assert_eq!(MARIO_THEME_RIFF.len(), 6);
+        let total_ms: u32 = MARIO_THEME_RIFF
+            .iter()
+            .map(|b| b.tone_duration_ms + b.rest_duration_ms)
+            .sum();
+        assert_eq!(total_ms, 1038);
+        assert_eq!(MARIO_THEME_RIFF[0].freq, 1319); // E6
+        assert_eq!(MARIO_THEME_RIFF[1].freq, 1319); // E6
+        assert_eq!(MARIO_THEME_RIFF[2].freq, 1319); // E6
+        assert_eq!(MARIO_THEME_RIFF[3].freq, 1047); // C6
+        assert_eq!(MARIO_THEME_RIFF[4].freq, 1319); // E6
+        assert_eq!(MARIO_THEME_RIFF[5].freq, 1568); // G6
     }
 }
