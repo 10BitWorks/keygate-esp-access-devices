@@ -226,9 +226,9 @@ pub const PATTERN_TABLE: &[(BeepEvent, &[Tone])] = &[
     (BeepEvent::TagDetected, &[]),
     // Auth request: silent so it does not interrupt the card's melody.
     (BeepEvent::AuthSent, &[]),
-    // Verdict: single short chirp. The relay click and the door itself are
-    // the primary grant feedback; no fanfare after the tag has left.
-    (BeepEvent::Granted, &[(3200, 100)]),
+    // Verdict: Cobalt door Pi "Mario Coin" (B5 988 Hz 50 ms -> E6 1319 Hz 400 ms).
+    // Deferred until card removal so it never steps on the signature melody.
+    (BeepEvent::Granted, &[(988, 50), (1319, 400)]),
     (BeepEvent::Denied, &[(1300, 150), (1300, 150)]),
     (BeepEvent::RelayPulse, &[(2600, 400)]),
     (
@@ -332,6 +332,14 @@ mod embedded {
         tone.stop();
     }
 
+    /// Play consecutive tones directly with zero inter-tone gap (e.g. Mario Coin).
+    async fn play_pattern_seamless<T: ToneDriver>(tone: &mut T, pattern: &[Tone]) {
+        for &(freq_hz, on_ms) in pattern.iter() {
+            play_tone(tone, freq_hz, on_ms).await;
+        }
+        tone.stop();
+    }
+
     /// Play an exact melody of notes and rests without synthetic gaps.
     async fn play_melody<T: ToneDriver>(tone: &mut T, melody: &[Beep]) {
         for beat in melody {
@@ -366,6 +374,7 @@ mod embedded {
 
         let mut tick: u32 = 0;
         let mut online_announced = false;
+        let mut pending_verdict: Option<BeepEvent> = None;
         loop {
             // In-field identity melody. Every beat awaits its rest — this
             // loop always yields, never starves the executor.
@@ -379,10 +388,19 @@ mod embedded {
                         break; // card left or swapped mid-measure
                     }
                     if let Ok(event) = rx.try_receive() {
-                        let pattern = pattern_for(event);
-                        if !pattern.is_empty() {
-                            println!("[piezo] play {:?} ({} tone(s))", event, pattern.len());
-                            play_pattern(&mut tone, &pattern).await;
+                        match event {
+                            BeepEvent::Granted | BeepEvent::Denied => {
+                                // Defer verdict until the card is physically removed
+                                // so it never steps on or interrupts the card's identity melody!
+                                pending_verdict = Some(event);
+                            }
+                            _ => {
+                                let pattern = pattern_for(event);
+                                if !pattern.is_empty() {
+                                    println!("[piezo] play {:?} ({} tone(s))", event, pattern.len());
+                                    play_pattern(&mut tone, &pattern).await;
+                                }
+                            }
                         }
                     }
                     // Full-length notes: the hardware PWM emits the waveform
@@ -393,12 +411,31 @@ mod embedded {
                     }
                 }
             }
+
+            // Card was removed from the reader (field is empty).
+            // If a verdict arrived while the card was held, play it NOW!
+            if let Some(verdict) = pending_verdict.take() {
+                let pattern = pattern_for(verdict);
+                if !pattern.is_empty() {
+                    println!("[piezo] play deferred {:?} ({} tone(s))", verdict, pattern.len());
+                    if verdict == BeepEvent::Granted {
+                        play_pattern_seamless(&mut tone, &pattern).await;
+                    } else {
+                        play_pattern(&mut tone, &pattern).await;
+                    }
+                }
+            }
+
             match with_timeout(Duration::from_millis(500), rx.receive()).await {
                 Ok(event) => {
                     let pattern = pattern_for(event);
                     if !pattern.is_empty() {
                         println!("[piezo] play {:?} ({} tone(s))", event, pattern.len());
-                        play_pattern(&mut tone, &pattern).await;
+                        if event == BeepEvent::Granted {
+                            play_pattern_seamless(&mut tone, &pattern).await;
+                        } else {
+                            play_pattern(&mut tone, &pattern).await;
+                        }
                     }
                 }
                 Err(_) => {
