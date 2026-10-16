@@ -117,6 +117,8 @@ async fn nfc_runner<I: pn532::Interface>(
     let mut ndef_buf = [0u8; 256];
     let mut no_nfc_logged = false;
     let mut nfc_down_ticks: u32 = 0;
+    let mut is_dna_active = false;
+    let mut last_dna_tag: Option<nfc::TagInfo> = None;
 
     println!("[nfc] reader task started (independent from network)");
 
@@ -164,8 +166,29 @@ async fn nfc_runner<I: pn532::Interface>(
                 continue;
             }
 
-            // Fast, non-blocking poll (200 ms timeout in driver, returns Option<TagInfo>).
-            let tag_opt = nfc::poll_tag(pn);
+            // Poll for tags or check presence of resting ISO-DEP target:
+            // For DNA tags in ISO-DEP mode, re-polling fails because Target 1 is active.
+            // is_target_present pings Target 1 with a 4-byte frame in <10ms, detecting
+            // resting presence seamlessly and physical removal instantly.
+            let tag_opt = if is_dna_active {
+                if nfc::is_target_present(pn, 1) {
+                    last_dna_tag.clone()
+                } else {
+                    is_dna_active = false;
+                    last_dna_tag = None;
+                    nfc::release_target(pn, 0);
+                    None
+                }
+            } else {
+                let opt = nfc::poll_tag(pn);
+                if let Some(ref tag) = opt {
+                    if tag.sak == 0x20 {
+                        is_dna_active = true;
+                        last_dna_tag = Some(tag.clone());
+                    }
+                }
+                opt
+            };
             let obs = tag_opt.as_ref().map(tag_debounce::TagObservation::from_tag_info);
 
             // Update debounce state machine FIRST, so presence tracking
@@ -228,7 +251,9 @@ async fn nfc_runner<I: pn532::Interface>(
                             };
                             if let Some((job_id, key_hex)) = prov_ctx {
                                 execute_tag_provisioning(pn, &job_id, &key_hex).await;
-                                let _ = nfc::deselect_target(pn, 1);
+                                is_dna_active = false;
+                                last_dna_tag = None;
+                                nfc::release_target(pn, 0);
                             }
                         }
                         _ => {
@@ -289,8 +314,6 @@ async fn nfc_runner<I: pn532::Interface>(
                                         status_led::set_state(status_led::LedState::MqttConnected);
                                     }
                                 }
-                                // Deselect target 1 so the card returns to ISO 14443-3 ready state.
-                                let _ = nfc::deselect_target(pn, 1);
                             }
                         }
                     }

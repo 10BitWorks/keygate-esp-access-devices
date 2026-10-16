@@ -48,13 +48,15 @@ for i in $(seq 1 40); do
     else
         CONN=$(printf '%s' "$LINE" | grep -oE 'connected=(true|false)' | head -1)
         SUBS=$(printf '%s' "$LINE" | grep -oE 'subscriptions=[0-9]+' | head -1)
+        SUBS_N=$(printf '%s' "$SUBS" | cut -d= -f2)
         log "[$i] $CONN $SUBS"
-        if [ "$CONN" = "connected=true" ] && [ "$SUBS" = "subscriptions=2" ]; then
+        if [ "$CONN" = "connected=true" ] && [ "${SUBS_N:-0}" -ge 2 ]; then
             log "session up + subscribed — soaking 12 s to confirm stability"
             sleep 12
             LINE2=$(node_state)
+            SUBS_N2=$(printf '%s' "$LINE2" | grep -oE 'subscriptions=[0-9]+' | cut -d= -f2)
             if printf '%s' "$LINE2" | grep -q 'connected=true' && \
-               printf '%s' "$LINE2" | grep -q 'subscriptions=2'; then
+               [ "${SUBS_N2:-0}" -ge 2 ]; then
                 STABLE=1
                 log "STABLE ✓"
                 break

@@ -11,6 +11,7 @@ use pn532::{
 };
 
 /// Detected NFC tag information
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TagInfo {
     pub uid: [u8; 7],
     pub uid_len: u8,
@@ -336,22 +337,35 @@ pub fn in_data_exchange<'a, I: pn532::Interface, T: CountDown<Time = fugit::Mill
     Ok(&resp[1..])
 }
 
-/// Deselect a selected target in the PN532 (InDeselect).
+/// Check if an already-activated ISO-DEP target is still physically present
+/// in the RF field by sending a lightweight dummy APDU.
 ///
-/// Sends an ISO 14443-4 S(DESELECT) frame to release the protocol level and
-/// return the card to the ISO 14443-3 READY/IDLE state (NOT the HALT state),
-/// so the resting card continues to answer subsequent InListPassiveTarget polls.
-pub fn deselect_target<I: pn532::Interface, T: CountDown<Time = fugit::MillisDurationU32>, const N: usize>(
+/// Returns true if the target answers within 80ms, false if removed from field.
+pub fn is_target_present<I: pn532::Interface, T: CountDown<Time = fugit::MillisDurationU32>, const N: usize>(
     pn532: &mut Pn532<I, T, N>,
     target: u8,
-) -> Result<(), NfcError> {
+) -> bool {
+    let mut tx_buf = [0u8; 5];
+    tx_buf[0] = target;
+    tx_buf[1..5].copy_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+    let req = BorrowedRequest::new(Command::InDataExchange, &tx_buf);
+    match pn532.process(req, 10, fugit::MillisDurationU32::from_ticks(80)) {
+        Ok(resp) => !resp.is_empty() && resp[0] == 0x00,
+        Err(_) => false,
+    }
+}
+
+/// Release a selected target in the PN532 (InRelease).
+pub fn release_target<I: pn532::Interface, T: CountDown<Time = fugit::MillisDurationU32>, const N: usize>(
+    pn532: &mut Pn532<I, T, N>,
+    target: u8,
+) {
     let req = match target {
-        1 => &Request::DESELECT_TAG_1,
-        2 => &Request::DESELECT_TAG_2,
-        _ => &Request::DESELECT_TAG_1,
+        1 => &Request::RELEASE_TAG_1,
+        2 => &Request::RELEASE_TAG_2,
+        _ => &Request::new(Command::InRelease, [0x00]),
     };
     let _ = pn532.process(req, 1, fugit::MillisDurationU32::from_ticks(100));
-    Ok(())
 }
 
 

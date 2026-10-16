@@ -15,9 +15,9 @@
 
 use embassy_time::{Duration, Instant};
 
-/// Continuous absence required to re-arm the reader for a new tap (200 ms).
-/// Cuts off the audio melody immediately upon physical card removal.
-pub const REMOVAL_DEBOUNCE: Duration = Duration::from_millis(200);
+/// Continuous absence required to re-arm the reader for a new tap (150 ms).
+/// Stops the audio melody immediately upon physical card removal (< 1 beat).
+pub const REMOVAL_DEBOUNCE: Duration = Duration::from_millis(150);
 
 /// State of tag presence on the reader.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -244,13 +244,13 @@ mod tests {
         assert_eq!(sm.observe(t1, None), None);
         assert!(matches!(sm.state(), State::Removing { .. }));
 
-        // 199ms absent -> not yet rearmed
-        let t_sub = t1 + Duration::from_millis(199);
+        // 149ms absent -> not yet rearmed
+        let t_sub = t1 + Duration::from_millis(149);
         assert_eq!(sm.observe(t_sub, None), None);
         assert!(matches!(sm.state(), State::Removing { .. }));
 
-        // 200ms absent -> rearmed to Idle
-        let t_rearm = t1 + Duration::from_millis(200);
+        // 150ms absent -> rearmed to Idle
+        let t_rearm = t1 + Duration::from_millis(150);
         assert_eq!(sm.observe(t_rearm, None), None);
         assert_eq!(sm.state(), State::Idle);
 
