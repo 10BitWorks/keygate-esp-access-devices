@@ -289,10 +289,8 @@ async fn nfc_runner<I: pn532::Interface>(
                                         status_led::set_state(status_led::LedState::MqttConnected);
                                     }
                                 }
-                                // Reset RF field and release target so the resting card undergoes
-                                // a power-on reset back to IDLE state and responds to ongoing polls.
+                                // Release target 1 so the card returns to idle state on PN532.
                                 let _ = nfc::release_target(pn, 1);
-                                nfc::rf_field_reset(pn);
                             }
                         }
                     }

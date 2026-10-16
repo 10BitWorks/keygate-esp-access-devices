@@ -264,7 +264,7 @@ pub fn poll_tag<I: pn532::Interface, T: CountDown<Time = fugit::MillisDurationU3
     if let Ok(res) = pn532.process(
         &Request::INLIST_ONE_ISO_A_TARGET,
         20,
-        fugit::MillisDurationU32::from_ticks(250),
+        fugit::MillisDurationU32::from_ticks(600),
     ) {
         if res.is_empty() || res[0] == 0 {
             return None;

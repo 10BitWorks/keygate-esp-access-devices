@@ -15,8 +15,9 @@
 
 use embassy_time::{Duration, Instant};
 
-/// Continuous absence required to re-arm the reader for a new tap (500 ms).
-pub const REMOVAL_DEBOUNCE: Duration = Duration::from_millis(500);
+/// Continuous absence required to re-arm the reader for a new tap (1500 ms).
+/// Absorbs slow ISO-DEP RATS/ATS re-activation cycles on resting DNA cards.
+pub const REMOVAL_DEBOUNCE: Duration = Duration::from_millis(1500);
 
 /// State of tag presence on the reader.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -243,13 +244,13 @@ mod tests {
         assert_eq!(sm.observe(t1, None), None);
         assert!(matches!(sm.state(), State::Removing { .. }));
 
-        // 499ms absent -> not yet rearmed
-        let t_sub = t1 + Duration::from_millis(499);
+        // 1499ms absent -> not yet rearmed
+        let t_sub = t1 + Duration::from_millis(1499);
         assert_eq!(sm.observe(t_sub, None), None);
         assert!(matches!(sm.state(), State::Removing { .. }));
 
-        // 500ms absent -> rearmed to Idle
-        let t_rearm = t1 + Duration::from_millis(500);
+        // 1500ms absent -> rearmed to Idle
+        let t_rearm = t1 + Duration::from_millis(1500);
         assert_eq!(sm.observe(t_rearm, None), None);
         assert_eq!(sm.state(), State::Idle);
 
