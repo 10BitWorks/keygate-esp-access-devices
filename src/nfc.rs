@@ -353,6 +353,17 @@ pub fn release_target<I: pn532::Interface, T: CountDown<Time = fugit::MillisDura
     Ok(())
 }
 
+/// Momentarily drops and re-enables the RF field (~5ms), causing resting
+/// passive tags to undergo a power-on reset back to ready/idle state.
+pub fn rf_field_reset<I: pn532::Interface, T: CountDown<Time = fugit::MillisDurationU32>, const N: usize>(
+    pn532: &mut Pn532<I, T, N>,
+) {
+    let off = Request::new(Command::RFConfiguration, [0x01, 0x00]);
+    let on = Request::new(Command::RFConfiguration, [0x01, 0x01]);
+    let _ = pn532.process(&off, 1, fugit::MillisDurationU32::from_ticks(50));
+    let _ = pn532.process(&on, 1, fugit::MillisDurationU32::from_ticks(50));
+}
+
 
 
 

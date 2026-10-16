@@ -99,9 +99,9 @@ pub static CONN_STATE: core::sync::atomic::AtomicU8 =
 /// Standard pentatonic frequencies in Hz (C6, D6, E6, G6, A6).
 pub const PENTATONIC_FREQS: [u32; 5] = [1047, 1175, 1319, 1568, 1760];
 
-/// One beat: a quarter note (400 ms tone) or a short note (160 ms) plus rest.
-/// 400 ms (150 BPM) makes each note clearly audible and distinct.
-pub const BEAT_DURATION_MS: u32 = 400;
+/// One beat: a quarter note (200 ms tone) or a short note (80 ms) plus rest (120 ms).
+/// 200 ms per beat (300 BPM) gives a lively, responsive identity rhythm (~800 ms per measure).
+pub const BEAT_DURATION_MS: u32 = 200;
 
 pub struct Beep {
     pub freq: u32,
@@ -173,9 +173,9 @@ fn melody_from_sequence(mut sequence_val: u32) -> [Beep; 4] {
         let pitch_index = (digit % 5) as usize;
         let is_short = digit >= 5;
 
-        // Quarters touch: a quarter note fills the whole 400 ms beat
-        // (no rest); eighths are 160 ms followed by a 240 ms rest.
-        let tone_duration = if is_short { 160 } else { 400 };
+        // Quarters touch: a quarter note fills the whole 200 ms beat
+        // (no rest); short notes are 80 ms followed by a 120 ms rest.
+        let tone_duration = if is_short { 80 } else { 200 };
 
         *beat = Beep {
             freq: PENTATONIC_FREQS[pitch_index],
@@ -552,7 +552,7 @@ mod tests {
                     beat.freq
                 );
                 assert!(
-                    beat.tone_duration_ms == 160 || beat.tone_duration_ms == 400,
+                    beat.tone_duration_ms == 80 || beat.tone_duration_ms == 200,
                     "tone {} ms is neither eighth nor quarter",
                     beat.tone_duration_ms
                 );
@@ -577,29 +577,29 @@ mod tests {
     #[test]
     fn melody_digit_mapping_is_lsb_first_quarter_or_short() {
         // Sequence 0: digit 0 -> pitch 0, quarter note — quarters touch:
-        // full 400 ms beat, no rest.
+        // full 200 ms beat, no rest.
         let m = melody_from_sequence(0);
         assert!(
             m.iter()
-                .all(|b| b.freq == 1047 && b.tone_duration_ms == 400 && b.rest_duration_ms == 0)
+                .all(|b| b.freq == 1047 && b.tone_duration_ms == 200 && b.rest_duration_ms == 0)
         );
 
-        // Sequence 5: digit 5 -> pitch 0, eighth note + rest (160 + 240).
+        // Sequence 5: digit 5 -> pitch 0, eighth note + rest (80 + 120).
         let m = melody_from_sequence(5);
         assert_eq!(m[0].freq, 1047);
-        assert_eq!(m[0].tone_duration_ms, 160);
-        assert_eq!(m[0].rest_duration_ms, 240);
+        assert_eq!(m[0].tone_duration_ms, 80);
+        assert_eq!(m[0].rest_duration_ms, 120);
 
         // Sequence 1234: digits extracted LSB-first 4,3,2,1 -> all quarters,
         // pitches A6, G6, E6, D6 in that beat order.
         let m = melody_from_sequence(1234);
         let freqs: [u32; 4] = [m[0].freq, m[1].freq, m[2].freq, m[3].freq];
         assert_eq!(freqs, [1760, 1568, 1319, 1175]);
-        assert!(m.iter().all(|b| b.tone_duration_ms == 400));
+        assert!(m.iter().all(|b| b.tone_duration_ms == 200));
 
         // Sequence 9999: digit 9 -> pitch 4, short, every beat.
         let m = melody_from_sequence(9999);
-        assert!(m.iter().all(|b| b.freq == 1760 && b.tone_duration_ms == 160));
+        assert!(m.iter().all(|b| b.freq == 1760 && b.tone_duration_ms == 80));
     }
 
     #[test]

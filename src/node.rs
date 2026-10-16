@@ -289,9 +289,10 @@ async fn nfc_runner<I: pn532::Interface>(
                                         status_led::set_state(status_led::LedState::MqttConnected);
                                     }
                                 }
-                                // Release target 1 so the card returns to idle state and can
-                                // continue to be detected on subsequent poll cycles while held.
+                                // Reset RF field and release target so the resting card undergoes
+                                // a power-on reset back to IDLE state and responds to ongoing polls.
                                 let _ = nfc::release_target(pn, 1);
+                                nfc::rf_field_reset(pn);
                             }
                         }
                     }
@@ -669,14 +670,13 @@ async fn mqtt_runner(
                 // Inner connected MQTT pump loop driven by select4.
                 // Connected MQTT pump loop: drain outbound queues then poll with bounded wait.
                 let mut pump_iters: u32 = 0;
-                let mut last_hb = Instant::now();
+                let mut last_hb_ms = uptime_ms();
                 loop {
                     pump_iters += 1;
-                    // Time-based heartbeat: iteration speed varies with poll
-                    // outcomes, so gate on wall time, not iteration count.
-                    if (Instant::now() - last_hb).as_millis() >= 30_000 {
+                    let now_ms = uptime_ms();
+                    if now_ms.saturating_sub(last_hb_ms) >= 30_000 {
                         println!("[pump hb {} iters]", pump_iters);
-                        last_hb = Instant::now();
+                        last_hb_ms = now_ms;
                     }
                     // 1. Drain and publish any pending auth requests.
                     while let Ok(auth_payload) = AUTH_OUTBOUND.try_receive() {
