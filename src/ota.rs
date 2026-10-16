@@ -126,17 +126,17 @@ pub async fn init_flash(flash: FlashStorage<'static>) {
     *FLASH.lock().await = Some(flash);
 }
 
-/// Decode the otadata sector: highest valid (crc32_le-checked) entry.
+/// Decode the otadata sector: highest valid (crc32_le-checked) entry across
+/// both 4KB sectors (sector 0 at OTADATA_OFF, sector 1 at OTADATA_OFF + 0x1000).
 /// Returns the boot seq of the RUNNING image (default 1 => ota_0).
 fn current_seq(flash: &mut FlashStorage) -> u32 {
-    let mut buf = [0u8; 64];
-    if flash.read(OTADATA_OFF, &mut buf).is_err() {
-        return 1;
-    }
+    let mut e0 = [0u8; 32];
+    let mut e1 = [0u8; 32];
+    let _ = flash.read(OTADATA_OFF, &mut e0);
+    let _ = flash.read(OTADATA_OFF + 0x1000, &mut e1);
     use esp_hal::rom::crc::crc32_le;
     let mut best: Option<u32> = None;
-    for i in 0..2 {
-        let e = &buf[i * 32..(i + 1) * 32];
+    for e in [&e0, &e1] {
         let seq = u32::from_le_bytes(e[0..4].try_into().unwrap());
         let stored = u32::from_le_bytes(e[28..32].try_into().unwrap());
         if seq != u32::MAX && crc32_le(0, &e[0..4]) == stored {
@@ -313,16 +313,11 @@ pub async fn on_end() {
         return;
     }
 
-    // Re-read otadata, build both entries in RAM, erase, rewrite.
-    let mut ot = [0u8; 64];
-    if flash.read(OTADATA_OFF, &mut ot).is_err() {
-        println!("[ota] otadata read failed");
-        crate::blog!("ota: otadata read failed");
-        return;
-    }
     use esp_hal::rom::crc::crc32_le;
 
     // The entry for the NEW slot: seq+1, VALID(2).
+    // In ESP-IDF: otadata[0] lives in sector 0 (OTADATA_OFF = 0xd000),
+    // and otadata[1] lives in sector 1 (OTADATA_OFF + 0x1000 = 0xe000).
     let new_idx = rx.target_idx;
     let new_seq = rx.target_seq;
     let new_entry = {
@@ -334,20 +329,13 @@ pub async fn on_end() {
         e[28..32].copy_from_slice(&crc.to_le_bytes());
         e
     };
-    // The OTHER entry: preserve whatever is there (old build keeps its seq
-    // so a fallback boot still works), minus nothing.
-    let old_idx = 1 - new_idx;
-    let mut old_entry = [0u8; 32];
-    old_entry.copy_from_slice(&ot[old_idx * 32..(old_idx + 1) * 32]);
 
+    let target_sector_off = OTADATA_OFF + (new_idx as u32 * 0x1000);
     let mut sector = [0xffu8; 0x1000];
-    sector[new_idx * 32..(new_idx + 1) * 32].copy_from_slice(&new_entry);
-    if old_entry != [0xffu8; 32] && old_entry[0..4] != [0xff; 4] {
-        sector[old_idx * 32..(old_idx + 1) * 32].copy_from_slice(&old_entry);
-    }
+    sector[0..32].copy_from_slice(&new_entry);
 
-    if flash.erase(OTADATA_OFF, OTADATA_OFF + 0x1000).is_err()
-        || flash.write(OTADATA_OFF, &sector).is_err()
+    if flash.erase(target_sector_off, target_sector_off + 0x1000).is_err()
+        || flash.write(target_sector_off, &sector).is_err()
     {
         println!("[ota] otadata write failed — old build keeps running");
         crate::blog!("ota: otadata write failed — old build keeps running");
