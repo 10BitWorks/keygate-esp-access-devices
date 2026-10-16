@@ -338,18 +338,22 @@ pub fn in_data_exchange<'a, I: pn532::Interface, T: CountDown<Time = fugit::Mill
 }
 
 /// Check if an already-activated ISO-DEP target is still physically present
-/// in the RF field by sending a lightweight dummy APDU.
+/// in the RF field by sending a standard Select NDEF Application APDU.
 ///
-/// Returns true if the target answers within 80ms, false if removed from field.
+/// On any NTAG 424 DNA tag (blank from factory or provisioned), the tag answers
+/// 90 00 in <15ms. If the tag was physically removed, the PN532 returns an RF error.
 pub fn is_target_present<I: pn532::Interface, T: CountDown<Time = fugit::MillisDurationU32>, const N: usize>(
     pn532: &mut Pn532<I, T, N>,
     target: u8,
 ) -> bool {
-    let mut tx_buf = [0u8; 5];
+    const SELECT_APP: [u8; 13] = [
+        0x00, 0xA4, 0x04, 0x00, 0x07, 0xD2, 0x76, 0x00, 0x00, 0x85, 0x01, 0x01, 0x00,
+    ];
+    let mut tx_buf = [0u8; 14];
     tx_buf[0] = target;
-    tx_buf[1..5].copy_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+    tx_buf[1..14].copy_from_slice(&SELECT_APP);
     let req = BorrowedRequest::new(Command::InDataExchange, &tx_buf);
-    match pn532.process(req, 10, fugit::MillisDurationU32::from_ticks(80)) {
+    match pn532.process(req, 20, fugit::MillisDurationU32::from_ticks(150)) {
         Ok(resp) => !resp.is_empty() && resp[0] == 0x00,
         Err(_) => false,
     }
