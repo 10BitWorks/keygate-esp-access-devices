@@ -228,7 +228,7 @@ async fn nfc_runner<I: pn532::Interface>(
                             };
                             if let Some((job_id, key_hex)) = prov_ctx {
                                 execute_tag_provisioning(pn, &job_id, &key_hex).await;
-                                let _ = nfc::release_target(pn, 1);
+                                let _ = nfc::deselect_target(pn, 1);
                             }
                         }
                         _ => {
@@ -289,8 +289,8 @@ async fn nfc_runner<I: pn532::Interface>(
                                         status_led::set_state(status_led::LedState::MqttConnected);
                                     }
                                 }
-                                // Release target 1 so the card returns to idle state on PN532.
-                                let _ = nfc::release_target(pn, 1);
+                                // Deselect target 1 so the card returns to ISO 14443-3 ready state.
+                                let _ = nfc::deselect_target(pn, 1);
                             }
                         }
                     }

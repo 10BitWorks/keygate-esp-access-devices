@@ -336,32 +336,22 @@ pub fn in_data_exchange<'a, I: pn532::Interface, T: CountDown<Time = fugit::Mill
     Ok(&resp[1..])
 }
 
-/// Release a selected target in the PN532 (InRelease).
+/// Deselect a selected target in the PN532 (InDeselect).
 ///
-/// Returns target 1 (or 2) back to idle state on both the PN532 and the card,
-/// allowing subsequent InListPassiveTarget calls to smoothly see the resting card.
-pub fn release_target<I: pn532::Interface, T: CountDown<Time = fugit::MillisDurationU32>, const N: usize>(
+/// Sends an ISO 14443-4 S(DESELECT) frame to release the protocol level and
+/// return the card to the ISO 14443-3 READY/IDLE state (NOT the HALT state),
+/// so the resting card continues to answer subsequent InListPassiveTarget polls.
+pub fn deselect_target<I: pn532::Interface, T: CountDown<Time = fugit::MillisDurationU32>, const N: usize>(
     pn532: &mut Pn532<I, T, N>,
     target: u8,
 ) -> Result<(), NfcError> {
     let req = match target {
-        1 => &Request::RELEASE_TAG_1,
-        2 => &Request::RELEASE_TAG_2,
-        _ => &Request::RELEASE_TAG_1,
+        1 => &Request::DESELECT_TAG_1,
+        2 => &Request::DESELECT_TAG_2,
+        _ => &Request::DESELECT_TAG_1,
     };
     let _ = pn532.process(req, 1, fugit::MillisDurationU32::from_ticks(100));
     Ok(())
-}
-
-/// Momentarily drops and re-enables the RF field (~5ms), causing resting
-/// passive tags to undergo a power-on reset back to ready/idle state.
-pub fn rf_field_reset<I: pn532::Interface, T: CountDown<Time = fugit::MillisDurationU32>, const N: usize>(
-    pn532: &mut Pn532<I, T, N>,
-) {
-    let off = Request::new(Command::RFConfiguration, [0x01, 0x00]);
-    let on = Request::new(Command::RFConfiguration, [0x01, 0x01]);
-    let _ = pn532.process(&off, 1, fugit::MillisDurationU32::from_ticks(50));
-    let _ = pn532.process(&on, 1, fugit::MillisDurationU32::from_ticks(50));
 }
 
 
