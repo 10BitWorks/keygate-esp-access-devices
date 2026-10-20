@@ -35,10 +35,10 @@ pub const MQTT_PORT: &str = match option_env!("MQTT_PORT") {
     None => "1883",
 };
 
-/// Relay Trigger Logic Polarity (optional, default: "true")
+/// Relay Trigger Logic Polarity (optional, default: "false" for active-high / normally-open relay board)
 pub const RELAY_ACTIVE_LOW: &str = match option_env!("RELAY_ACTIVE_LOW") {
     Some(val) => val,
-    None => "true",
+    None => "false",
 };
 
 /// How long the door strike stays released on a grant — LOCAL door policy.

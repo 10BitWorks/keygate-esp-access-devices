@@ -482,9 +482,9 @@ pub fn setup(
     println!("XIAO-C6 NFC node starting...");
 
     // 4. Spawn the status LED (GPIO15, active-low) and relay (GPIO1) tasks.
-    //    Each task takes ownership of its pin.
+    //    Each task takes ownership of its pin. Initialized Low (de-energized for active-high relay).
     let led_pin = Output::new(peripherals.GPIO15, Level::High, OutputConfig::default());
-    let relay_pin = Output::new(peripherals.GPIO1, Level::High, OutputConfig::default());
+    let relay_pin = Output::new(peripherals.GPIO1, Level::Low, OutputConfig::default());
 
     // Passive piezo disc on GPIO9, driven by LEDC hardware PWM (zero CPU
     // during tones). GPIO10 (old bridge leg B) idles low, forgotten so the
@@ -608,9 +608,9 @@ pub fn setup(
     println!("door build: pn532 soft-SPI (sck5 mosi22 miso18 cs17)");
 
     // 4. Spawn the status LED (GPIO2 onboard, active-low) and relay (GPIO13) tasks.
-    //    GPIO13 chosen to avoid GPIO12/MTDI strapping pin issues.
+    //    GPIO13 chosen to avoid GPIO12/MTDI strapping pin issues. Initialized Low (de-energized for active-high relay).
     let led_pin = Output::new(peripherals.GPIO2, Level::High, OutputConfig::default());
-    let relay_pin = Output::new(peripherals.GPIO13, Level::High, OutputConfig::default());
+    let relay_pin = Output::new(peripherals.GPIO13, Level::Low, OutputConfig::default());
 
     // Passive piezo disc on GPIO32, driven by LEDC hardware PWM (zero CPU
     // during tones). GPIO33 (old bridge leg B) idles low, forgotten so the
