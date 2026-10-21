@@ -98,7 +98,6 @@ status_t = f"access/{DEVICE}/ota/status"
 
 state = {"logs": [], "statuses": [], "connected": False, "subbed": False}
 
-ERASE_RE = re.compile(r"^erase\s+(\d+)/(\d+)")
 FW_GIT_RE = re.compile(r"fw git:([0-9a-fA-F]+)")
 
 
@@ -196,8 +195,6 @@ confirmed_old_sha = None
 
 # Track already inspected log index to avoid re-evaluating or missing lines
 last_log_idx = 0
-
-ROLLBACK_KEYWORDS = ("probation", "rollback", "ota:", "attempt")
 
 while time.time() < deadline:
     logs_len = len(state["logs"])
