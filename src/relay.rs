@@ -42,6 +42,7 @@ pub async fn relay_task(mut pin: Output<'static>) -> ! {
     // Ensure idle/de-energized state at boot
     pin.set_level(deenergized);
     println!("Relay task initialized (active_low={})", active_low);
+    crate::blog!("relay initialized active_low={}", active_low);
 
     loop {
         let pulse_ms = RELAY_CHANNEL.receive().await;
