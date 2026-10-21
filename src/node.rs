@@ -21,9 +21,10 @@ use minimq::{
 use pn532::Pn532;
 
 use crate::{
-    auth_msg, cmd, config,
+    auth_msg, blog, cmd, config,
     nfc::{self, Pn532Delay},
     ntag424,
+    ota_probation,
     provision,
     provision_flow::{self, ProvAction, ProvMachine, ProvState},
     relay, status_led, tag_debounce,
@@ -467,6 +468,25 @@ async fn mqtt_runner(
     let mut backoff_secs: u64 = 1;
     let mut cycle: u32 = 0;
 
+    let boot_ms = uptime_ms();
+    let probation_active = matches!(
+        (*crate::BOOT_INFO.lock().await).map(|i| i.state),
+        Some(ota_probation::MarkerState::Pending { .. })
+    );
+    let mut confirm_pending = probation_active;
+    let mut last_online_ms = uptime_ms();
+
+    let check_probation_deadline = || async {
+        if probation_active && ota_probation::deadline_expired(boot_ms as u64, uptime_ms() as u64) {
+            println!("probation deadline hit — attempt recorded, rebooting");
+            blog!("probation deadline hit — attempt recorded, rebooting");
+            if let Err(()) = ota::record_attempt_locked().await {
+                blog!("probation record attempt failed");
+            }
+            esp_hal::system::software_reset();
+        }
+    };
+
     // Pick the STRONGEST AP for our SSID and pin the association to it.
     //
     // The fleet SSID is broadcast by many BSSIDs with ~50 dB of spread (bench
@@ -542,22 +562,45 @@ async fn mqtt_runner(
         Timer::after(Duration::from_secs(1)).await;
         println!("[mqtt-cycle {}]", cycle);
 
+        // Probation deadline check at outer-loop top
+        check_probation_deadline().await;
+
+        // Connectivity watchdog: warm wedge lives INSIDE the inner loop;
+        // outer-only checks cannot see it. Check outer loop as well.
+        if uptime_ms().saturating_sub(last_online_ms) > ota_probation::OFFLINE_RESET_MS as u32 {
+            println!("[net-watch] no network evidence 180s — resetting");
+            blog!("[net-watch] no network evidence 180s — resetting");
+            esp_hal::system::software_reset();
+        }
+
+        // Paced erase tick at outer-loop top
+        ota::erase_tick().await;
+
         // Audible connection progress: joining Wi-Fi first.
         piezo::set_conn_state(piezo::conn::WAIT_WIFI);
         status_led::set_state(status_led::LedState::WifiConnecting);
 
         if !wifi_controller.is_connected() {
             println!("Connecting to WiFi...");
-            match wifi_controller.connect_async().await {
-                Ok(_) => println!("WiFi connected"),
-                Err(e) => {
+            match embassy_time::with_timeout(Duration::from_secs(30), wifi_controller.connect_async()).await {
+                Ok(Ok(_)) => println!("WiFi connected"),
+                Ok(Err(e)) => {
                     println!("WiFi connection failed: {:?}", e);
                     blog!("wifi assoc failed: {:?}", e);
+                    check_probation_deadline().await;
                     Timer::after(Duration::from_secs(5)).await;
+                    continue;
+                }
+                Err(_) => {
+                    println!("WiFi connection timeout (30s)");
+                    blog!("wifi connect timeout (30s)");
+                    check_probation_deadline().await;
+                    Timer::after(Duration::from_secs(next_backoff(&mut backoff_secs))).await;
                     continue;
                 }
             }
         }
+        check_probation_deadline().await;
 
         // Wait for DHCP (up to 30 s).
         let mut dhcp_ok = false;
@@ -580,34 +623,63 @@ async fn mqtt_runner(
         // Wi-Fi + DHCP up; audible progress moves to MQTT joining.
         piezo::set_conn_state(piezo::conn::WAIT_MQTT);
 
-        // Resolve broker address.
-        let broker_addr = match stack.dns_query(config::MQTT_HOST, embassy_net::dns::DnsQueryType::A).await {
-            Ok(addrs) if !addrs.is_empty() => addrs[0],
-            Ok(_) => {
+        // Resolve broker address (bounded 15s).
+        let broker_addr = match embassy_time::with_timeout(
+            Duration::from_secs(15),
+            stack.dns_query(config::MQTT_HOST, embassy_net::dns::DnsQueryType::A),
+        )
+        .await
+        {
+            Ok(Ok(addrs)) if !addrs.is_empty() => addrs[0],
+            Ok(Ok(_)) => {
                 println!("DNS returned no addresses for {}", config::MQTT_HOST);
+                check_probation_deadline().await;
                 Timer::after(Duration::from_secs(next_backoff(&mut backoff_secs))).await;
                 continue;
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 println!("DNS lookup failed for {}: {:?}", config::MQTT_HOST, e);
+                check_probation_deadline().await;
+                Timer::after(Duration::from_secs(next_backoff(&mut backoff_secs))).await;
+                continue;
+            }
+            Err(_) => {
+                println!("DNS lookup timed out for {} (15s)", config::MQTT_HOST);
+                blog!("dns lookup timeout (15s)");
+                check_probation_deadline().await;
                 Timer::after(Duration::from_secs(next_backoff(&mut backoff_secs))).await;
                 continue;
             }
         };
+        check_probation_deadline().await;
         println!("Broker {} -> {}:{}", config::MQTT_HOST, broker_addr, broker_port);
 
-        // Open TCP transport, then the MQTT session — both bounded. A broker
+        // Open TCP transport (bounded 15s), then the MQTT session — both bounded. A broker
         // that accepts TCP but stalls CONNACK must not hold a zombie session
         // (and our pump hostage) for minutes.
         let mut socket = TcpSocket::new(stack, &mut tcp_rx_buf[..], &mut tcp_tx_buf[..]);
-        match socket.connect((broker_addr, broker_port)).await {
-            Ok(_) => println!("TCP connected to MQTT broker."),
-            Err(e) => {
+        match embassy_time::with_timeout(
+            Duration::from_secs(15),
+            socket.connect((broker_addr, broker_port)),
+        )
+        .await
+        {
+            Ok(Ok(_)) => println!("TCP connected to MQTT broker."),
+            Ok(Err(e)) => {
                 println!("TCP connection to broker failed: {:?}", e);
+                check_probation_deadline().await;
+                Timer::after(Duration::from_secs(next_backoff(&mut backoff_secs))).await;
+                continue;
+            }
+            Err(_) => {
+                println!("TCP connection to broker timed out (15s)");
+                blog!("tcp connect timeout (15s)");
+                check_probation_deadline().await;
                 Timer::after(Duration::from_secs(next_backoff(&mut backoff_secs))).await;
                 continue;
             }
         }
+        check_probation_deadline().await;
 
         // Build MQTT session with retained offline LWT.
         let will = match Will::new(presence_topic.as_str(), b"offline", &[]) {
@@ -670,19 +742,51 @@ async fn mqtt_runner(
                 let filters = [
                     TopicFilter::new(cmd_topic.as_str()),
                     TopicFilter::new(job_topic.as_str()),
+                    TopicFilter::new(presence_topic.as_str()),
                     TopicFilter::new(ota_meta_topic.as_str()).options(qos1),
                     TopicFilter::new(ota_data_topic.as_str()).options(qos1),
                     TopicFilter::new(ota_end_topic.as_str()).options(qos1),
                 ];
-                if let Err(e) = session.subscribe(&filters, &[]).await {
-                    println!("[mqtt] subscribe failed: {:?}", e);
-                    status_led::set_state(status_led::LedState::DeniedOrOffline);
-                    Timer::after(Duration::from_secs(next_backoff(&mut backoff_secs))).await;
-                    continue;
+                match embassy_time::with_timeout(
+                    Duration::from_secs(10),
+                    session.subscribe(&filters, &[]),
+                )
+                .await
+                {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(e)) => {
+                        println!("[mqtt] subscribe failed: {:?}", e);
+                        status_led::set_state(status_led::LedState::DeniedOrOffline);
+                        check_probation_deadline().await;
+                        Timer::after(Duration::from_secs(next_backoff(&mut backoff_secs))).await;
+                        continue;
+                    }
+                    Err(_) => {
+                        println!("[mqtt] subscribe timed out (10s)");
+                        blog!("mqtt subscribe timeout (10s)");
+                        status_led::set_state(status_led::LedState::DeniedOrOffline);
+                        check_probation_deadline().await;
+                        Timer::after(Duration::from_secs(next_backoff(&mut backoff_secs))).await;
+                        continue;
+                    }
                 }
+                check_probation_deadline().await;
 
                 println!("[mqtt] all subscriptions live — node fully online!");
                 blog!("subscriptions live — online");
+                last_online_ms = uptime_ms();
+
+                if confirm_pending {
+                    match ota::confirm_locked().await {
+                        Ok(()) => {
+                            confirm_pending = false;
+                        }
+                        Err(()) => {
+                            blog!("probation confirm write failed — will retry");
+                        }
+                    }
+                }
+
                 // Audible confirmation: online (plays only when truly online & subscribed!).
                 piezo::set_conn_state(piezo::conn::ONLINE);
 
@@ -690,12 +794,43 @@ async fn mqtt_runner(
                 // Connected MQTT pump loop: drain outbound queues then poll with bounded wait.
                 let mut pump_iters: u32 = 0;
                 let mut last_hb_ms = uptime_ms();
+                let mut hb_count: u32 = 0;
                 loop {
                     pump_iters += 1;
                     let now_ms = uptime_ms();
                     if now_ms.saturating_sub(last_hb_ms) >= 30_000 {
                         println!("[pump hb {} iters]", pump_iters);
                         last_hb_ms = now_ms;
+                        hb_count = hb_count.wrapping_add(1);
+
+                        // Every 2nd hb (~60s): re-publish retained "online" QoS1
+                        if hb_count % 2 == 0 {
+                            let refresh = Publication::new(presence_topic.as_str(), "online")
+                                .retain()
+                                .qos(minimq::QoS::AtLeastOnce);
+                            if let Err(e) = session.publish(refresh).await {
+                                println!("[mqtt] presence refresh publish failed: {:?}", e);
+                            }
+                        }
+
+                        // Connectivity watchdog check every hb
+                        if uptime_ms().saturating_sub(last_online_ms) > ota_probation::OFFLINE_RESET_MS as u32 {
+                            println!("[net-watch] no network evidence 180s — resetting");
+                            blog!("[net-watch] no network evidence 180s — resetting");
+                            esp_hal::system::software_reset();
+                        }
+
+                        // Confirm retry on every 30s pump-hb tick while pending
+                        if confirm_pending {
+                            match ota::confirm_locked().await {
+                                Ok(()) => {
+                                    confirm_pending = false;
+                                }
+                                Err(()) => {
+                                    blog!("probation confirm write failed — will retry");
+                                }
+                            }
+                        }
                     }
                     // 1. Drain and publish any pending auth requests.
                     while let Ok(auth_payload) = AUTH_OUTBOUND.try_receive() {
@@ -726,6 +861,7 @@ async fn mqtt_runner(
                     // 4. Drive MQTT with a bounded 100 ms wait (as documented in minimq examples).
                     // OTA: advance the batched erase; drain status messages.
                     ota::erase_tick().await;
+                    ota::rx_timeout_check(uptime_ms() as u64).await;
                     while let Ok(status) = crate::ota::STATUS_OUTBOUND.try_receive() {
                         let pkt = minimq::Publication::new(ota_status_topic.as_str(), status.as_str())
                             .qos(minimq::QoS::AtLeastOnce);
@@ -741,7 +877,9 @@ async fn mqtt_runner(
                             let payload = msg.payload();
                             println!("[mqtt] rx {} ({}B)", topic, payload.len());
 
-                            if topic == ota_meta_topic.as_str() {
+                            if topic == presence_topic.as_str() {
+                                last_online_ms = uptime_ms();
+                            } else if topic == ota_meta_topic.as_str() {
                                 ota::on_meta(payload).await;
                             } else if topic == ota_data_topic.as_str() {
                                 ota::on_data(payload).await;
