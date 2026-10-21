@@ -517,14 +517,12 @@ pub async fn write_rollback(
         return Err(());
     }
 
+    // runs before the time driver exists (main.rs early boot) — must not await Timer
     for i in 0..4 {
         let chunk_off = target_sector_off + (i as u32 * 1024);
         let chunk_data = &sector_guard[(i * 1024)..((i + 1) * 1024)];
         if flash.write(chunk_off, chunk_data).is_err() {
             return Err(());
-        }
-        if i < 3 {
-            Timer::after(Duration::from_millis(10)).await;
         }
     }
 
@@ -556,10 +554,4 @@ pub async fn confirm_locked() -> Result<(), ()> {
     confirm(flash).await
 }
 
-/// Lock FLASH and run record_attempt() (runtime path for the mqtt runner).
-pub async fn record_attempt_locked() -> Result<(), ()> {
-    let mut guard = FLASH.lock().await;
-    let Some(flash) = guard.as_mut() else { return Err(()) };
-    record_attempt(flash).await
-}
 

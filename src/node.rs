@@ -478,11 +478,8 @@ async fn mqtt_runner(
 
     let check_probation_deadline = || async {
         if probation_active && ota_probation::deadline_expired(boot_ms as u64, uptime_ms() as u64) {
-            println!("probation deadline hit — attempt recorded, rebooting");
-            blog!("probation deadline hit — attempt recorded, rebooting");
-            if let Err(()) = ota::record_attempt_locked().await {
-                blog!("probation record attempt failed");
-            }
+            println!("probation deadline hit — rebooting");
+            blog!("probation deadline hit — rebooting");
             esp_hal::system::software_reset();
         }
     };

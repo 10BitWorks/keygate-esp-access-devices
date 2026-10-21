@@ -11,9 +11,12 @@
 //! The ESP-IDF second stage bootloader validates entries by checking `crc32_le(0, seq)` against `crc[28..32]`.
 //! It ignores the 20-byte `seq_label` scratch area entirely.
 //!
-//! - Torn-write fail-safe: if the magic word is present but the marker CRC does not match,
-//!   `decode_marker` evaluates to `MarkerState::Pending` (NEVER `Confirmed` and NEVER `Absent`),
-//!   defaulting safely toward probation/rollback rather than allowing an unverified image to persist.
+//! - Torn-write fail-safe: every marker field is a single 4-byte word program (atomic at word
+//!   granularity on ESP32 flash); NOR programs only clear bits 1->0. A power-interrupted confirm
+//!   leaves the status word partially cleared (has zero bits but != 0x00000000) -> decodes Pending
+//!   (safe: re-confirm is legal because reprogramming the same word with additional cleared bits
+//!   is a valid 1->0 program — confirm is idempotent). A power-interrupted bitmap byte (!=0xFF and
+//!   !=0x00) counts as a consumed attempt (fails toward rollback = safe).
 //! - Marker-free rollback: rollback entries explicitly wipe the `seq_label` field to all `0xFF`.
 //!   A pending marker on the rollback entry would trigger probation on the known-good previous firmware,
 //!   causing a boot ping-pong loop when the network or broker is unreachable.
@@ -86,8 +89,7 @@ pub fn next_bitmap(bitmap_word: [u8; 4]) -> Option<[u8; 4]> {
 /// - Bytes [4..8): Magic "KGOT" (LE 0x544F474B)
 /// - Bytes [8..12): Status word (0xFFFFFFFF = pending, 0x00000000 = confirmed)
 /// - Bytes [12..16): Attempt bitmap word (4 byte-slots)
-/// - Bytes [16..20): Marker CRC word over bytes [4..16) stored LE
-/// - Bytes [20..24): Spare (stays 0xFF)
+/// - Bytes [16..24): Spare (stays 0xFF)
 pub fn decode_marker(entry: &[u8; 32]) -> MarkerState {
     let magic = u32::from_le_bytes(entry[4..8].try_into().unwrap_or([0xFF; 4]));
     if magic != MAGIC_KGOT {
@@ -96,15 +98,6 @@ pub fn decode_marker(entry: &[u8; 32]) -> MarkerState {
 
     let status = u32::from_le_bytes(entry[8..12].try_into().unwrap_or([0xFF; 4]));
     let bitmap: [u8; 4] = entry[12..16].try_into().unwrap_or([0xFF; 4]);
-    let stored_crc = u32::from_le_bytes(entry[16..20].try_into().unwrap_or([0xFF; 4]));
-    let computed_crc = crc32_le_compat(0, &entry[4..16]);
-
-    if stored_crc != computed_crc {
-        // Torn-write fail-safe: NEVER Confirmed, NEVER Absent. Fail-safe toward rollback.
-        return MarkerState::Pending {
-            attempts: attempts(bitmap),
-        };
-    }
 
     if status == STATUS_CONFIRMED {
         MarkerState::Confirmed
@@ -154,15 +147,12 @@ pub fn rollback_entry_32(current_max_seq: u32) -> [u8; 32] {
 /// - [4..8): magic word `MAGIC_KGOT`
 /// - [8..12): status word `STATUS_PENDING` (0xFFFFFFFF)
 /// - [12..16): attempt bitmap word `[0xFF; 4]` (0 attempts)
-/// - [16..20): marker CRC word over bytes [4..16)
-/// - [20..24): spare `[0xFF; 4]`
+/// - [16..24): spare `[0xFF; 8]`
 pub fn stamp_pending_marker(entry: &mut [u8; 32]) {
     entry[4..8].copy_from_slice(&MAGIC_KGOT.to_le_bytes());
     entry[8..12].copy_from_slice(&STATUS_PENDING.to_le_bytes());
     entry[12..16].copy_from_slice(&[0xFFu8; 4]);
-    let marker_crc = crc32_le_compat(0, &entry[4..16]);
-    entry[16..20].copy_from_slice(&marker_crc.to_le_bytes());
-    entry[20..24].copy_from_slice(&[0xFFu8; 4]);
+    entry[16..24].copy_from_slice(&[0xFFu8; 8]);
 }
 
 /// Transition marker status word from pending to confirmed.
@@ -190,11 +180,8 @@ mod tests {
     fn test_round_trip_encode_decode() {
         let mut entry = [0xFFu8; 32];
         entry[0..4].copy_from_slice(&2u32.to_le_bytes());
-        entry[4..8].copy_from_slice(&MAGIC_KGOT.to_le_bytes());
-        entry[8..12].copy_from_slice(&STATUS_PENDING.to_le_bytes());
+        stamp_pending_marker(&mut entry);
         entry[12..16].copy_from_slice(&[0x00, 0xFF, 0xFF, 0xFF]);
-        let crc = crc32_le_compat(0, &entry[4..16]);
-        entry[16..20].copy_from_slice(&crc.to_le_bytes());
         entry[24..28].copy_from_slice(&2u32.to_le_bytes());
         let entry_crc = crc32_le_compat(0, &entry[0..4]);
         entry[28..32].copy_from_slice(&entry_crc.to_le_bytes());
@@ -204,9 +191,48 @@ mod tests {
 
         let mut confirmed_entry = entry;
         confirmed_entry[8..12].copy_from_slice(&STATUS_CONFIRMED.to_le_bytes());
-        let crc_conf = crc32_le_compat(0, &confirmed_entry[4..16]);
-        confirmed_entry[16..20].copy_from_slice(&crc_conf.to_le_bytes());
         assert_eq!(decode_marker(&confirmed_entry), MarkerState::Confirmed);
+    }
+
+    #[test]
+    fn test_regression_stamp_confirm_transition_decodes_confirmed() {
+        let mut entry = [0xFFu8; 32];
+        stamp_pending_marker(&mut entry);
+        assert_eq!(decode_marker(&entry), MarkerState::Pending { attempts: 0 });
+
+        let status_word: [u8; 4] = entry[8..12].try_into().unwrap();
+        let confirmed_status = confirm_transition(status_word);
+        entry[8..12].copy_from_slice(&confirmed_status);
+        assert_eq!(decode_marker(&entry), MarkerState::Confirmed);
+    }
+
+    #[test]
+    fn test_regression_stamp_next_bitmap_decodes_pending_attempt_1() {
+        let mut entry = [0xFFu8; 32];
+        stamp_pending_marker(&mut entry);
+
+        let bitmap_word: [u8; 4] = entry[12..16].try_into().unwrap();
+        let next = next_bitmap(bitmap_word).expect("first attempt");
+        entry[12..16].copy_from_slice(&next);
+        assert_eq!(decode_marker(&entry), MarkerState::Pending { attempts: 1 });
+    }
+
+    #[test]
+    fn test_partially_cleared_status_word_decodes_pending() {
+        let mut entry = [0xFFu8; 32];
+        stamp_pending_marker(&mut entry);
+        // Partially cleared status word: has zero bits but != 0x00000000
+        entry[8..12].copy_from_slice(&0x00FF_FFFFu32.to_le_bytes());
+        assert_eq!(decode_marker(&entry), MarkerState::Pending { attempts: 0 });
+    }
+
+    #[test]
+    fn test_torn_bitmap_byte_counts_as_consumed_attempt() {
+        let mut entry = [0xFFu8; 32];
+        stamp_pending_marker(&mut entry);
+        // Torn bitmap byte e.g. [0x0F, 0xFF, 0xFF, 0xFF] -> 1 attempt consumed
+        entry[12..16].copy_from_slice(&[0x0F, 0xFF, 0xFF, 0xFF]);
+        assert_eq!(decode_marker(&entry), MarkerState::Pending { attempts: 1 });
     }
 
     #[test]
@@ -217,17 +243,6 @@ mod tests {
         let mut corrupted = [0xAAu8; 32];
         corrupted[4..8].copy_from_slice(b"NOPE");
         assert_eq!(decode_marker(&corrupted), MarkerState::Absent);
-    }
-
-    #[test]
-    fn test_torn_marker_crc_returns_pending_fail_safe() {
-        let mut entry = [0xFFu8; 32];
-        entry[4..8].copy_from_slice(&MAGIC_KGOT.to_le_bytes());
-        entry[8..12].copy_from_slice(&STATUS_CONFIRMED.to_le_bytes());
-        entry[12..16].copy_from_slice(&[0x00, 0x00, 0xFF, 0xFF]);
-        entry[16..20].copy_from_slice(&0xDEADBEEFu32.to_le_bytes());
-
-        assert_eq!(decode_marker(&entry), MarkerState::Pending { attempts: 2 });
     }
 
     #[test]
