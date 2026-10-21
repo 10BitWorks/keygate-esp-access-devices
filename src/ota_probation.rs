@@ -149,6 +149,22 @@ pub fn rollback_entry_32(current_max_seq: u32) -> [u8; 32] {
     entry
 }
 
+/// Stamp the initial PENDING probation marker into the `seq_label` scratch area [4..24) of an otadata entry.
+///
+/// - [4..8): magic word `MAGIC_KGOT`
+/// - [8..12): status word `STATUS_PENDING` (0xFFFFFFFF)
+/// - [12..16): attempt bitmap word `[0xFF; 4]` (0 attempts)
+/// - [16..20): marker CRC word over bytes [4..16)
+/// - [20..24): spare `[0xFF; 4]`
+pub fn stamp_pending_marker(entry: &mut [u8; 32]) {
+    entry[4..8].copy_from_slice(&MAGIC_KGOT.to_le_bytes());
+    entry[8..12].copy_from_slice(&STATUS_PENDING.to_le_bytes());
+    entry[12..16].copy_from_slice(&[0xFFu8; 4]);
+    let marker_crc = crc32_le_compat(0, &entry[4..16]);
+    entry[16..20].copy_from_slice(&marker_crc.to_le_bytes());
+    entry[20..24].copy_from_slice(&[0xFFu8; 4]);
+}
+
 /// Transition marker status word from pending to confirmed.
 ///
 /// Status word 0xFFFFFFFF -> 0x00000000. Idempotent: any other value is returned unchanged.
@@ -328,6 +344,24 @@ mod tests {
             let mut buf = [i; 32];
             buf[4..8].copy_from_slice(&MAGIC_KGOT.to_le_bytes());
             let _ = decode_marker(&buf);
+        }
+    }
+
+    #[test]
+    fn test_stamp_pending_marker() {
+        let mut entry = [0xFFu8; 32];
+        entry[0..4].copy_from_slice(&123u32.to_le_bytes());
+        stamp_pending_marker(&mut entry);
+
+        // Seq remains intact
+        assert_eq!(u32::from_le_bytes(entry[0..4].try_into().unwrap()), 123);
+
+        // Marker decodes as Pending { attempts: 0 }
+        assert_eq!(decode_marker(&entry), MarkerState::Pending { attempts: 0 });
+
+        // Bits only cleared relative to 0xFF in seq_label [4..24)
+        for i in 4..24 {
+            assert_eq!(0xFF & entry[i], entry[i]);
         }
     }
 }

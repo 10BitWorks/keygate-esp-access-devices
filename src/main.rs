@@ -24,6 +24,7 @@ mod nfc;
 mod node;
 mod ntag424;
 mod ota;
+mod ota_probation;
 mod piezo;
 mod platform;
 mod provision;

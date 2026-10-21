@@ -23,9 +23,20 @@ use esp_println::println;
 
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::mutex::Mutex;
+use embassy_time::{Duration, Instant, Timer};
 use embedded_storage::nor_flash::NorFlash;
 use embedded_storage::ReadStorage;
 use esp_storage::FlashStorage;
+
+use crate::ota_probation::{self, MarkerState};
+
+/// Static buffer for 4KB otadata sector operations, avoiding stack allocation.
+///
+/// Safety / Concurrency: Access to flash operations and this buffer is serialized
+/// by the caller holding `FLASH.lock().await` (or being inside single-threaded flash
+/// operations). A `StaticCell` pattern or `AtomicBool` / mutex guards against concurrent use.
+static OTADATA_SECTOR: Mutex<CriticalSectionRawMutex, [u8; 0x1000]> =
+    Mutex::new([0xffu8; 0x1000]);
 
 /// Partition geometry (partitions.csv, auto-placed offsets confirmed by
 /// the second-stage boot log and a live otadata decode).
@@ -97,9 +108,12 @@ struct Rx {
     target_off: u32,
     erase_end: u32,
     erase_next: u32,
+    erase_total_sectors: u32,
+    last_progress_sectors: u32,
     erasing: bool,
     target_seq: u32,
     target_idx: usize,
+    last_activity_ms: u64,
 }
 
 static RX: Mutex<CriticalSectionRawMutex, Option<Rx>> = Mutex::new(None);
@@ -171,6 +185,7 @@ pub async fn on_meta(payload: &[u8]) {
     let target_idx = ((target_seq - 1) % 2) as usize;
     let (target_off, target_len) = OTA_SLOTS[target_idx];
     let erase_end = target_off + meta.size.div_ceil(SECTOR) * SECTOR;
+    let erase_total_sectors = (erase_end - target_off) / SECTOR;
     let _ = target_len;
 
     // Erase in small batches from the pump loop (erase_tick): a single
@@ -187,9 +202,12 @@ pub async fn on_meta(payload: &[u8]) {
         target_off,
         erase_end,
         erase_next: target_off,
+        erase_total_sectors,
+        last_progress_sectors: 0,
         erasing: true,
         target_seq,
         target_idx,
+        last_activity_ms: Instant::now().as_millis() as u64,
     });
 }
 
@@ -237,6 +255,7 @@ pub async fn on_data(payload: &[u8]) {
         *state = None;
         return;
     }
+    rx.last_activity_ms = Instant::now().as_millis() as u64;
     rx.crc_got = crc32_update(rx.crc_got, chunk);
     rx.written += chunk.len() as u32;
     if rx.written % (128 * 1024) == 0 {
@@ -246,9 +265,9 @@ pub async fn on_data(payload: &[u8]) {
 }
 
 /// Erase up to `ERASE_BATCH` sectors per call; called every pump-loop pass
-/// while a transfer is in the erasing phase. Each batch is bounded (~
-/// 100-400 ms), so the executor, Wi-Fi and the watchdog stay live.
-const ERASE_BATCH: u32 = 4;
+/// while a transfer is in the erasing phase. One sector per call = one
+/// ~30-100 ms critical section, so the executor, Wi-Fi and the watchdog stay live.
+const ERASE_BATCH: u32 = 1;
 
 /// Returns true when no batched erase is pending.
 pub async fn erase_tick() -> bool {
@@ -277,6 +296,15 @@ pub async fn erase_tick() -> bool {
             return true;
         }
         rx.erase_next += SECTOR;
+
+        let sectors_done = (rx.erase_next - rx.target_off) / SECTOR;
+        if sectors_done >= rx.last_progress_sectors + 32 || rx.erase_next >= rx.erase_end {
+            rx.last_progress_sectors = sectors_done;
+            let mut buf = heapless::String::<64>::new();
+            use core::fmt::Write as _;
+            let _ = write!(buf, "erase {}/{}", sectors_done, rx.erase_total_sectors);
+            status(buf.as_str());
+        }
     }
     false
 }
@@ -323,7 +351,7 @@ pub async fn on_end() {
     let new_entry = {
         let mut e = [0xffu8; 32];
         e[0..4].copy_from_slice(&new_seq.to_le_bytes());
-        // e[4..24] stays 0xFF (seq_label)
+        ota_probation::stamp_pending_marker(&mut e);
         e[24..28].copy_from_slice(&2u32.to_le_bytes()); // VALID
         let crc = crc32_le(0, &e[0..4]);
         e[28..32].copy_from_slice(&crc.to_le_bytes());
@@ -331,12 +359,31 @@ pub async fn on_end() {
     };
 
     let target_sector_off = OTADATA_OFF + (new_idx as u32 * 0x1000);
-    let mut sector = [0xffu8; 0x1000];
-    sector[0..32].copy_from_slice(&new_entry);
+    let mut sector_guard = OTADATA_SECTOR.lock().await;
+    sector_guard.fill(0xff);
+    sector_guard[0..32].copy_from_slice(&new_entry);
 
-    if flash.erase(target_sector_off, target_sector_off + 0x1000).is_err()
-        || flash.write(target_sector_off, &sector).is_err()
-    {
+    if flash.erase(target_sector_off, target_sector_off + 0x1000).is_err() {
+        println!("[ota] otadata erase failed — old build keeps running");
+        crate::blog!("ota: otadata erase failed — old build keeps running");
+        return;
+    }
+
+    let mut write_failed = false;
+    for i in 0..4 {
+        let chunk_off = target_sector_off + (i as u32 * 1024);
+        let chunk_data = &sector_guard[(i * 1024)..((i + 1) * 1024)];
+        if flash.write(chunk_off, chunk_data).is_err() {
+            write_failed = true;
+            break;
+        }
+        if i < 3 {
+            Timer::after(Duration::from_millis(10)).await;
+        }
+    }
+    drop(sector_guard);
+
+    if write_failed {
         println!("[ota] otadata write failed — old build keeps running");
         crate::blog!("ota: otadata write failed — old build keeps running");
         return;
@@ -356,4 +403,148 @@ pub async fn on_end() {
     drop(state);
     drop(guard);
     esp_hal::system::software_reset();
+}
+
+/// Boot information and marker status discovered from otadata sectors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BootInfo {
+    pub state: MarkerState,
+    pub max_seq: u32,
+    pub booted_slot: usize,
+}
+
+/// Inspect both otadata entries to determine current booted slot and probation marker state.
+pub async fn boot_check(flash: &mut FlashStorage<'static>) -> BootInfo {
+    use esp_hal::rom::crc::crc32_le;
+    let mut e0 = [0u8; 32];
+    let mut e1 = [0u8; 32];
+    let _ = flash.read(OTADATA_OFF, &mut e0);
+    let _ = flash.read(OTADATA_OFF + 0x1000, &mut e1);
+
+    let mut best_slot: Option<(usize, u32)> = None;
+    for (slot_idx, e) in [(0usize, &e0), (1usize, &e1)] {
+        let seq = u32::from_le_bytes(e[0..4].try_into().unwrap_or([0xFF; 4]));
+        let stored = u32::from_le_bytes(e[28..32].try_into().unwrap_or([0xFF; 4]));
+        if seq != u32::MAX && crc32_le(0, &e[0..4]) == stored {
+            if best_slot.map_or(true, |(_, b_seq)| seq > b_seq) {
+                best_slot = Some((slot_idx, seq));
+            }
+        }
+    }
+
+    match best_slot {
+        Some((slot, seq)) => {
+            let entry = if slot == 0 { &e0 } else { &e1 };
+            let state = ota_probation::decode_marker(entry);
+            BootInfo {
+                state,
+                max_seq: seq,
+                booted_slot: slot,
+            }
+        }
+        None => {
+            // Fresh bench flash or all 0xFF
+            BootInfo {
+                state: MarkerState::Absent,
+                max_seq: 1,
+                booted_slot: 0,
+            }
+        }
+    }
+}
+
+/// Record a boot attempt on the booted slot by advancing the bitmap word.
+///
+/// Modifies the 4-byte bitmap word at offset `OTADATA_OFF + slot * 0x1000 + 12`.
+/// Returns Err(()) if attempt budget is exhausted (all slots already 0x00).
+pub async fn record_attempt(flash: &mut FlashStorage<'static>) -> Result<(), ()> {
+    let boot_info = boot_check(flash).await;
+    let slot_off = OTADATA_OFF + (boot_info.booted_slot as u32 * 0x1000);
+    let mut bitmap_word = [0u8; 4];
+    if flash.read(slot_off + 12, &mut bitmap_word).is_err() {
+        return Err(());
+    }
+
+    let Some(next) = ota_probation::next_bitmap(bitmap_word) else {
+        return Err(());
+    };
+
+    // NOR flash allows changing bits 1 -> 0 without sector erase.
+    flash.write(slot_off + 12, &next).map_err(|_| ())
+}
+
+/// Confirm the running firmware by setting status word to STATUS_CONFIRMED.
+///
+/// Idempotent: returns Ok(()) if already confirmed.
+pub async fn confirm(flash: &mut FlashStorage<'static>) -> Result<(), ()> {
+    let boot_info = boot_check(flash).await;
+    let slot_off = OTADATA_OFF + (boot_info.booted_slot as u32 * 0x1000);
+    let mut status_word = [0u8; 4];
+    if flash.read(slot_off + 8, &mut status_word).is_err() {
+        return Err(());
+    }
+
+    let next = ota_probation::confirm_transition(status_word);
+    if next != status_word {
+        flash.write(slot_off + 8, &next).map_err(|_| ())
+    } else {
+        Ok(())
+    }
+}
+
+/// Write a rollback entry into the opposite (previous) slot's otadata sector.
+///
+/// Power loss during the old-sector erase destroys the last-known-good entry —
+/// acceptable: the pending entry survives and the cycle retries (self-healing).
+pub async fn write_rollback(
+    flash: &mut FlashStorage<'static>,
+    max_seq: u32,
+    booted_slot: usize,
+) -> Result<(), ()> {
+    let other_slot = (booted_slot + 1) % 2;
+    let target_sector_off = OTADATA_OFF + (other_slot as u32 * 0x1000);
+
+    let rollback_entry = ota_probation::rollback_entry_32(max_seq);
+
+    let mut sector_guard = OTADATA_SECTOR.lock().await;
+    sector_guard.fill(0xff);
+    sector_guard[0..32].copy_from_slice(&rollback_entry);
+
+    if flash
+        .erase(target_sector_off, target_sector_off + 0x1000)
+        .is_err()
+    {
+        return Err(());
+    }
+
+    for i in 0..4 {
+        let chunk_off = target_sector_off + (i as u32 * 1024);
+        let chunk_data = &sector_guard[(i * 1024)..((i + 1) * 1024)];
+        if flash.write(chunk_off, chunk_data).is_err() {
+            return Err(());
+        }
+        if i < 3 {
+            Timer::after(Duration::from_millis(10)).await;
+        }
+    }
+
+    Ok(())
+}
+
+/// Check RX inactivity timeout.
+///
+/// If RX is active, not in erase phase, and inactivity exceeds RX_TIMEOUT_MS, aborts transfer.
+/// Erase phase note: meta anchors the timer; a mid-erase disconnect at outer-loop 1 sector/s pace
+/// exceeds 120s -> clean abort; host retries the whole push.
+pub async fn rx_timeout_check(now_ms: u64) {
+    let mut state = RX.lock().await;
+    let Some(rx) = state.as_mut() else {
+        return;
+    };
+    if !rx.erasing && now_ms.saturating_sub(rx.last_activity_ms) > ota_probation::RX_TIMEOUT_MS {
+        status("idle: transfer timed out");
+        println!("[ota] RX timeout ({} ms idle) — aborting", now_ms.saturating_sub(rx.last_activity_ms));
+        crate::blog!("ota: RX timeout — aborting");
+        *state = None;
+    }
 }
