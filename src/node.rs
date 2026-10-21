@@ -64,11 +64,10 @@ pub async fn run<I: pn532::Interface>(
     reader_reset: Option<esp_hal::gpio::Output<'static>>,
     stack: embassy_net::Stack<'static>,
     wifi_controller: esp_radio::wifi::WifiController<'static>,
-    wdt: esp_hal::timer::timg::Wdt<esp_hal::peripherals::TIMG1<'static>>,
 ) -> ! {
     embassy_futures::join::join(
         nfc_runner(pn532, reader_reset),
-        mqtt_runner(stack, wifi_controller, wdt),
+        mqtt_runner(stack, wifi_controller),
     )
     .await;
 
@@ -429,7 +428,6 @@ async fn execute_tag_provisioning<I: pn532::Interface>(
 async fn mqtt_runner(
     stack: embassy_net::Stack<'static>,
     mut wifi_controller: esp_radio::wifi::WifiController<'static>,
-    mut wdt: esp_hal::timer::timg::Wdt<esp_hal::peripherals::TIMG1<'static>>,
 ) -> ! {
     static TCP_RX: static_cell::StaticCell<[u8; 1024]> = static_cell::StaticCell::new();
     static TCP_TX: static_cell::StaticCell<[u8; 1024]> = static_cell::StaticCell::new();
@@ -726,9 +724,6 @@ async fn mqtt_runner(
                     }
 
                     // 4. Drive MQTT with a bounded 100 ms wait (as documented in minimq examples).
-                    // Watchdog: if ANY task wedges (e.g. a flash op), the
-                    // 30s WDT reboots and the OLD build keeps guarding.
-                    wdt.feed();
                     // OTA: advance the batched erase; drain status messages.
                     ota::erase_tick().await;
                     while let Ok(status) = crate::ota::STATUS_OUTBOUND.try_receive() {

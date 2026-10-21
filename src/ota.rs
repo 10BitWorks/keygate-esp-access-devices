@@ -548,3 +548,18 @@ pub async fn rx_timeout_check(now_ms: u64) {
         *state = None;
     }
 }
+
+/// Lock FLASH and run confirm() (runtime path for the mqtt runner).
+pub async fn confirm_locked() -> Result<(), ()> {
+    let mut guard = FLASH.lock().await;
+    let Some(flash) = guard.as_mut() else { return Err(()) };
+    confirm(flash).await
+}
+
+/// Lock FLASH and run record_attempt() (runtime path for the mqtt runner).
+pub async fn record_attempt_locked() -> Result<(), ()> {
+    let mut guard = FLASH.lock().await;
+    let Some(flash) = guard.as_mut() else { return Err(()) };
+    record_attempt(flash).await
+}
+
