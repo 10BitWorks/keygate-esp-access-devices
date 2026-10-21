@@ -8,6 +8,7 @@ pub mod reader_supervisor;
 pub mod piezo;
 pub mod provision;
 pub mod provision_flow;
+pub mod ota_probation;
 
 /// OTA firmware updates over MQTT (target-only: needs the flash driver).
 #[cfg(any(target_arch = "riscv32", target_arch = "xtensa"))]
