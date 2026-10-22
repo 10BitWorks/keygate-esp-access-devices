@@ -52,6 +52,12 @@ parser.add_argument(
     help="MQTT broker hostname or IP (default: 10.7.1.106)",
 )
 parser.add_argument(
+    "--pace-ms",
+    type=int,
+    default=20,
+    help="inter-chunk delay in ms (default: 20; raise for weak WiFi links, e.g. 60)",
+)
+parser.add_argument(
     "--wait-secs",
     type=int,
     default=90,
@@ -179,7 +185,7 @@ for off in range(0, len(data), CHUNK):
     # wire format: [u32 LE offset][bytes] — idempotent under QoS1 dupes
     pkt = off.to_bytes(4, "little") + data[off:off + CHUNK]
     cli.publish(data_t, pkt, qos=1).wait_for_publish()
-    time.sleep(0.02)  # pace: the device erases/writes flash per chunk
+    time.sleep(args.pace_ms / 1000.0)  # pace: the device erases/writes flash per chunk
     if (off // CHUNK) % 40 == 0:
         print(f"data: {off}/{len(data)} bytes")
 print(f"data: done in {time.time() - t0:.1f}s")
