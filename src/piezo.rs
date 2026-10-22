@@ -68,6 +68,33 @@ pub const ON_MS_MIN: u32 = 10;
 /// Longest accepted tone duration (ms).
 pub const ON_MS_MAX: u32 = 1000;
 
+/// Lowest frequency the LEDC timer accepts from an 80 MHz APB clock at
+/// 8-bit duty resolution: 80_000_000 / 262_143 (2^18-1, the max divider)
+/// = 305.18 Hz, rounded up. esp-hal 1.1.1's `ledc::timer::Timer::configure`
+/// has a sticky `use_ref_tick` bug on the classic ESP32 (the only target
+/// with a REF_TICK fallback): one tone below this floor flips the timer
+/// to the 1 MHz REF_TICK source and the flag is never reset, permanently
+/// derating every later tone to f/80 (a 1047 Hz note comes out ~13 Hz
+/// until reboot). The ESP32-C6 has no REF_TICK path (and its APB is also
+/// 80 MHz: PLL 240/3 AHB, APB div 0), so `configure` would just return
+/// `Err(Divisor)` — this floor is exact for both boards. Do NOT request
+/// below it; [`clamp_freq`] is the guard.
+pub const LEDC_APB_MIN_HZ: u32 = 306;
+
+/// Clamp a tone frequency up to the LEDC APB floor ([`LEDC_APB_MIN_HZ`]).
+///
+/// Pure so host tests can pin the guard. `LedcTone::start` (board.rs)
+/// calls this before `timer.configure`, so no request can reach the
+/// divider overflow — and, on the classic ESP32, the sticky REF_TICK
+/// corruption.
+pub fn clamp_freq(freq_hz: u32) -> u32 {
+    if freq_hz < LEDC_APB_MIN_HZ {
+        LEDC_APB_MIN_HZ
+    } else {
+        freq_hz
+    }
+}
+
 /// Feedback pattern per event, per draft decision D5.
 
 /// Connection progress states for the audible status beeps. Written by the
@@ -166,16 +193,22 @@ pub const MARIO_THEME_RIFF: &[Beep] = &[
 ];
 
 /// Super Mario Bros death jingle (the "lose a life" sting):
-/// B4 - F5 - F5 - F5 - E5 - D5 - C5, then the low E4 - E4 - C4(held) tail.
+/// B4 - F5 - F5 - F5 - E5 - D5 - C5, then an E5 - E5 - C5(held) tail.
 /// Transcribed from the note array in `hibit-dev/buzzer`
 /// `src/games/mario_bros/mario_bros.ino` (MIT,
 /// https://github.com/hibit-dev/buzzer): B4 eighth, F5 quarter accent,
-/// eighth-note descending run, E4 quarter + E4 eighth, C4 half. Slots are
-/// scaled to this firmware's 220 BPM eighth (83 ms tone + 42 ms rest, the
-/// same vocabulary as MARIO_THEME_RIFF) with the final C4 hold tightened
+/// eighth-note descending run, E4 quarter + E4 eighth, C4 half. The tail
+/// is lifted one octave (E5 E5 C5) from the transcription: the piezo
+/// disc reproduces the low register poorly AND any tone below
+/// [`LEDC_APB_MIN_HZ`] (306 Hz — C4 is 262 Hz) permanently corrupts the
+/// LEDC timer on the classic ESP32 (sticky REF_TICK selection in esp-hal
+/// 1.1.1 `timer.rs`: `use_ref_tick` is set on divisor overflow and never
+/// reset, so every later tone plays at f/80 until reboot). Slots stay at
+/// this firmware's 220 BPM eighth (83 ms tone + 42 ms rest, the same
+/// vocabulary as MARIO_THEME_RIFF) with the final C5 hold tightened
 /// 500 -> 332 ms. Total duration: 1623 ms (~1.62s). Beat order: B4 494,
-/// F5 698 (accent), F5, F5, E5 659, D5 587, C5 523, E4 330, E4 330, C4 262
-/// (held).
+/// F5 698 (accent), F5, F5, E5 659, D5 587, C5 523, E5 659, E5 659,
+/// C5 523 (held).
 pub const MARIO_DEATH_RIFF: &[Beep] = &[
     Beep { freq: 494, tone_duration_ms: 83, rest_duration_ms: 42 },
     Beep { freq: 698, tone_duration_ms: 166, rest_duration_ms: 42 },
@@ -184,9 +217,9 @@ pub const MARIO_DEATH_RIFF: &[Beep] = &[
     Beep { freq: 659, tone_duration_ms: 83, rest_duration_ms: 42 },
     Beep { freq: 587, tone_duration_ms: 83, rest_duration_ms: 42 },
     Beep { freq: 523, tone_duration_ms: 83, rest_duration_ms: 42 },
-    Beep { freq: 330, tone_duration_ms: 166, rest_duration_ms: 42 },
-    Beep { freq: 330, tone_duration_ms: 83, rest_duration_ms: 42 },
-    Beep { freq: 262, tone_duration_ms: 332, rest_duration_ms: 0 },
+    Beep { freq: 659, tone_duration_ms: 166, rest_duration_ms: 42 },
+    Beep { freq: 659, tone_duration_ms: 83, rest_duration_ms: 42 },
+    Beep { freq: 523, tone_duration_ms: 332, rest_duration_ms: 0 },
 ];
 
 /// FNV-1a 32-bit hash of the raw UID bytes.
@@ -239,15 +272,35 @@ pub static FIELD_UID: embassy_sync::mutex::Mutex<
     heapless::Vec<u8, 10>,
 > = embassy_sync::mutex::Mutex::new(heapless::Vec::new());
 
+/// Change counter bumped on every [`FIELD_UID`] update — the two-sided
+/// handshake that makes a `FIELD_WAKER` wake with no registered waiter
+/// (which embassy-sync 0.8 drops) observable anyway: waiters register the
+/// waker *before* comparing this counter, so a bump in any interleaving
+/// is always seen via the counter or the waker.
+static FIELD_REV: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// Woken on every [`FIELD_UID`] update so the piezo task's melody loop
+/// can race note timers against field changes — instant stop on tap
+/// removal (see `wait_field_exit_or_swap` in [`run`]).
+pub static FIELD_WAKER: embassy_sync::waitqueue::AtomicWaker =
+    embassy_sync::waitqueue::AtomicWaker::new();
+
 /// Publish the in-field tag's UID (empty slice = tag left the field).
 pub async fn set_field_uid(uid: &[u8]) {
-    let mut guard = FIELD_UID.lock().await;
-    guard.clear();
-    for &b in uid {
-        if guard.push(b).is_err() {
-            break;
+    {
+        let mut guard = FIELD_UID.lock().await;
+        guard.clear();
+        for &b in uid {
+            if guard.push(b).is_err() {
+                break;
+            }
         }
     }
+    // Signal field-change waiters after the new value is visible: bump
+    // the revision, then wake. A waiter that has not registered yet sees
+    // the bump on its next compare; one that has gets the wake.
+    FIELD_REV.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    FIELD_WAKER.wake();
 }
 
 /// Publish a new connection state for the audible progress beeps.
@@ -303,7 +356,7 @@ pub const PATTERN_TABLE: &[(BeepEvent, &[Tone])] = &[
     (BeepEvent::Boot, &[(2600, 60)]),
     // Reader-dead alarm: three low tones, unmistakable next to the connect
     // beeps (2000/2500 Hz) and the Denied Mario death jingle (which ends
-    // with a held low C4 after a fast descending run).
+    // with a held C5 after a fast descending run).
     (
         BeepEvent::NfcDown,
         &[(900, 180), (900, 180), (900, 180)],
@@ -341,6 +394,9 @@ pub trait ToneDriver {
 mod embedded {
     use super::*;
 
+    use core::future::poll_fn;
+    use core::task::Poll;
+    use embassy_futures::select::{Either, select};
     use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
     use embassy_sync::channel::{Channel, Receiver, Sender};
     use embassy_time::{Duration, Timer, with_timeout};
@@ -413,18 +469,54 @@ mod embedded {
         super::CONN_STATE.load(core::sync::atomic::Ordering::Relaxed)
     }
 
+    /// Park until FIELD_UID no longer equals `field` (card removed or
+    /// swapped). Purely event-driven — the future parks on
+    /// [`super::FIELD_WAKER`] and re-polls only on a wake. Same-uid
+    /// refreshes (re-tap heartbeat) re-arm the wait without completing,
+    /// so a note timer racing this future in a `select` is never
+    /// restarted by them.
+    ///
+    /// The revision compare lives *inside* the poll after registering
+    /// the waker, which closes embassy-sync 0.8's lost-wake window (a
+    /// `wake` with no registered waker is dropped): a bump landing in
+    /// any interleaving is observed via the counter or the wake.
+    async fn wait_field_exit_or_swap(field: &[u8]) {
+        let mut armed_rev = super::FIELD_REV.load(core::sync::atomic::Ordering::Relaxed);
+        loop {
+            poll_fn(|cx| {
+                super::FIELD_WAKER.register(cx.waker());
+                if super::FIELD_REV.load(core::sync::atomic::Ordering::Relaxed) != armed_rev {
+                    Poll::Ready(())
+                } else {
+                    Poll::Pending
+                }
+            })
+            .await;
+            if super::FIELD_UID.lock().await.as_slice() != field {
+                return;
+            }
+            // Same-uid refresh: swallow it, re-arm for the next revision.
+            armed_rev = super::FIELD_REV.load(core::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
     /// Drain feedback events and play their patterns forever.
     ///
     /// While a card is in the field, its UID-derived measure (see
-    /// [`generate_melody`]) repeats: the card audibly announces itself. The
-    /// TagDetected event (empty pattern) wakes the idle wait instantly on a
-    /// sighting so the melody starts without lag. Every beat awaits its
-    /// rest — the executor always gets a slice (no starvation) — and each
-    /// rest doubles as a checkpoint: field exit, card swap, or a queued
-    /// event (verdict chirp) preempts the measure. Between events (1 s
-    /// tick) the connection state drives audible progress: single beep
-    /// while joining Wi-Fi, double beep while joining MQTT, a rising
-    /// confirmation when online, and a slow beep every 15 s while
+    /// [`generate_melody`]) repeats: the card audibly announces itself.
+    /// The TagDetected event (empty pattern) wakes the idle wait instantly
+    /// on a sighting so the melody starts without lag. Every note and rest
+    /// races its timer against a field-change wake (`select` of
+    /// `Timer::after` and [`wait_field_exit_or_swap`]): tap removal or a
+    /// card swap cuts the sounding note within one scheduler tick — no
+    /// beat-boundary tail, no lingering tone after the tap is gone.
+    /// Verdicts (granted/denied) play the instant they arrive: the
+    /// sounding note stops, the verdict melody takes over, and the
+    /// abandoned measure does not resume. Every await is event-driven
+    /// (timer or waker) — the loop never polls or spins. Between events
+    /// (500 ms tick) the connection state drives audible progress:
+    /// single beep while joining Wi-Fi, double beep while joining MQTT, a
+    /// rising confirmation when online, and a slow beep every 15 s while
     /// reconnecting after a drop.
     pub async fn run<T: ToneDriver>(rx: PiezoReceiver, mut tone: T) -> ! {
         tone.stop();
@@ -432,56 +524,76 @@ mod embedded {
 
         let mut tick: u32 = 0;
         let mut online_announced = false;
-        let mut pending_verdict: Option<BeepEvent> = None;
         loop {
-            // In-field identity melody. Every beat awaits its rest — this
-            // loop always yields, never starves the executor.
-            loop {
+            // In-field identity melody. Every beat races its timers
+            // against a field-change wake; the loop only yields, never
+            // starves the executor.
+            'melody: loop {
                 let field = FIELD_UID.lock().await.clone();
                 if field.is_empty() {
-                    break;
+                    break 'melody;
                 }
-                for beat in generate_melody(&field) {
+                'measure: for beat in generate_melody(&field) {
                     if FIELD_UID.lock().await.as_slice() != field.as_slice() {
-                        break; // card left or swapped mid-measure
+                        break 'measure; // card left or swapped mid-measure
                     }
                     if let Ok(event) = rx.try_receive() {
                         match event {
                             BeepEvent::Granted | BeepEvent::Denied => {
-                                // Defer verdict until the card is physically removed
-                                // so it never steps on or interrupts the card's identity melody!
-                                pending_verdict = Some(event);
+                                // Verdict-on-arrival: the verdict is the
+                                // important sound — cut the note, play it
+                                // now, abandon the measure, return to
+                                // idle. The melody does not resume.
+                                tone.stop();
+                                println!("[piezo] play verdict {:?} (immediate)", event);
+                                if event == BeepEvent::Granted {
+                                    play_melody(&mut tone, MARIO_THEME_RIFF).await;
+                                } else {
+                                    play_melody(&mut tone, MARIO_DEATH_RIFF).await;
+                                }
+                                break 'melody;
                             }
                             _ => {
                                 let pattern = pattern_for(event);
                                 if !pattern.is_empty() {
-                                    println!("[piezo] play {:?} ({} tone(s))", event, pattern.len());
+                                    println!(
+                                        "[piezo] play {:?} ({} tone(s))",
+                                        event,
+                                        pattern.len()
+                                    );
                                     play_pattern(&mut tone, &pattern).await;
                                 }
                             }
                         }
                     }
-                    // Full-length notes: the hardware PWM emits the waveform
-                    // while this task awaits — the NFC task keeps its slice.
-                    play_tone(&mut tone, beat.freq, beat.tone_duration_ms).await;
-                    if beat.rest_duration_ms > 0 {
-                        Timer::after(Duration::from_millis(beat.rest_duration_ms as u64)).await;
+                    // Full-length notes: the hardware PWM emits the
+                    // waveform while this task awaits — and the await
+                    // races the note timer against field exit/swap so
+                    // removal cuts the sounding note instantly.
+                    tone.start(beat.freq);
+                    match select(
+                        Timer::after(Duration::from_millis(u64::from(beat.tone_duration_ms))),
+                        wait_field_exit_or_swap(&field),
+                    )
+                    .await
+                    {
+                        Either::First(()) => {}
+                        Either::Second(()) => {
+                            tone.stop();
+                            break 'measure;
+                        }
                     }
-                }
-            }
-
-            // Card was removed from the reader (field is empty).
-            // If a verdict arrived while the card was held, play it NOW!
-            if let Some(verdict) = pending_verdict.take() {
-                println!("[piezo] play deferred {:?}", verdict);
-                if verdict == BeepEvent::Granted {
-                    play_melody(&mut tone, MARIO_THEME_RIFF).await;
-                } else if verdict == BeepEvent::Denied {
-                    play_melody(&mut tone, MARIO_DEATH_RIFF).await;
-                } else {
-                    let pattern = pattern_for(verdict);
-                    if !pattern.is_empty() {
-                        play_pattern(&mut tone, &pattern).await;
+                    tone.stop();
+                    if beat.rest_duration_ms > 0 {
+                        match select(
+                            Timer::after(Duration::from_millis(u64::from(beat.rest_duration_ms))),
+                            wait_field_exit_or_swap(&field),
+                        )
+                        .await
+                        {
+                            Either::First(()) => {}
+                            Either::Second(()) => break 'measure,
+                        }
                     }
                 }
             }
@@ -739,8 +851,12 @@ mod tests {
     fn mario_death_riff_matches_transcription() {
         // Super Mario Bros death jingle, transcribed from hibit-dev/buzzer
         // src/games/mario_bros/mario_bros.ino (MIT): B4 pickup, F5 quarter
-        // accent, F5-F5-E5-D5-C5 eighth run, E4 quarter + E4 eighth, C4
-        // half held. The rejected Bb3 buzz (233 Hz) must never return.
+        // accent, F5-F5-E5-D5-C5 eighth run, then the E5-E5-C5(held) tail —
+        // lifted one octave above the transcription's E4-E4-C4 because the
+        // disc reproduces the low register poorly AND the sub-306 Hz C4
+        // (262 Hz) tail permanently corrupted the LEDC timer (sticky
+        // REF_TICK, esp-hal 1.1.1 — see MARIO_DEATH_RIFF). The rejected
+        // Bb3 buzz (233 Hz) must never return.
         assert_eq!(MARIO_DEATH_RIFF.len(), 10);
         assert_eq!(MARIO_DEATH_RIFF[0].freq, 494); // B4 pickup
         // F5 accent: the quarter beat is longer than the eighth run around it.
@@ -756,14 +872,23 @@ mod tests {
             "E5-D5-C5 run must strictly descend"
         );
         assert_eq!((run[0].freq, run[1].freq, run[2].freq), (659, 587, 523));
-        // Low tail: E4, E4, then the held C4.
+        // Tail: E5, E5, then the held C5 — one octave above the original
+        // E4-E4-C4 so no note dips below the LEDC APB floor.
         assert_eq!(
             (
                 MARIO_DEATH_RIFF[7].freq,
                 MARIO_DEATH_RIFF[8].freq,
                 MARIO_DEATH_RIFF[9].freq
             ),
-            (330, 330, 262)
+            (659, 659, 523)
+        );
+        // The held tail keeps its 332 ms hold.
+        assert_eq!(MARIO_DEATH_RIFF[9].tone_duration_ms, 332);
+        // LEDC floor invariant: no note may request a frequency that
+        // trips the sticky REF_TICK corruption (or Err(Divisor) on C6).
+        assert!(
+            MARIO_DEATH_RIFF.iter().all(|b| b.freq >= LEDC_APB_MIN_HZ),
+            "every death-jingle note must clear the LEDC APB floor"
         );
         let total_ms: u32 = MARIO_DEATH_RIFF
             .iter()
@@ -774,5 +899,20 @@ mod tests {
             "death sting {total_ms} ms outside 800..2000"
         );
         assert_eq!(total_ms, 1623);
+    }
+
+    #[test]
+    fn clamp_freq_enforces_ledc_apb_floor() {
+        // Given a requested tone below the LEDC APB floor, when clamped,
+        // then the result is exactly the floor; at-or-above passes
+        // through unchanged.
+        assert_eq!(clamp_freq(0), LEDC_APB_MIN_HZ);
+        assert_eq!(clamp_freq(200), LEDC_APB_MIN_HZ); // FREQ_MIN_HZ itself
+        assert_eq!(clamp_freq(262), LEDC_APB_MIN_HZ); // the old death-tail C4
+        assert_eq!(clamp_freq(305), LEDC_APB_MIN_HZ); // floor is 305.18
+        assert_eq!(clamp_freq(306), LEDC_APB_MIN_HZ);
+        assert_eq!(clamp_freq(307), 307);
+        assert_eq!(clamp_freq(523), 523); // new death-tail C5 stays legal
+        assert_eq!(clamp_freq(5000), 5000); // FREQ_MAX_HZ passes through
     }
 }

@@ -67,6 +67,13 @@ pub async fn piezo_task(rx: piezo::PiezoReceiver, tone: LedcTone) -> ! {
 /// persistent error cannot spam the UART.
 static DUTY_ERR_SEEN: [AtomicBool; 2] = [AtomicBool::new(false), AtomicBool::new(false)];
 
+/// Once-latch for the LEDC floor-clamp notice (UART print; the blog ring
+/// line is emitted every time it fires — cheap, drop-oldest, and after
+/// the death-tail fix no in-tree pattern can trigger it).
+static FLOOR_CLAMP_SEEN: AtomicBool = AtomicBool::new(false);
+/// Once-latch for `timer.configure` errors (both UART and blog).
+static CFG_ERR_SEEN: AtomicBool = AtomicBool::new(false);
+
 /// Set a channel's duty, printing the channel's first error.
 ///
 /// `set_duty` failures should never happen (0-100 duty is always valid and
@@ -120,17 +127,46 @@ fn ledc_spy_dump() {
     println!(
         "[piezo-spy] ch0_duty={ch0_duty:#x} ch1_duty={ch1_duty:#x} ch1_hpoint={ch1_hpoint:#x} gpio{pin_a}_sel={sel_a:#x} gpio{pin_b}_sel={sel_b:#x}"
     );
+    // Mirror into the diag ring so the dump also lands on
+    // `access/<id>/log`: the ring flushes on EVERY MQTT (re)connect
+    // (node.rs mqtt_runner publishes up to 12 lines, drains overflow) —
+    // live at the next connect, not boot-only.
+    crate::blog!(
+        "[piezo-spy] ch0_duty={ch0_duty:#x} ch1_duty={ch1_duty:#x} ch1_hpoint={ch1_hpoint:#x} gpio{pin_a}_sel={sel_a:#x} gpio{pin_b}_sel={sel_b:#x}"
+    );
 }
 
 impl piezo::ToneDriver for LedcTone {
     fn start(&mut self, freq_hz: u32) {
-        self.timer
-            .configure(esp_hal::ledc::timer::config::Config {
-                duty: esp_hal::ledc::timer::config::Duty::Duty8Bit,
-                clock_source: esp_hal::ledc::timer::LSClockSource::APBClk,
-                frequency: esp_hal::time::Rate::from_hz(freq_hz),
-            })
-            .ok();
+        // Never let a sub-floor request reach the timer: on the classic
+        // ESP32 one such tone permanently corrupts the LEDC timer (sticky
+        // REF_TICK selection, esp-hal 1.1.1 — see piezo::LEDC_APB_MIN_HZ).
+        let clamped = piezo::clamp_freq(freq_hz);
+        if clamped != freq_hz {
+            if !FLOOR_CLAMP_SEEN.swap(true, Ordering::Relaxed) {
+                println!(
+                    "[piezo] freq {freq_hz} Hz below APB floor, clamped to {}",
+                    piezo::LEDC_APB_MIN_HZ
+                );
+            }
+            crate::blog!(
+                "[piezo] freq {freq_hz} Hz below APB floor, clamped to {}",
+                piezo::LEDC_APB_MIN_HZ
+            );
+        }
+        // Checked, not swallowed: a configure error (e.g. divisor out of
+        // range) means the note will not sound at the requested pitch —
+        // that belongs on the UART and the broker log, not in a `.ok()`.
+        if let Err(e) = self.timer.configure(esp_hal::ledc::timer::config::Config {
+            duty: esp_hal::ledc::timer::config::Duty::Duty8Bit,
+            clock_source: esp_hal::ledc::timer::LSClockSource::APBClk,
+            frequency: esp_hal::time::Rate::from_hz(clamped),
+        }) {
+            if !CFG_ERR_SEEN.swap(true, Ordering::Relaxed) {
+                println!("[piezo] timer configure error: {e:?}");
+            }
+            crate::blog!("[piezo] timer configure error: {e:?}");
+        }
         set_duty_checked(&self.ch0, 50, 0);
         set_duty_checked(&self.ch1, 50, 1);
         // After the duty writes settle, dump the routing truth once.
