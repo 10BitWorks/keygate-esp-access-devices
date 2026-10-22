@@ -47,6 +47,10 @@ board-esp32-devkit-door = []
 # Bench diagnostics: wire-level spy (write frames, STATUS transitions, response dumps,
 # poll heartbeat) on the door soft-SPI driver. See docs/PN532-SPI-NOTES.md. Not default.
 nfc-spy = []
+# Bench-only: executor-starvation injection (non-yielding spin in the cmd handler
+# via {"wedge":true}) used to prove the dedicated TIMG1 WDT-feeder contract. Not in
+# `default`; never built into a shipped/OTA image. See plan ota-stability.md task 8.
+bench-wedge = []
 
 [target.'cfg(any(target_arch = "riscv32", target_arch = "xtensa"))'.dependencies]
 # ESP32 HAL and runtime

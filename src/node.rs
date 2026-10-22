@@ -883,6 +883,22 @@ async fn mqtt_runner(
                             } else if topic == ota_end_topic.as_str() {
                                 ota::on_end().await;
                             } else if topic == cmd_topic.as_str() {
+                                // Bench-only executor-starvation injection (plan task 8).
+                                // A non-yielding spin here starves the dedicated TIMG1
+                                // feeder -> hardware WDT reset, proving the
+                                // feeder/starvation contract. Gated behind a NON-DEFAULT
+                                // feature: never present in production binaries or OTA
+                                // images. `black_box` per iteration keeps the loop
+                                // materialized (~2-4 cycles at 240 MHz).
+                                #[cfg(feature = "bench-wedge")]
+                                if payload.windows(5).any(|w| w == b"wedge") {
+                                    println!(
+                                        "[bench] wedge: spinning (expect WDT reset <=30s)"
+                                    );
+                                    loop {
+                                        core::hint::black_box(0u32);
+                                    }
+                                }
                                 if let Ok(c) = cmd::parse_cmd_slice(payload) {
                                     if c.grant {
                                         // Door timing is LOCAL policy — the
