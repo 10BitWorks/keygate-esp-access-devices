@@ -891,10 +891,11 @@ async fn mqtt_runner(
                                 // images. `black_box` per iteration keeps the loop
                                 // materialized (~2-4 cycles at 240 MHz).
                                 #[cfg(feature = "bench-wedge")]
-                                if payload.windows(5).any(|w| w == b"wedge") {
-                                    println!(
-                                        "[bench] wedge: spinning (expect WDT reset <=30s)"
-                                    );
+if payload.windows(5).any(|w| w == b"wedge") {
+                                        crate::rwdt_diag("wedge-entry");
+                                        println!(
+                                            "[bench] wedge: spinning (expect WDT reset <=30s)"
+                                        );
                                     loop {
                                         core::hint::black_box(0u32);
                                     }

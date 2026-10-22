@@ -52,13 +52,46 @@ unsafe extern "Rust" fn custom_halt() -> ! {
     esp_hal::system::software_reset();
 }
 
+/// Construct an RTC-WDT instance. `esp_hal::rtc_cntl::Rwdt` is a zero-sized
+/// handle over the LP_WDT peripheral with no public constructor in esp-hal
+/// 1.1.1; since it is a ZST, `MaybeUninit::uninit().assume_init()` is sound
+/// (there are no bytes to initialize). The RTC WDT (RWDT) is the ROM-grade
+/// watchdog and, unlike the TIMG1 MWDT, its config writes actually land on
+/// classic ESP32 (see plan task 11).
+fn rwdt_inst() -> esp_hal::rtc_cntl::Rwdt {
+    // SAFETY: Rwdt is a zero-sized type; uninit() has no invalid bit patterns.
+    unsafe { core::mem::MaybeUninit::uninit().assume_init() }
+}
+
 #[embassy_executor::task]
 pub async fn wdt_feeder() -> ! {
-    let mut wdt = esp_hal::timer::timg::Wdt::<esp_hal::peripherals::TIMG1<'static>>::new();
+    let mut wdt = rwdt_inst();
+    #[cfg(feature = "bench-wedge")]
+    let mut n: u8 = 0;
     loop {
         embassy_time::Timer::after(embassy_time::Duration::from_secs(5)).await;
+        #[cfg(feature = "bench-wedge")]
+        if n < 2 {
+            rwdt_diag("feeder-pre-feed");
+        }
         wdt.feed();
+        #[cfg(feature = "bench-wedge")]
+        {
+            if n < 2 {
+                rwdt_diag("feeder-post-feed");
+            }
+            n = n.saturating_add(1);
+        }
     }
+}
+
+/// Bench-only (bench-wedge) RTC-WDT code-path marker — task 11 confirmation.
+/// (The classic-ESP32 LP_WDT peripheral is not exposed via `esp_hal::peripherals`,
+/// so no raw register read here; the definitive proof that RWDT armed and fires
+/// is the bench wedge drill itself: wedge -> RWDT reset.)
+#[cfg(feature = "bench-wedge")]
+pub(crate) fn rwdt_diag(tag: &str) {
+    esp_println::println!("[rwdt] {}", tag);
 }
 
 #[embassy_executor::task]
@@ -116,18 +149,27 @@ async fn main(spawner: Spawner) -> ! {
 
     drop(early_flash);
 
-    // 4. Arm the WDT before board::setup
-    let mut wdt = esp_hal::timer::timg::Wdt::<esp_hal::peripherals::TIMG1<'static>>::new();
+    // 4. Arm the WDT before board::setup. Task-11 fix: use the RTC WDT (RWDT),
+    // not the TIMG1 MWDT — on classic ESP32 the TIMG1 MWDT config writes do not
+    // land (wdt_en stays 0, bench-proven), so the MWDT never arms nor fires.
+    // RWDT is the ROM-grade watchdog in the RTC domain, independent of TIMG.
+    let mut wdt = rwdt_inst();
     wdt.enable();
     wdt.set_timeout(
-        esp_hal::timer::timg::MwdtStage::Stage0,
+        esp_hal::rtc_cntl::RwdtStage::Stage0,
         esp_hal::time::Duration::from_secs(30),
     );
     drop(wdt);
 
+    #[cfg(feature = "bench-wedge")]
+    rwdt_diag("after-arm(pre-board-setup)");
+
     // 5. Initialize board and platform seams.
     let setup = board::setup(peripherals);
     ota::init_flash(setup.flash).await;
+
+    #[cfg(feature = "bench-wedge")]
+    crate::rwdt_diag("after-board-setup(post-esp_rtos-start)");
 
     // 6. Spawn the background tasks
     spawner.spawn(wdt_feeder().unwrap());
