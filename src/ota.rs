@@ -296,6 +296,7 @@ pub async fn erase_tick() -> bool {
         if r.is_err() {
             status("erase failed — transfer aborted");
             println!("[ota] erase failed at {:#x}", rx.erase_next);
+            crate::blog!("ota: erase failed at {:#x}", rx.erase_next);
             *state = None;
             return true;
         }
@@ -425,9 +426,11 @@ pub async fn boot_check(flash: &mut FlashStorage<'static>) -> BootInfo {
     let mut e1 = [0u8; 32];
     if flash.read(OTADATA_OFF, &mut e0).is_err() {
         println!("[boot] otadata read failed (slot 0)");
+        crate::blog!("boot: otadata read failed (slot 0)");
     }
     if flash.read(OTADATA_OFF + 0x1000, &mut e1).is_err() {
         println!("[boot] otadata read failed (slot 1)");
+        crate::blog!("boot: otadata read failed (slot 1)");
     }
 
     let mut best_slot: Option<(usize, u32)> = None;

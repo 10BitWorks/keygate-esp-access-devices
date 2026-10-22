@@ -27,6 +27,7 @@ pub fn start_rtos(
 /// Initialize Wi-Fi controller and the Embassy network stack.
 pub fn net(wifi: esp_hal::peripherals::WIFI<'static>, rng: esp_hal::rng::Rng) -> NetParts {
     println!("Configuring WiFi...");
+    crate::blog!("configuring wifi");
     let (mut wifi_controller, interfaces) = esp_radio::wifi::new(
         wifi,
         esp_radio::wifi::ControllerConfig::default(),

@@ -30,6 +30,7 @@
 - **MQTT Auth Topic:** Publish auth requests to `access/<device_id>/auth`.
 - **MQTT Cmd Topic:** Listen for door commands on `access/<device_id>/cmd`.
 - **MQTT Presence Topic:** Retained LWT offline and online on `access/<device_id>/presence`.
+- **Logging:** Runtime diagnostics `blog!` lines stream LIVE to `access/<device_id>/log` (QoS0, drop-on-full) while MQTT is connected, and the 64-line diag ring re-flushes (up to 12 lines) at every (re)connect for pre-connect coverage. Serial keeps ALL `println!` output unchanged. Never convert loop-rate lines (>~1 Hz, e.g. `[mqtt-cycle]`, `[mqtt] rx`, APDU/spy hex traces) to `blog!`.
 
 # Resources
 

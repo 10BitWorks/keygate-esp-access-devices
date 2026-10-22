@@ -50,14 +50,17 @@ pub async fn relay_task(mut pin: Output<'static>) -> ! {
         // Guard: 0 ms pulse is ignored to prevent bogus unlock or glitches
         if pulse_ms == 0 {
             println!("Relay: ignoring 0ms pulse request");
+            crate::blog!("relay: ignoring 0ms pulse request");
             continue;
         }
 
         println!("Relay: energizing for {} ms", pulse_ms);
+        crate::blog!("relay: energizing {} ms", pulse_ms);
         pin.set_level(energized);
         Timer::after(Duration::from_millis(pulse_ms as u64)).await;
         pin.set_level(deenergized);
         println!("Relay: de-energized");
+        crate::blog!("relay: de-energized");
     }
 }
 

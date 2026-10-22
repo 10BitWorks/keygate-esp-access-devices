@@ -521,6 +521,7 @@ mod embedded {
     pub async fn run<T: ToneDriver>(rx: PiezoReceiver, mut tone: T) -> ! {
         tone.stop();
         println!("[piezo] LEDC tone driver ready (hardware PWM)");
+        crate::blog!("[piezo] LEDC tone driver ready");
 
         let mut tick: u32 = 0;
         let mut online_announced = false;
@@ -546,6 +547,7 @@ mod embedded {
                                 // idle. The melody does not resume.
                                 tone.stop();
                                 println!("[piezo] play verdict {:?} (immediate)", event);
+                                crate::blog!("[piezo] play verdict {:?} (immediate)", event);
                                 if event == BeepEvent::Granted {
                                     play_melody(&mut tone, MARIO_THEME_RIFF).await;
                                 } else {
@@ -561,6 +563,7 @@ mod embedded {
                                         event,
                                         pattern.len()
                                     );
+                                    crate::blog!("[piezo] play {:?} ({} tone(s))", event, pattern.len());
                                     play_pattern(&mut tone, &pattern).await;
                                 }
                             }
@@ -601,6 +604,7 @@ mod embedded {
             match with_timeout(Duration::from_millis(500), rx.receive()).await {
                 Ok(event) => {
                     println!("[piezo] play {:?}", event);
+                    crate::blog!("[piezo] play {:?}", event);
                     if event == BeepEvent::Granted {
                         play_melody(&mut tone, MARIO_THEME_RIFF).await;
                     } else if event == BeepEvent::Denied {

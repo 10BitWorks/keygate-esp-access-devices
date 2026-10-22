@@ -87,6 +87,7 @@ fn set_duty_checked(
     if let Err(e) = ch.set_duty(duty_pct) {
         if !DUTY_ERR_SEEN[ch_idx].swap(true, Ordering::Relaxed) {
             println!("[piezo] ch{ch_idx} duty error: {e:?}");
+            crate::blog!("[piezo] ch{ch_idx} duty error: {e:?}");
         }
     }
 }
@@ -584,6 +585,7 @@ pub async fn setup(
     platform::start_rtos(timg0.timer0, sw_interrupt.software_interrupt0);
 
     println!("XIAO-C6 NFC node starting...");
+    crate::blog!("xiao-c6 node starting");
 
     // 4. Spawn the status LED (GPIO15, active-low) and relay (GPIO1) tasks.
     //    Each task takes ownership of its pin. Initialized Low (de-energized for active-high relay).
@@ -654,15 +656,18 @@ pub async fn setup(
     .with_scl(peripherals.GPIO3);
 
     println!("I2C initialized on GPIO2 (SDA) / GPIO3 (SCL)");
+    crate::blog!("i2c initialized (gpio2/gpio3)");
 
     // PN532 init is non-fatal: Wi-Fi/MQTT proceed regardless.
     let pn532 = match nfc::init_pn532(pn532::i2c::I2CInterface { i2c }).await {
         Ok(p) => {
             println!("PN532 initialized successfully!");
+            crate::blog!("pn532 init ok");
             Some(p)
         }
         Err(e) => {
             println!("PN532 init failed: {:?} — continuing without NFC", e);
+            crate::blog!("pn532 init failed ({:?})", e);
             None
         }
     };
@@ -697,10 +702,14 @@ pub async fn setup(
 
     println!("ESP32 door node starting...");
     println!("door build: provision+piezo");
+    crate::blog!("door node starting (provision+piezo)");
     #[cfg(feature = "nfc-spy")]
     println!("door build: pn532 soft-SPI SPY (sck5 mosi22 miso18 cs17)");
     #[cfg(not(feature = "nfc-spy"))]
-    println!("door build: pn532 soft-SPI (sck5 mosi22 miso18 cs17)");
+    {
+        println!("door build: pn532 soft-SPI (sck5 mosi22 miso18 cs17)");
+        crate::blog!("door build: pn532 soft-SPI (sck5 mosi22 miso18 cs17)");
+    }
 
     // 4. Spawn the status LED (GPIO2 onboard, active-low) and relay (GPIO13) tasks.
     //    GPIO13 chosen to avoid GPIO12/MTDI strapping pin issues. Initialized Low (de-energized for active-high relay).
@@ -806,6 +815,7 @@ pub async fn setup(
         );
         *nfc::IRQ_PIN.lock().await = Some(irq);
         println!("door build: pn532 IRQ readiness (gpio4, meter-verified)");
+        crate::blog!("door build: pn532 IRQ readiness (gpio4)");
     }
 
     let iface = pn532::spi::SPIInterface { spi: spi_device };

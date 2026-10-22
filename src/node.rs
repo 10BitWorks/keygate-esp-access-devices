@@ -121,6 +121,7 @@ async fn nfc_runner<I: pn532::Interface>(
     let mut last_dna_tag: Option<nfc::TagInfo> = None;
 
     println!("[nfc] reader task started (independent from network)");
+    blog!("[nfc] reader task started");
 
     loop {
         if let Some(ref mut pn) = pn532 {
@@ -136,6 +137,7 @@ async fn nfc_runner<I: pn532::Interface>(
                 if it % 50 == 0 {
                     if let Err(e) = nfc::health_check(pn).await {
                         println!("[nfc] bus health check FAILED ({:?}) — pulsing RSTO", e);
+                        blog!("[nfc] bus health check FAILED ({:?}) — pulsing RSTO", e);
                         if let Some(pin) = reader_reset.as_mut() {
                             pin.set_low();
                             Timer::after(Duration::from_millis(10)).await;
@@ -155,6 +157,7 @@ async fn nfc_runner<I: pn532::Interface>(
 
             if let Some((job_id, key_hex)) = prov_ready {
                 println!("[prov] keyed claim reply active — writing card now (job {})", job_id);
+                blog!("[prov] keyed claim reply active — writing card now (job {})", job_id);
                 execute_tag_provisioning(pn, &job_id, &key_hex).await;
                 continue;
             } else if is_claim_wait {
@@ -234,10 +237,12 @@ async fn nfc_runner<I: pn532::Interface>(
                     match prov_action {
                         ProvAction::PublishClaim(claim) => {
                             println!("[prov] wildcard tap: publishing claim for uid");
+                            blog!("[prov] wildcard tap: publishing claim");
                             let _ = PROV_CLAIM_OUTBOUND.try_send(claim);
                         }
                         ProvAction::TapRejected => {
                             println!("[prov] tap rejected (uid mismatch for fixed-uid job)");
+                            blog!("[prov] tap rejected (uid mismatch)");
                             let _ = PZ.try_send(BeepEvent::Denied);
                         }
                         ProvAction::ProvisionStart => {
@@ -278,6 +283,12 @@ async fn nfc_runner<I: pn532::Interface>(
                                                 TAP_T0_MS.load(core::sync::atomic::Ordering::Relaxed)
                                             )
                                         );
+                                        blog!(
+                                            "[latency] ndef read done +{} ms",
+                                            uptime_ms().saturating_sub(
+                                                TAP_T0_MS.load(core::sync::atomic::Ordering::Relaxed)
+                                            )
+                                        );
                                         match ntag424::extract_ndef_uri(&ndef_buf[..n]) {
                                         Ok(uri) => match ntag424::parse_sun_url(uri) {
                                             Ok(sun) => {
@@ -289,6 +300,11 @@ async fn nfc_runner<I: pn532::Interface>(
                                                         nfc::TagInfo { uid: ev.uid, uid_len: ev.uid_len, sak: ev.sak }.uid_hex(),
                                                         sun.counter
                                                     );
+                                                    blog!(
+                                                        "auth: uid:{} ctr:{}",
+                                                        nfc::TagInfo { uid: ev.uid, uid_len: ev.uid_len, sak: ev.sak }.uid_hex(),
+                                                        sun.counter
+                                                    );
                                                     // Enqueue for publishing when MQTT is online.
                                                     let _ = AUTH_OUTBOUND.try_send(payload);
                                                     let _ = PZ.try_send(BeepEvent::AuthSent);
@@ -297,11 +313,13 @@ async fn nfc_runner<I: pn532::Interface>(
                                             }
                                             Err(e) => {
                                                 println!("SUN parse error: {:?}", e);
+                                                blog!("SUN parse error: {:?}", e);
                                                 status_led::set_state(status_led::LedState::MqttConnected);
                                             }
                                         },
                                         Err(e) => {
                                             println!("NDEF URI error: {:?}", e);
+                                            blog!("NDEF URI error: {:?}", e);
                                             status_led::set_state(status_led::LedState::MqttConnected);
                                         }
                                     }
@@ -309,6 +327,7 @@ async fn nfc_runner<I: pn532::Interface>(
                                     Err(e) => {
                                         // Blank / unwritten tag — perfectly normal.
                                         println!("NDEF read: unwritten/blank tag ({:?})", e);
+                                        blog!("NDEF read: unwritten/blank tag ({:?})", e);
                                         status_led::set_state(status_led::LedState::MqttConnected);
                                     }
                                 }
@@ -344,6 +363,7 @@ async fn execute_tag_provisioning<I: pn532::Interface>(
     key_hex: &str,
 ) {
     println!("[prov] provisioning tag (job {})...", job_id);
+    blog!("[prov] provisioning tag (job {})", job_id);
     // The write-progress tone (conn::PROV_WRITING) owns the sound here; the
     // identity melody must not fight it (the tag obviously stays in field).
     piezo::set_field_uid(&[]).await;
@@ -366,6 +386,7 @@ async fn execute_tag_provisioning<I: pn532::Interface>(
                 .await
                 .map_err(|e| {
                     println!("[exchange] in_data_exchange error: {:?}", e);
+                    blog!("[exchange] in_data_exchange error: {:?}", e);
                     ntag424::NdefError::Transport
                 })?;
             println!("[apdu-rx] (len {}) {:02x?}", resp.len(), resp);
@@ -392,6 +413,7 @@ async fn execute_tag_provisioning<I: pn532::Interface>(
         Ok(report) => (true, report.counter, ""),
         Err(e) => {
             println!("[prov] provision sequence error: {:?}", e);
+            blog!("[prov] provision sequence error: {:?}", e);
             let reason = match e {
                 provision::ProvisionError::KeyMismatch => "key-mismatch",
                 _ => "provision error",
@@ -413,10 +435,12 @@ async fn execute_tag_provisioning<I: pn532::Interface>(
 
     if ok {
         println!("[prov] tag successfully provisioned!");
+        blog!("[prov] tag successfully provisioned");
         let _ = PZ.try_send(BeepEvent::Granted);
         status_led::set_state(status_led::LedState::Grant);
     } else {
         println!("[prov] provisioning failed");
+        blog!("[prov] provisioning failed");
         let _ = PZ.try_send(BeepEvent::Denied);
         status_led::set_state(status_led::LedState::DeniedOrOffline);
     }
@@ -532,11 +556,13 @@ async fn mqtt_runner(
                         "wifi: scan found no '{}' AP — keeping default config",
                         config::WIFI_SSID
                     );
+                    blog!("wifi: scan found no AP — keeping default config");
                 }
             }
         }
         Err(e) => {
             println!("wifi: scan failed ({:?}) — keeping default config", e);
+            blog!("wifi: scan failed ({:?})", e);
         }
     }
 
@@ -580,7 +606,10 @@ async fn mqtt_runner(
         if !wifi_controller.is_connected() {
             println!("Connecting to WiFi...");
             match embassy_time::with_timeout(Duration::from_secs(30), wifi_controller.connect_async()).await {
-                Ok(Ok(_)) => println!("WiFi connected"),
+                Ok(Ok(_)) => {
+                    println!("WiFi connected");
+                    blog!("wifi connected");
+                }
                 Ok(Err(e)) => {
                     println!("WiFi connection failed: {:?}", e);
                     blog!("wifi assoc failed: {:?}", e);
@@ -610,12 +639,14 @@ async fn mqtt_runner(
         }
         if !dhcp_ok {
             println!("DHCP timeout — retrying...");
+            blog!("dhcp timeout — retrying");
             Timer::after(Duration::from_secs(2)).await;
             continue;
         }
 
         let ip_info = stack.config_v4().unwrap();
         println!("IP: {}", ip_info.address);
+        blog!("IP: {}", ip_info.address);
 
         // Wi-Fi + DHCP up; audible progress moves to MQTT joining.
         piezo::set_conn_state(piezo::conn::WAIT_MQTT);
@@ -630,12 +661,14 @@ async fn mqtt_runner(
             Ok(Ok(addrs)) if !addrs.is_empty() => addrs[0],
             Ok(Ok(_)) => {
                 println!("DNS returned no addresses for {}", config::MQTT_HOST);
+                blog!("dns: no addresses for {}", config::MQTT_HOST);
                 check_probation_deadline().await;
                 Timer::after(Duration::from_secs(next_backoff(&mut backoff_secs))).await;
                 continue;
             }
             Ok(Err(e)) => {
                 println!("DNS lookup failed for {}: {:?}", config::MQTT_HOST, e);
+                blog!("dns lookup failed: {:?}", e);
                 check_probation_deadline().await;
                 Timer::after(Duration::from_secs(next_backoff(&mut backoff_secs))).await;
                 continue;
@@ -650,6 +683,7 @@ async fn mqtt_runner(
         };
         check_probation_deadline().await;
         println!("Broker {} -> {}:{}", config::MQTT_HOST, broker_addr, broker_port);
+        blog!("broker resolved {}:{}", config::MQTT_HOST, broker_addr);
 
         // Open TCP transport (bounded 15s), then the MQTT session — both bounded. A broker
         // that accepts TCP but stalls CONNACK must not hold a zombie session
@@ -661,9 +695,13 @@ async fn mqtt_runner(
         )
         .await
         {
-            Ok(Ok(_)) => println!("TCP connected to MQTT broker."),
+            Ok(Ok(_)) => {
+                println!("TCP connected to MQTT broker.");
+                blog!("tcp connected to broker");
+            }
             Ok(Err(e)) => {
                 println!("TCP connection to broker failed: {:?}", e);
+                blog!("tcp connect failed: {:?}", e);
                 check_probation_deadline().await;
                 Timer::after(Duration::from_secs(next_backoff(&mut backoff_secs))).await;
                 continue;
@@ -683,6 +721,7 @@ async fn mqtt_runner(
             Ok(w) => w.retained(),
             Err(e) => {
                 println!("Invalid LWT configuration: {:?}", e);
+                blog!("invalid LWT configuration: {:?}", e);
                 Timer::after(Duration::from_secs(next_backoff(&mut backoff_secs))).await;
                 continue;
             }
@@ -696,6 +735,7 @@ async fn mqtt_runner(
             Ok(c) => c,
             Err(e) => {
                 println!("Invalid MQTT configuration: {:?}", e);
+                blog!("invalid MQTT configuration: {:?}", e);
                 Timer::after(Duration::from_secs(next_backoff(&mut backoff_secs))).await;
                 continue;
             }
@@ -706,8 +746,16 @@ async fn mqtt_runner(
         match embassy_time::with_timeout(Duration::from_secs(10), session.connect(socket)).await {
             Ok(Ok(ConnectEvent::Connected)) | Ok(Ok(ConnectEvent::Reconnected)) => {
                 println!("MQTT connected! Broker online.");
+                blog!("mqtt connected — broker online");
                 status_led::set_state(status_led::LedState::MqttConnected);
                 backoff_secs = 1;
+
+                // Discard the pre-connect live-stream backlog: blog! wrote
+                // every one of these lines into the diag ring as well, and
+                // the ring flush below owns publishing pre-connect lines —
+                // draining-to-publish here would double them. LOG_OUTBOUND
+                // serves the connected pump loop only.
+                while crate::diag::LOG_OUTBOUND.try_receive().is_ok() {}
 
                 // Flush buffered diagnostics (bounded — boot milestones +
                 // recent events; the ring holds 64, drain the overflow).
@@ -728,6 +776,7 @@ async fn mqtt_runner(
                 let online = Publication::new(presence_topic.as_str(), "online").retain();
                 if let Err(e) = session.publish(online).await {
                     println!("[mqtt] presence publish failed: {:?}", e);
+                    blog!("[mqtt] presence publish failed: {:?}", e);
                 }
 
                 // Subscribe to command, provisioning and OTA topics (one
@@ -753,6 +802,7 @@ async fn mqtt_runner(
                     Ok(Ok(_)) => {}
                     Ok(Err(e)) => {
                         println!("[mqtt] subscribe failed: {:?}", e);
+                        blog!("mqtt subscribe failed: {:?}", e);
                         status_led::set_state(status_led::LedState::DeniedOrOffline);
                         check_probation_deadline().await;
                         Timer::after(Duration::from_secs(next_backoff(&mut backoff_secs))).await;
@@ -797,6 +847,10 @@ async fn mqtt_runner(
                     let now_ms = uptime_ms();
                     if now_ms.saturating_sub(last_hb_ms) >= 30_000 {
                         println!("[pump hb {} iters]", pump_iters);
+                        // Liveness heartbeat on the broker log too: a
+                        // missing live heartbeat localizes starvation
+                        // without a USB capture (30 s cadence).
+                        blog!("[pump hb] iters {}", pump_iters);
                         last_hb_ms = now_ms;
                         hb_count = hb_count.wrapping_add(1);
 
@@ -807,6 +861,7 @@ async fn mqtt_runner(
                                 .qos(minimq::QoS::AtLeastOnce);
                             if let Err(e) = session.publish(refresh).await {
                                 println!("[mqtt] presence refresh publish failed: {:?}", e);
+                                blog!("[mqtt] presence refresh publish failed: {:?}", e);
                             }
                         }
 
@@ -829,33 +884,47 @@ async fn mqtt_runner(
                             }
                         }
                     }
-                    // 1. Drain and publish any pending auth requests.
-                    while let Ok(auth_payload) = AUTH_OUTBOUND.try_receive() {
-                        let pkt = Publication::new(auth_topic.as_str(), auth_payload.as_str());
-                        if let Err(e) = session.publish(pkt).await {
-                            println!("[mqtt] auth publish error: {:?}", e);
+                    // 1. Drain and publish live diagnostic lines (blog!
+                    //    mirror → LOG_OUTBOUND). QoS0, drop-on-full at the
+                    //    source; a publish error breaks out like the auth
+                    //    drain — the reconnect path re-flushes via the ring.
+                    while let Ok(line) = crate::diag::LOG_OUTBOUND.try_receive() {
+                        let pkt = Publication::new(log_topic.as_str(), line.as_str());
+                        if session.publish(pkt).await.is_err() {
                             break;
                         }
                     }
 
-                    // 2. Drain and publish any claim requests.
+                    // 2. Drain and publish any pending auth requests.
+                    while let Ok(auth_payload) = AUTH_OUTBOUND.try_receive() {
+                        let pkt = Publication::new(auth_topic.as_str(), auth_payload.as_str());
+                        if let Err(e) = session.publish(pkt).await {
+                            println!("[mqtt] auth publish error: {:?}", e);
+                            blog!("[mqtt] auth publish error: {:?}", e);
+                            break;
+                        }
+                    }
+
+                    // 3. Drain and publish any claim requests.
                     while let Ok(claim_payload) = PROV_CLAIM_OUTBOUND.try_receive() {
                         println!("[mqtt] sending claim to verifier");
+                        blog!("[mqtt] sending claim to verifier");
                         let pkt = Publication::new(claim_topic.as_str(), claim_payload.as_str())
                             .qos(minimq::QoS::AtLeastOnce);
                         let _ = session.publish(pkt).await;
                     }
 
-                    // 3. Drain and publish any done reports.
+                    // 4. Drain and publish any done reports.
                     while let Ok((job_id, ok, counter, reason)) = PROV_DONE_OUTBOUND.try_receive() {
                         println!("[mqtt] sending done report to verifier");
+                        blog!("[mqtt] sending done report to verifier");
                         let done = provision_flow::build_done_json(job_id.as_str(), ok, counter, reason);
                         let pkt = Publication::new(done_topic.as_str(), done.as_str())
                             .qos(minimq::QoS::AtLeastOnce);
                         let _ = session.publish(pkt).await;
                     }
 
-                    // 4. Drive MQTT with a bounded 100 ms wait (as documented in minimq examples).
+                    // 5. Drive MQTT with a bounded 100 ms wait (as documented in minimq examples).
                     // OTA: advance the batched erase; drain status messages.
                     ota::erase_tick().await;
                     ota::rx_timeout_check(uptime_ms() as u64).await;
@@ -864,6 +933,7 @@ async fn mqtt_runner(
                             .qos(minimq::QoS::AtLeastOnce);
                         if let Err(e) = session.publish(pkt).await {
                             println!("[mqtt] ota status publish failed: {:?}", e);
+                            blog!("[mqtt] ota status publish failed: {:?}", e);
                             break;
                         }
                     }
@@ -915,11 +985,17 @@ if payload.windows(5).any(|w| w == b"wedge") {
                                             dt,
                                             c.reason
                                         );
+                                        blog!(
+                                            "GRANT (+{} ms since tap): {}",
+                                            dt,
+                                            c.reason
+                                        );
                                     } else {
                                         let _ = PZ.try_send(BeepEvent::Denied);
                                         status_led::set_state(status_led::LedState::DeniedOrOffline);
                                         let dt = uptime_ms().saturating_sub(TAP_T0_MS.load(core::sync::atomic::Ordering::Relaxed));
                                         println!("DENY (+{} ms since tap): {}", dt, c.reason);
+                                        blog!("DENY (+{} ms since tap): {}", dt, c.reason);
                                     }
                                 }
                             } else if topic == job_topic.as_str() {
@@ -937,6 +1013,7 @@ if payload.windows(5).any(|w| w == b"wedge") {
                                     match action {
                                         ProvAction::Arm => {
                                             println!("[prov] job armed — tap blank tag now");
+                                            blog!("[prov] job armed — tap blank tag now");
                                             piezo::set_conn_state(piezo::conn::PROV_ARMED);
                                             let _ = PZ.try_send(BeepEvent::ProvisionArmed);
                                         }
@@ -947,9 +1024,11 @@ if payload.windows(5).any(|w| w == b"wedge") {
                                         }
                                         ProvAction::ProvisionStart => {
                                             println!("[prov] keyed claim reply received from verifier");
+                                            blog!("[prov] keyed claim reply received");
                                         }
                                         ProvAction::Fail(j_id, reason) => {
                                             println!("[prov] job rejected: {}", reason);
+                                            blog!("[prov] job rejected: {}", reason);
                                             piezo::set_conn_state(piezo::conn::ONLINE);
                                             let done = provision_flow::build_done_json(j_id.as_str(), false, 0, reason);
                                             let pkt = Publication::new(done_topic.as_str(), done.as_str())
@@ -989,6 +1068,7 @@ if payload.windows(5).any(|w| w == b"wedge") {
             }
             Ok(Err(e)) => {
                 println!("MQTT session connect failed: {:?}", e);
+                blog!("mqtt session connect failed: {:?}", e);
                 status_led::set_state(status_led::LedState::DeniedOrOffline);
                 Timer::after(Duration::from_secs(next_backoff(&mut backoff_secs))).await;
             }

@@ -278,6 +278,7 @@ pub async fn init_pn532<I: pn532::Interface>(
                     attempt,
                     e
                 );
+                crate::blog!("[nfc] init attempt {} failed ({:?}) — resync + retry", attempt, e);
                 let _ = pn532.abort(); // datasheet: ACK frame forces the PN532 to resync
                 busy_wait_ms(200);
             }
@@ -334,6 +335,7 @@ pub async fn soft_reinit<I: pn532::Interface>(
             };
             esp_println::println!("[nfc] SAMConfig failed ({:?}): {}", _e, hint);
         }
+        crate::blog!("[nfc] SAMConfig failed: {:?}", _e);
         NfcError::Pn532
     })?;
     #[cfg(feature = "pn532-irq")]
@@ -356,6 +358,7 @@ pub async fn soft_reinit<I: pn532::Interface>(
                 "[nfc] SAMConfig (irq) failed ({:?}) — see docs/PN532-SPI-NOTES.md symptom table",
                 e
             );
+            crate::blog!("[nfc] SAMConfig (irq) failed: {:?}", e);
             return Err(NfcError::Pn532);
         }
     }

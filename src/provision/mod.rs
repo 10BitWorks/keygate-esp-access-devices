@@ -120,6 +120,7 @@ where
     // 1) Select NDEF application + file (unauthenticated).
     #[cfg(target_arch = "xtensa")]
     esp_println::println!("[prov-step] step 1: select_ndef");
+    crate::blog!("[prov-step] step 1: select_ndef");
     select_ndef(exchange).await?;
 
     // 2) Write the NDEF file — ISO UPDATE BINARY, offset addressing, plain,
@@ -128,11 +129,13 @@ where
     //    write=NoAccess, its content persists, and step 6 verifies it.
     #[cfg(target_arch = "xtensa")]
     esp_println::println!("[prov-step] step 2: ISO update_binary ({} bytes)", file_len);
+    crate::blog!("[prov-step] step 2: update_binary ({} bytes)", file_len);
     match iso_update_binary(exchange, 0, &file[..file_len]).await {
         Ok(()) => {}
         Err(ProvisionError::Status(0x69, 0x82)) => {
             #[cfg(target_arch = "xtensa")]
             esp_println::println!("[prov-step] write refused (69 82) — already provisioned, skipping rewrite");
+            crate::blog!("[prov-step] write refused (69 82) — already provisioned");
         }
         Err(e) => return Err(e),
     }
@@ -140,11 +143,13 @@ where
     // 3) Authenticate with the factory key 0 — NEVER change key 0.
     #[cfg(target_arch = "xtensa")]
     esp_println::println!("[prov-step] step 3: authenticate_ev2_first");
+    crate::blog!("[prov-step] step 3: authenticate_ev2_first");
     let mut session: Session = authenticate_ev2_first(&FACTORY_KEY, 0, rnda, exchange).await?;
 
     // 4) ChangeFileSettings on file 2: enable the SDM mirrors.
     #[cfg(target_arch = "xtensa")]
     esp_println::println!("[prov-step] step 4: change_file_settings");
+    crate::blog!("[prov-step] step 4: change_file_settings");
     let settings = sdm::sdm_settings_bytes(&offsets);
     change_file_settings(exchange, &mut session, 2, &settings).await?;
 
@@ -153,11 +158,13 @@ where
     //    cards — the verifier re-issues the same deterministic per-UID key).
     #[cfg(target_arch = "xtensa")]
     esp_println::println!("[prov-step] step 5: change_key");
+    crate::blog!("[prov-step] step 5: change_key");
     match change_key(exchange, &mut session, 1, job_key, &[0u8; 16], 1).await {
         Ok(()) => {}
         Err(ProvisionError::Status(0x91, 0x1E)) | Err(ProvisionError::Status(0x91, 0xAE)) => {
             #[cfg(target_arch = "xtensa")]
             esp_println::println!("[prov-step] key 1 not factory-zero — re-authenticating, retrying with old = job key");
+            crate::blog!("[prov-step] key 1 not factory-zero — retrying with old = job key");
             let mut retry: Session = authenticate_ev2_first(&FACTORY_KEY, 0, rnda, exchange).await?;
             change_key(exchange, &mut retry, 1, job_key, job_key, 1)
                 .await
@@ -171,6 +178,7 @@ where
     //    message back through the live mirrors and verify the SUN CMAC.
     #[cfg(target_arch = "xtensa")]
     esp_println::println!("[prov-step] step 6: readback & verify");
+    crate::blog!("[prov-step] step 6: readback & verify");
     select_ndef(exchange).await?;
     let mut resp = [0u8; 258];
     let nlen = read_file(exchange, &mut resp).await?;

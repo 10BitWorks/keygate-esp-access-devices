@@ -141,6 +141,7 @@ async fn main(spawner: Spawner) -> ! {
         }
     } else if let ota_probation::MarkerState::Pending { attempts } = boot.state {
         esp_println::println!("[boot] probation pending — attempt {}/3", attempts + 1);
+        crate::blog!("probation pending — attempt {}/3", attempts + 1);
         if let Err(()) = ota::record_attempt(&mut early_flash).await {
             esp_println::println!("[boot] record attempt failed — deadline path will re-record");
             crate::blog!("probation record attempt failed");
@@ -190,6 +191,7 @@ async fn main(spawner: Spawner) -> ! {
         Timer::after(Duration::from_millis(1000)).await;
         let dt_ms = (Instant::now() - t0).as_millis();
         esp_println::println!("[probe] Timer::after(1000ms) measured {} ms", dt_ms);
+        crate::blog!("[probe] timer sanity: 1000 ms wait measured {} ms", dt_ms);
     }
 
     // 7. Transfer control to the node runtime loop.
