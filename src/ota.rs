@@ -353,7 +353,7 @@ pub async fn on_end() {
         e[0..4].copy_from_slice(&new_seq.to_le_bytes());
         ota_probation::stamp_pending_marker(&mut e);
         e[24..28].copy_from_slice(&2u32.to_le_bytes()); // VALID
-        let crc = crc32_le(0, &e[0..4]);
+        let crc = crc32_le(0, &e[0..28]);
         e[28..32].copy_from_slice(&crc.to_le_bytes());
         e
     };
@@ -425,7 +425,7 @@ pub async fn boot_check(flash: &mut FlashStorage<'static>) -> BootInfo {
     for (slot_idx, e) in [(0usize, &e0), (1usize, &e1)] {
         let seq = u32::from_le_bytes(e[0..4].try_into().unwrap_or([0xFF; 4]));
         let stored = u32::from_le_bytes(e[28..32].try_into().unwrap_or([0xFF; 4]));
-        if seq != u32::MAX && crc32_le(0, &e[0..4]) == stored {
+        if seq != u32::MAX && crc32_le(0, &e[0..28]) == stored {
             if best_slot.map_or(true, |(_, b_seq)| seq > b_seq) {
                 best_slot = Some((slot_idx, seq));
             }
@@ -455,41 +455,87 @@ pub async fn boot_check(flash: &mut FlashStorage<'static>) -> BootInfo {
 
 /// Record a boot attempt on the booted slot by advancing the bitmap word.
 ///
-/// Modifies the 4-byte bitmap word at offset `OTADATA_OFF + slot * 0x1000 + 12`.
+/// Rewrite-not-mutate pattern: reads the 4KB otadata sector, advances bitmap,
+/// recomputes CRC over bytes [0..28], erases sector, and rewrites.
+/// Pre-executor safe: runs before the time driver exists (main.rs early boot) — must not await Timer.
 /// Returns Err(()) if attempt budget is exhausted (all slots already 0x00).
 pub async fn record_attempt(flash: &mut FlashStorage<'static>) -> Result<(), ()> {
+    use esp_hal::rom::crc::crc32_le;
     let boot_info = boot_check(flash).await;
     let slot_off = OTADATA_OFF + (boot_info.booted_slot as u32 * 0x1000);
-    let mut bitmap_word = [0u8; 4];
-    if flash.read(slot_off + 12, &mut bitmap_word).is_err() {
+
+    let mut sector_guard = OTADATA_SECTOR.lock().await;
+    if flash.read(slot_off, &mut *sector_guard).is_err() {
         return Err(());
     }
 
+    let bitmap_word: [u8; 4] = sector_guard[12..16].try_into().map_err(|_| ())?;
     let Some(next) = ota_probation::next_bitmap(bitmap_word) else {
         return Err(());
     };
 
-    // NOR flash allows changing bits 1 -> 0 without sector erase.
-    flash.write(slot_off + 12, &next).map_err(|_| ())
+    sector_guard[12..16].copy_from_slice(&next);
+    let fresh_crc = crc32_le(0, &sector_guard[0..28]);
+    sector_guard[28..32].copy_from_slice(&fresh_crc.to_le_bytes());
+
+    if flash.erase(slot_off, slot_off + 0x1000).is_err() {
+        return Err(());
+    }
+
+    // Pre-executor: no yields / no Timer::after allowed here
+    for i in 0..4 {
+        let chunk_off = slot_off + (i as u32 * 1024);
+        let chunk_data = &sector_guard[(i * 1024)..((i + 1) * 1024)];
+        if flash.write(chunk_off, chunk_data).is_err() {
+            return Err(());
+        }
+    }
+
+    Ok(())
 }
 
 /// Confirm the running firmware by setting status word to STATUS_CONFIRMED.
 ///
+/// Rewrite-not-mutate pattern: reads the 4KB otadata sector, sets status to confirmed,
+/// recomputes CRC over bytes [0..28], erases sector, and rewrites with 10ms pacing between chunks.
 /// Idempotent: returns Ok(()) if already confirmed.
 pub async fn confirm(flash: &mut FlashStorage<'static>) -> Result<(), ()> {
+    use esp_hal::rom::crc::crc32_le;
     let boot_info = boot_check(flash).await;
     let slot_off = OTADATA_OFF + (boot_info.booted_slot as u32 * 0x1000);
-    let mut status_word = [0u8; 4];
-    if flash.read(slot_off + 8, &mut status_word).is_err() {
+
+    let mut sector_guard = OTADATA_SECTOR.lock().await;
+    if flash.read(slot_off, &mut *sector_guard).is_err() {
         return Err(());
     }
 
+    let status_word: [u8; 4] = sector_guard[8..12].try_into().map_err(|_| ())?;
     let next = ota_probation::confirm_transition(status_word);
-    if next != status_word {
-        flash.write(slot_off + 8, &next).map_err(|_| ())
-    } else {
-        Ok(())
+    if next == status_word {
+        return Ok(());
     }
+
+    sector_guard[8..12].copy_from_slice(&next);
+    let fresh_crc = crc32_le(0, &sector_guard[0..28]);
+    sector_guard[28..32].copy_from_slice(&fresh_crc.to_le_bytes());
+
+    if flash.erase(slot_off, slot_off + 0x1000).is_err() {
+        return Err(());
+    }
+
+    // Runtime path: paced with yields between chunks
+    for i in 0..4 {
+        let chunk_off = slot_off + (i as u32 * 1024);
+        let chunk_data = &sector_guard[(i * 1024)..((i + 1) * 1024)];
+        if flash.write(chunk_off, chunk_data).is_err() {
+            return Err(());
+        }
+        if i < 3 {
+            Timer::after(Duration::from_millis(10)).await;
+        }
+    }
+
+    Ok(())
 }
 
 /// Write a rollback entry into the opposite (previous) slot's otadata sector.

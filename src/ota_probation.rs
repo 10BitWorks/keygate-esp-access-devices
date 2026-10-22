@@ -7,16 +7,26 @@
 //! `esp-storage` 0.8.1 rejects any write where `offset % 4 != 0` or `len % 4 != 0` with `NotAligned`.
 //! Marker layout spans bytes `[4..24)` within the 32-byte otadata entry's `seq_label` scratch field.
 //!
-//! # Bootloader Independence & Fail-Safe Model
-//! The ESP-IDF second stage bootloader validates entries by checking `crc32_le(0, seq)` against `crc[28..32]`.
-//! It ignores the 20-byte `seq_label` scratch area entirely.
+//! # Bootloader otadata CRC Rule & Rewrite-not-Mutate Pattern
+//! The ESP-IDF second stage bootloader validates entries by computing `crc32_le(0, &entry[0..28])`
+//! and checking it against `entry[28..32]` (`crc`).
+//! Because `seq_label` [4..24) sits inside the 28-byte CRC span, any change to marker fields
+//! (attempt count or confirmation status) renders the previous CRC stale and invalidates the entry
+//! per the bootloader's rule.
 //!
-//! - Torn-write fail-safe: every marker field is a single 4-byte word program (atomic at word
-//!   granularity on ESP32 flash); NOR programs only clear bits 1->0. A power-interrupted confirm
-//!   leaves the status word partially cleared (has zero bits but != 0x00000000) -> decodes Pending
-//!   (safe: re-confirm is legal because reprogramming the same word with additional cleared bits
-//!   is a valid 1->0 program — confirm is idempotent). A power-interrupted bitmap byte (!=0xFF and
-//!   !=0x00) counts as a consumed attempt (fails toward rollback = safe).
+//! Therefore, all marker operations use a full rewrite-not-mutate pattern:
+//! 1. Read current 4KB otadata sector into RAM.
+//! 2. Mutate marker field(s) in the buffer.
+//! 3. Recompute CRC over `entry[0..28]` with `crc32_le_compat(0, &entry[0..28])`.
+//! 4. Erase the 4KB otadata sector.
+//! 5. Rewrite the sector with fresh CRC.
+//!
+//! # Fail-Safe & Torn-Write Semantics
+//! - A torn rewrite (power loss during sector erase or rewrite) leaves an invalid or blank entry.
+//! - Per ESP-IDF bootloader logic, an invalid entry causes the bootloader to fall back to the other
+//!   otadata sector (the previous slot's valid entry), resulting in a spontaneous rollback.
+//!   This failure direction is fail-safe: it falls back to previously known-good firmware rather
+//!   than booting unverified or corrupted state.
 //! - Marker-free rollback: rollback entries explicitly wipe the `seq_label` field to all `0xFF`.
 //!   A pending marker on the rollback entry would trigger probation on the known-good previous firmware,
 //!   causing a boot ping-pong loop when the network or broker is unreachable.
@@ -130,14 +140,14 @@ pub fn deadline_expired(boot_ms: u64, now_ms: u64) -> bool {
 /// - `seq` = current_max_seq + 2 (LE at [0..4])
 /// - `seq_label` [4..24) ALL 0xFF (marker-free: prevents re-probating known-good old image)
 /// - `ota_state` [24..28) = 2u32 LE (VALID)
-/// - `crc` [28..32) = crc32_le_compat(0, seq_bytes) LE
+/// - `crc` [28..32) = crc32_le_compat(0, entry[0..28]) LE
 pub fn rollback_entry_32(current_max_seq: u32) -> [u8; 32] {
     let mut entry = [0xFFu8; 32];
     let next_seq = current_max_seq.wrapping_add(2);
     entry[0..4].copy_from_slice(&next_seq.to_le_bytes());
     // bytes [4..24) stay 0xFF (marker-free)
     entry[24..28].copy_from_slice(&2u32.to_le_bytes());
-    let entry_crc = crc32_le_compat(0, &entry[0..4]);
+    let entry_crc = crc32_le_compat(0, &entry[0..28]);
     entry[28..32].copy_from_slice(&entry_crc.to_le_bytes());
     entry
 }
@@ -305,15 +315,53 @@ mod tests {
         let ota_state = u32::from_le_bytes(entry[24..28].try_into().unwrap());
         assert_eq!(ota_state, 2);
         let crc = u32::from_le_bytes(entry[28..32].try_into().unwrap());
-        assert_eq!(crc, crc32_le_compat(0, &entry[0..4]));
+        assert_eq!(crc, crc32_le_compat(0, &entry[0..28]));
 
-        let seq1_entry = rollback_entry_32(0xFFFFFFFF);
+        let seq0_entry = rollback_entry_32(0xFFFFFFFF);
         assert_eq!(
-            &seq1_entry[0..4],
+            &seq0_entry[0..4],
             &1u32.to_le_bytes(),
             "0xFFFFFFFF + 2 should wrap to 1"
         );
-        assert_eq!(&seq1_entry[28..32], &[0x9A, 0x98, 0x43, 0x47]);
+        let crc_seq1 = u32::from_le_bytes(seq0_entry[28..32].try_into().unwrap());
+        assert_eq!(crc_seq1, crc32_le_compat(0, &seq0_entry[0..28]));
+    }
+
+    #[test]
+    fn test_entry_with_28_byte_crc_passes_validation_and_mutation_requires_rewrite() {
+        let mut entry = [0xFFu8; 32];
+        entry[0..4].copy_from_slice(&2u32.to_le_bytes());
+        stamp_pending_marker(&mut entry);
+        entry[24..28].copy_from_slice(&2u32.to_le_bytes());
+        let crc = crc32_le_compat(0, &entry[0..28]);
+        entry[28..32].copy_from_slice(&crc.to_le_bytes());
+
+        // Valid per 28-byte rule
+        assert_eq!(
+            u32::from_le_bytes(entry[28..32].try_into().unwrap()),
+            crc32_le_compat(0, &entry[0..28])
+        );
+
+        // In-place mutation (e.g. advance bitmap) makes previous CRC stale!
+        let bitmap_word: [u8; 4] = entry[12..16].try_into().unwrap();
+        let next_bm = next_bitmap(bitmap_word).unwrap();
+        entry[12..16].copy_from_slice(&next_bm);
+
+        // Previous CRC is now STALE / invalid per bootloader rule
+        assert_ne!(
+            u32::from_le_bytes(entry[28..32].try_into().unwrap()),
+            crc32_le_compat(0, &entry[0..28])
+        );
+
+        // Full rewrite pattern recomputes CRC over [0..28]
+        let fresh_crc = crc32_le_compat(0, &entry[0..28]);
+        entry[28..32].copy_from_slice(&fresh_crc.to_le_bytes());
+
+        // Now valid again
+        assert_eq!(
+            u32::from_le_bytes(entry[28..32].try_into().unwrap()),
+            crc32_le_compat(0, &entry[0..28])
+        );
     }
 
     #[test]
