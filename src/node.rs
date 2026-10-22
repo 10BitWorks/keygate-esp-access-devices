@@ -195,25 +195,22 @@ async fn nfc_runner<I: pn532::Interface>(
             // filters out PN532 RF polling flicker while a tag rests on the reader.
             let tap_event = debounce.observe(now, obs);
 
-            // In-field identity melody: driven by the debounced presence state.
-            // Raw `poll_tag` flickers to None when an activated tag is already
-            // in target slot 1; `debounce.state()` holds `Tapped` continuously
-            // as long as the card is on the reader, and only transitions to
-            // `Idle` when the tag is physically removed.
-            match debounce.state() {
-                tag_debounce::State::Tapped { uid, uid_len } => {
-                    piezo::set_field_uid(&uid[..uid_len as usize]).await;
-                }
-                tag_debounce::State::Removing {
-                    last_uid,
-                    last_uid_len,
-                    ..
-                } => {
-                    piezo::set_field_uid(&last_uid[..last_uid_len as usize]).await;
-                }
-                tag_debounce::State::Idle => {
-                    piezo::set_field_uid(&[]).await;
-                }
+            // In-field identity melody is TAP-SCOPED: populated only on a
+            // fresh tap event, cleared only when removal fully completes
+            // (Idle). Two flicker sources must NOT restart the measure:
+            // (a) raw `poll_tag` flicker to None while an activated target
+            // rests in slot 1 — `debounce.state()` holds `Tapped` through
+            // it; (b) post-removal re-detections inside the 300 ms debounce
+            // window (`is_target_present` has shorter range than
+            // `poll_tag`, so a card being pulled away can re-trigger
+            // `Tapped`) — that restart was the audible "straggler tone"
+            // after card pull. Tapped/Removing deliberately hold the last
+            // value so the melody runs through hold flicker and at most
+            // through the removal debounce, then stops for good.
+            if let Some(ev) = tap_event {
+                piezo::set_field_uid(&ev.uid[..ev.uid_len as usize]).await;
+            } else if matches!(debounce.state(), tag_debounce::State::Idle) {
+                piezo::set_field_uid(&[]).await;
             }
 
             if let Some(ev) = tap_event {

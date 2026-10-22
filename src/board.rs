@@ -3,6 +3,7 @@
 //! Encapsulates board-level differences (e.g. XIAO ESP32-C6 vs classic ESP32 devkit door)
 //! so the core orchestration in `main.rs` and node logic remain board-agnostic.
 
+use core::sync::atomic::{AtomicBool, Ordering};
 use esp_hal::gpio::{Level, Output, OutputConfig};
 #[cfg(any(feature = "board-esp32-devkit-door", feature = "board-xiao-c6"))]
 use esp_hal::ledc::{channel::ChannelIFace, timer::TimerIFace};
@@ -37,11 +38,14 @@ use crate::{
 /// its own clock — zero CPU during a tone, true parallelism with every
 /// other task.
 ///
-/// Bridge drive: Channel 0 (leg A) and Channel 1 (leg B) share Timer 0 at
-/// 50% duty. Channel 1 has its `hpoint` set to 128 (180° out of phase
-/// relative to Channel 0's hpoint of 0). This gives full 6.6V peak-to-peak
-/// differential voltage across the piezo disc when playing, and 0V DC
-/// when idle (both channels at 0% duty).
+/// Bridge drive INTENT: Channel 0 (leg A) and Channel 1 (leg B) share
+/// Timer 0 at 50% duty. Channel 1 has its `hpoint` set to 128 (180° out
+/// of phase relative to Channel 0's hpoint of 0), which would give full
+/// 6.6V peak-to-peak differential voltage across the piezo disc and 0V DC
+/// when idle. A physical A/B test (leg B on GPIO33 vs tied to GND) showed
+/// IDENTICAL volume — the differential swing is not happening on real
+/// hardware; the first `start()` prints a one-time `[piezo-spy]` register
+/// dump (see [`ledc_spy_dump`]) to capture the ground truth.
 pub struct LedcTone {
     /// Private aliased handle for per-note frequency reconfiguration
     /// (esp-hal Timer handles alias the same registers by design).
@@ -58,6 +62,66 @@ pub async fn piezo_task(rx: piezo::PiezoReceiver, tone: LedcTone) -> ! {
     piezo::run(rx, tone).await
 }
 
+/// Per-channel once-latch for `set_duty` errors: the first failure on a
+/// channel prints, later ones stay silent, so a melody loop that hits a
+/// persistent error cannot spam the UART.
+static DUTY_ERR_SEEN: [AtomicBool; 2] = [AtomicBool::new(false), AtomicBool::new(false)];
+
+/// Set a channel's duty, printing the channel's first error.
+///
+/// `set_duty` failures should never happen (0-100 duty is always valid and
+/// the channels are configured at setup); the old `.ok()` swallowed them
+/// invisibly if they ever did.
+fn set_duty_checked(
+    ch: &esp_hal::ledc::channel::Channel<'static, esp_hal::ledc::LowSpeed>,
+    duty_pct: u8,
+    ch_idx: usize,
+) {
+    if let Err(e) = ch.set_duty(duty_pct) {
+        if !DUTY_ERR_SEEN[ch_idx].swap(true, Ordering::Relaxed) {
+            println!("[piezo] ch{ch_idx} duty error: {e:?}");
+        }
+    }
+}
+
+/// One-shot latch so the register dump runs only on the first tone.
+static LEDC_SPY_DUMPED: AtomicBool = AtomicBool::new(false);
+
+/// Read back the LEDC and GPIO-matrix output-routing registers and print
+/// them — the register-level ground truth for the bridge-drive question.
+///
+/// The dump proves (a) what duty/hpoint values the LEDC actually latched
+/// on both channels, and (b) whether each piezo pad's `FUNCn_OUT_SEL_CFG`
+/// routes the LEDC signal to the pad at all: `out_sel` (bits 0:7) is the
+/// peripheral output signal index, 256 selects plain GPIO output;
+/// `inv_sel` (bit 8) and `oen_sel`/`oen_inv_sel` (bits 9:10) qualify the
+/// routing. Raw register words are printed (`{:?}`-free, hex) so the bits
+/// can be decoded straight from the UART log.
+fn ledc_spy_dump() {
+    let ledc_reg = esp_hal::peripherals::LEDC::regs();
+    // Channel-cluster accessors differ per PAC: classic ESP32 splits
+    // high/low-speed banks (`lsch(n)`), ESP32-C6 has a single bank (`ch(n)`).
+    #[cfg(feature = "board-esp32-devkit-door")]
+    let (ch0_duty, ch1_duty, ch1_hpoint) = (
+        ledc_reg.lsch(0).duty().read().bits(),
+        ledc_reg.lsch(1).duty().read().bits(),
+        ledc_reg.lsch(1).hpoint().read().bits(),
+    );
+    #[cfg(feature = "board-xiao-c6")]
+    let (ch0_duty, ch1_duty, ch1_hpoint) = (
+        ledc_reg.ch(0).duty().read().bits(),
+        ledc_reg.ch(1).duty().read().bits(),
+        ledc_reg.ch(1).hpoint().read().bits(),
+    );
+    let gpio_reg = esp_hal::peripherals::GPIO::regs();
+    let (pin_a, pin_b) = PIEZO_PINS;
+    let sel_a = gpio_reg.func_out_sel_cfg(usize::from(pin_a)).read().bits();
+    let sel_b = gpio_reg.func_out_sel_cfg(usize::from(pin_b)).read().bits();
+    println!(
+        "[piezo-spy] ch0_duty={ch0_duty:#x} ch1_duty={ch1_duty:#x} ch1_hpoint={ch1_hpoint:#x} gpio{pin_a}_sel={sel_a:#x} gpio{pin_b}_sel={sel_b:#x}"
+    );
+}
+
 impl piezo::ToneDriver for LedcTone {
     fn start(&mut self, freq_hz: u32) {
         self.timer
@@ -67,13 +131,17 @@ impl piezo::ToneDriver for LedcTone {
                 frequency: esp_hal::time::Rate::from_hz(freq_hz),
             })
             .ok();
-        self.ch0.set_duty(50).ok();
-        self.ch1.set_duty(50).ok();
+        set_duty_checked(&self.ch0, 50, 0);
+        set_duty_checked(&self.ch1, 50, 1);
+        // After the duty writes settle, dump the routing truth once.
+        if !LEDC_SPY_DUMPED.swap(true, Ordering::Relaxed) {
+            ledc_spy_dump();
+        }
     }
 
     fn stop(&mut self) {
-        self.ch0.set_duty(0).ok();
-        self.ch1.set_duty(0).ok();
+        set_duty_checked(&self.ch0, 0, 0);
+        set_duty_checked(&self.ch1, 0, 1);
     }
 }
 

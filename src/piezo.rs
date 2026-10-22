@@ -1,9 +1,15 @@
-//! Passive piezo feedback driver (bridge-driven, GPIO bit-bang).
+//! Passive piezo feedback driver (LEDC hardware PWM, bridge-drive intent).
 //!
-//! A 2-terminal passive piezo disc is driven differentially ("bridge" mode): leg A
-//! high while leg B low, then swap, on every half-period. This doubles the voltage
-//! swing across the disc versus a single-pin + GND drive and is polarity-free, so
-//! either leg may land on either GPIO. An unwired disc simply stays silent — no
+//! Tones are emitted by the LEDC peripheral — the waveform runs in hardware
+//! with zero CPU while the firmware only awaits note durations. The board
+//! driver (see `board.rs` `LedcTone`) configures two channels, one per disc
+//! leg, intending differential bridge drive: equal 50% duty with leg B's
+//! `hpoint` offset 180°, doubling the swing across the disc versus a
+//! single-pin + GND drive. Whether the second leg actually toggles on a
+//! given board is checked at runtime: the first tone triggers a one-time
+//! `[piezo-spy]` dump of the LEDC duty/hpoint and GPIO-matrix output-select
+//! registers (ground truth for the bench A/B volume investigation). Either
+//! leg may land on either GPIO — an unwired disc simply stays silent; no
 //! code path changes for that case.
 //!
 //! # Layout
@@ -251,7 +257,11 @@ pub const PATTERN_TABLE: &[(BeepEvent, &[Tone])] = &[
             (1568, 83),
         ],
     ),
-    (BeepEvent::Denied, &[(1300, 150), (1300, 150)]),
+    // Denied: Cobalt door Pi error sound — `play_note("Bb", 3, 0.5)` in the
+    // DENYING_ACCESS branch of `Front Door/cobalt_local_backup/my_door.py`
+    // (line ~121). Bb3 = 233.08 Hz, rounded to 233 Hz for 500 ms: a single
+    // low buzz, unmistakable from every other pattern in this table.
+    (BeepEvent::Denied, &[(233, 500)]),
     (BeepEvent::RelayPulse, &[(2600, 400)]),
     (
         BeepEvent::ProvisionArmed,
@@ -267,7 +277,7 @@ pub const PATTERN_TABLE: &[(BeepEvent, &[Tone])] = &[
     ),
     (BeepEvent::Boot, &[(2600, 60)]),
     // Reader-dead alarm: three low tones, unmistakable next to the connect
-    // beeps (2000/2500 Hz) and the Denied double (1300 Hz).
+    // beeps (2000/2500 Hz) and the Denied single low buzz (233 Hz).
     (
         BeepEvent::NfcDown,
         &[(900, 180), (900, 180), (900, 180)],
@@ -693,5 +703,14 @@ mod tests {
         assert_eq!(MARIO_THEME_RIFF[3].freq, 1047); // C6
         assert_eq!(MARIO_THEME_RIFF[4].freq, 1319); // E6
         assert_eq!(MARIO_THEME_RIFF[5].freq, 1568); // G6
+    }
+
+    #[test]
+    fn denied_matches_cobalt_error_note() {
+        // Cobalt door Pi DENYING_ACCESS branch plays `play_note("Bb", 3, 0.5)`
+        // (Front Door/cobalt_local_backup/my_door.py ~line 121): Bb3 =
+        // 233.08 Hz for 500 ms. Pinned so the deny tune cannot silently
+        // drift from its namesake.
+        assert_eq!(pattern_for(BeepEvent::Denied), &[(233, 500)]);
     }
 }
