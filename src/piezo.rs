@@ -165,6 +165,30 @@ pub const MARIO_THEME_RIFF: &[Beep] = &[
     Beep { freq: 1568, tone_duration_ms: 83, rest_duration_ms: 0 },
 ];
 
+/// Super Mario Bros death jingle (the "lose a life" sting):
+/// B4 - F5 - F5 - F5 - E5 - D5 - C5, then the low E4 - E4 - C4(held) tail.
+/// Transcribed from the note array in `hibit-dev/buzzer`
+/// `src/games/mario_bros/mario_bros.ino` (MIT,
+/// https://github.com/hibit-dev/buzzer): B4 eighth, F5 quarter accent,
+/// eighth-note descending run, E4 quarter + E4 eighth, C4 half. Slots are
+/// scaled to this firmware's 220 BPM eighth (83 ms tone + 42 ms rest, the
+/// same vocabulary as MARIO_THEME_RIFF) with the final C4 hold tightened
+/// 500 -> 332 ms. Total duration: 1623 ms (~1.62s). Beat order: B4 494,
+/// F5 698 (accent), F5, F5, E5 659, D5 587, C5 523, E4 330, E4 330, C4 262
+/// (held).
+pub const MARIO_DEATH_RIFF: &[Beep] = &[
+    Beep { freq: 494, tone_duration_ms: 83, rest_duration_ms: 42 },
+    Beep { freq: 698, tone_duration_ms: 166, rest_duration_ms: 42 },
+    Beep { freq: 698, tone_duration_ms: 83, rest_duration_ms: 42 },
+    Beep { freq: 698, tone_duration_ms: 83, rest_duration_ms: 42 },
+    Beep { freq: 659, tone_duration_ms: 83, rest_duration_ms: 42 },
+    Beep { freq: 587, tone_duration_ms: 83, rest_duration_ms: 42 },
+    Beep { freq: 523, tone_duration_ms: 83, rest_duration_ms: 42 },
+    Beep { freq: 330, tone_duration_ms: 166, rest_duration_ms: 42 },
+    Beep { freq: 330, tone_duration_ms: 83, rest_duration_ms: 42 },
+    Beep { freq: 262, tone_duration_ms: 332, rest_duration_ms: 0 },
+];
+
 /// FNV-1a 32-bit hash of the raw UID bytes.
 fn hash_uid(uid: &[u8]) -> u32 {
     let mut hash: u32 = 2166136261;
@@ -257,11 +281,12 @@ pub const PATTERN_TABLE: &[(BeepEvent, &[Tone])] = &[
             (1568, 83),
         ],
     ),
-    // Denied: Cobalt door Pi error sound — `play_note("Bb", 3, 0.5)` in the
-    // DENYING_ACCESS branch of `Front Door/cobalt_local_backup/my_door.py`
-    // (line ~121). Bb3 = 233.08 Hz, rounded to 233 Hz for 500 ms: a single
-    // low buzz, unmistakable from every other pattern in this table.
-    (BeepEvent::Denied, &[(233, 500)]),
+    // Denied: fallback only — primary feedback is the MARIO_DEATH_RIFF
+    // melody (routed in `run()`), the death jingle's descending E5-D5-C5
+    // run with the last note held. This table entry never fires while the
+    // melody routing exists; it satisfies the one-entry-per-event table
+    // invariant if that routing is ever removed.
+    (BeepEvent::Denied, &[(659, 83), (587, 83), (523, 150)]),
     (BeepEvent::RelayPulse, &[(2600, 400)]),
     (
         BeepEvent::ProvisionArmed,
@@ -277,7 +302,8 @@ pub const PATTERN_TABLE: &[(BeepEvent, &[Tone])] = &[
     ),
     (BeepEvent::Boot, &[(2600, 60)]),
     // Reader-dead alarm: three low tones, unmistakable next to the connect
-    // beeps (2000/2500 Hz) and the Denied single low buzz (233 Hz).
+    // beeps (2000/2500 Hz) and the Denied Mario death jingle (which ends
+    // with a held low C4 after a fast descending run).
     (
         BeepEvent::NfcDown,
         &[(900, 180), (900, 180), (900, 180)],
@@ -450,6 +476,8 @@ mod embedded {
                 println!("[piezo] play deferred {:?}", verdict);
                 if verdict == BeepEvent::Granted {
                     play_melody(&mut tone, MARIO_THEME_RIFF).await;
+                } else if verdict == BeepEvent::Denied {
+                    play_melody(&mut tone, MARIO_DEATH_RIFF).await;
                 } else {
                     let pattern = pattern_for(verdict);
                     if !pattern.is_empty() {
@@ -463,6 +491,8 @@ mod embedded {
                     println!("[piezo] play {:?}", event);
                     if event == BeepEvent::Granted {
                         play_melody(&mut tone, MARIO_THEME_RIFF).await;
+                    } else if event == BeepEvent::Denied {
+                        play_melody(&mut tone, MARIO_DEATH_RIFF).await;
                     } else {
                         let pattern = pattern_for(event);
                         if !pattern.is_empty() {
@@ -706,11 +736,43 @@ mod tests {
     }
 
     #[test]
-    fn denied_matches_cobalt_error_note() {
-        // Cobalt door Pi DENYING_ACCESS branch plays `play_note("Bb", 3, 0.5)`
-        // (Front Door/cobalt_local_backup/my_door.py ~line 121): Bb3 =
-        // 233.08 Hz for 500 ms. Pinned so the deny tune cannot silently
-        // drift from its namesake.
-        assert_eq!(pattern_for(BeepEvent::Denied), &[(233, 500)]);
+    fn mario_death_riff_matches_transcription() {
+        // Super Mario Bros death jingle, transcribed from hibit-dev/buzzer
+        // src/games/mario_bros/mario_bros.ino (MIT): B4 pickup, F5 quarter
+        // accent, F5-F5-E5-D5-C5 eighth run, E4 quarter + E4 eighth, C4
+        // half held. The rejected Bb3 buzz (233 Hz) must never return.
+        assert_eq!(MARIO_DEATH_RIFF.len(), 10);
+        assert_eq!(MARIO_DEATH_RIFF[0].freq, 494); // B4 pickup
+        // F5 accent: the quarter beat is longer than the eighth run around it.
+        assert_eq!(MARIO_DEATH_RIFF[1].freq, 698); // F5
+        assert!(
+            MARIO_DEATH_RIFF[1].tone_duration_ms > MARIO_DEATH_RIFF[2].tone_duration_ms,
+            "F5 accent must outlast the eighth-note run"
+        );
+        // Descending run E5 -> D5 -> C5 is strictly monotonically decreasing.
+        let run = &MARIO_DEATH_RIFF[4..7];
+        assert!(
+            run.windows(2).all(|w| w[0].freq > w[1].freq),
+            "E5-D5-C5 run must strictly descend"
+        );
+        assert_eq!((run[0].freq, run[1].freq, run[2].freq), (659, 587, 523));
+        // Low tail: E4, E4, then the held C4.
+        assert_eq!(
+            (
+                MARIO_DEATH_RIFF[7].freq,
+                MARIO_DEATH_RIFF[8].freq,
+                MARIO_DEATH_RIFF[9].freq
+            ),
+            (330, 330, 262)
+        );
+        let total_ms: u32 = MARIO_DEATH_RIFF
+            .iter()
+            .map(|b| b.tone_duration_ms + b.rest_duration_ms)
+            .sum();
+        assert!(
+            (800..=2000).contains(&total_ms),
+            "death sting {total_ms} ms outside 800..2000"
+        );
+        assert_eq!(total_ms, 1623);
     }
 }
