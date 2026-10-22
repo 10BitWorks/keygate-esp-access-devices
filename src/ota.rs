@@ -15,10 +15,12 @@
 //! confirms itself, there is no esp_ota_ops agent to do it.
 //!
 //! otadata entry layout (32 bytes, decoded from live flash 2026-10-15):
-//! `0..4` seq (LE u32, boots ota[(seq-1)%2]), `4..24` seq_label (0xFF),
-//! `24..28` ota_state (2 = VALID), `28..32` CRC32 of the 4 seq bytes via
-//! the ROM `crc32_le(0, bytes)` (LSB, poly 0x04c11db7, fin ~0) — verified
-//! against live flash: seq=1 -> 0x4743989a.
+//! `0..4` seq (LE u32, boots ota[(seq-1)%2]), `4..24` seq_label (holds the
+//! probation marker), `24..28` ota_state (2 = VALID), `28..32` CRC32 of the
+//! 4 seq bytes ONLY, seeded with `0xFFFFFFFF` — see `ota_probation::entry_crc`.
+//! That is exactly the ESP-IDF bootloader's rule
+//! (`esp_rom_crc32_le(UINT32_MAX, &ota_seq, 4)`); the marker fields [4..28) are
+//! OUTSIDE the CRC span. Pinned vectors: seq=1 -> 0x4743989a, seq=2 -> 0x55f63774.
 use esp_println::println;
 
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
@@ -140,20 +142,22 @@ pub async fn init_flash(flash: FlashStorage<'static>) {
     *FLASH.lock().await = Some(flash);
 }
 
-/// Decode the otadata sector: highest valid (crc32_le-checked) entry across
-/// both 4KB sectors (sector 0 at OTADATA_OFF, sector 1 at OTADATA_OFF + 0x1000).
-/// Returns the boot seq of the RUNNING image (default 1 => ota_0).
+/// Decode the otadata sector: highest valid entry across both 4KB sectors
+/// (sector 0 at OTADATA_OFF, sector 1 at OTADATA_OFF + 0x1000).
+///
+/// Validity is the bootloader's rule: `seq != 0xFFFFFFFF && stored == entry_crc(seq)`,
+/// where the CRC covers only the 4 seq bytes. Returns the boot seq of the RUNNING
+/// image (default 1 => ota_0).
 fn current_seq(flash: &mut FlashStorage) -> u32 {
     let mut e0 = [0u8; 32];
     let mut e1 = [0u8; 32];
     let _ = flash.read(OTADATA_OFF, &mut e0);
     let _ = flash.read(OTADATA_OFF + 0x1000, &mut e1);
-    use esp_hal::rom::crc::crc32_le;
     let mut best: Option<u32> = None;
     for e in [&e0, &e1] {
         let seq = u32::from_le_bytes(e[0..4].try_into().unwrap());
         let stored = u32::from_le_bytes(e[28..32].try_into().unwrap());
-        if seq != u32::MAX && crc32_le(0, &e[0..4]) == stored {
+        if seq != u32::MAX && ota_probation::entry_crc(seq) == stored {
             if best.map_or(true, |b| seq > b) {
                 best = Some(seq);
             }
@@ -341,8 +345,6 @@ pub async fn on_end() {
         return;
     }
 
-    use esp_hal::rom::crc::crc32_le;
-
     // The entry for the NEW slot: seq+1, VALID(2).
     // In ESP-IDF: otadata[0] lives in sector 0 (OTADATA_OFF = 0xd000),
     // and otadata[1] lives in sector 1 (OTADATA_OFF + 0x1000 = 0xe000).
@@ -353,7 +355,8 @@ pub async fn on_end() {
         e[0..4].copy_from_slice(&new_seq.to_le_bytes());
         ota_probation::stamp_pending_marker(&mut e);
         e[24..28].copy_from_slice(&2u32.to_le_bytes()); // VALID
-        let crc = crc32_le(0, &e[0..28]);
+        // Bootloader CRC covers ONLY the 4 seq bytes, seed 0xFFFFFFFF.
+        let crc = ota_probation::entry_crc(new_seq);
         e[28..32].copy_from_slice(&crc.to_le_bytes());
         e
     };
@@ -414,8 +417,10 @@ pub struct BootInfo {
 }
 
 /// Inspect both otadata entries to determine current booted slot and probation marker state.
+///
+/// Validity uses the bootloader's rule: `seq != 0xFFFFFFFF && stored == entry_crc(seq)`,
+/// where the CRC covers only the 4 seq bytes (marker fields [4..28) are outside the span).
 pub async fn boot_check(flash: &mut FlashStorage<'static>) -> BootInfo {
-    use esp_hal::rom::crc::crc32_le;
     let mut e0 = [0u8; 32];
     let mut e1 = [0u8; 32];
     let _ = flash.read(OTADATA_OFF, &mut e0);
@@ -425,7 +430,7 @@ pub async fn boot_check(flash: &mut FlashStorage<'static>) -> BootInfo {
     for (slot_idx, e) in [(0usize, &e0), (1usize, &e1)] {
         let seq = u32::from_le_bytes(e[0..4].try_into().unwrap_or([0xFF; 4]));
         let stored = u32::from_le_bytes(e[28..32].try_into().unwrap_or([0xFF; 4]));
-        if seq != u32::MAX && crc32_le(0, &e[0..28]) == stored {
+        if seq != u32::MAX && ota_probation::entry_crc(seq) == stored {
             if best_slot.map_or(true, |(_, b_seq)| seq > b_seq) {
                 best_slot = Some((slot_idx, seq));
             }
@@ -456,11 +461,11 @@ pub async fn boot_check(flash: &mut FlashStorage<'static>) -> BootInfo {
 /// Record a boot attempt on the booted slot by advancing the bitmap word.
 ///
 /// Rewrite-not-mutate pattern: reads the 4KB otadata sector, advances bitmap,
-/// recomputes CRC over bytes [0..28], erases sector, and rewrites.
+/// recomputes the entry CRC via `entry_crc(seq)`, erases sector, and rewrites.
+/// The erase is mandatory — NOR flash can only clear the bitmap bits via a sector erase.
 /// Pre-executor safe: runs before the time driver exists (main.rs early boot) — must not await Timer.
 /// Returns Err(()) if attempt budget is exhausted (all slots already 0x00).
 pub async fn record_attempt(flash: &mut FlashStorage<'static>) -> Result<(), ()> {
-    use esp_hal::rom::crc::crc32_le;
     let boot_info = boot_check(flash).await;
     let slot_off = OTADATA_OFF + (boot_info.booted_slot as u32 * 0x1000);
 
@@ -475,7 +480,10 @@ pub async fn record_attempt(flash: &mut FlashStorage<'static>) -> Result<(), ()>
     };
 
     sector_guard[12..16].copy_from_slice(&next);
-    let fresh_crc = crc32_le(0, &sector_guard[0..28]);
+    // Bootloader CRC spans only entry[0..4); recomputed from the buffer's seq so this
+    // path cannot drift from the pinned rule.
+    let seq = u32::from_le_bytes(sector_guard[0..4].try_into().map_err(|_| ())?);
+    let fresh_crc = ota_probation::entry_crc(seq);
     sector_guard[28..32].copy_from_slice(&fresh_crc.to_le_bytes());
 
     if flash.erase(slot_off, slot_off + 0x1000).is_err() {
@@ -497,10 +505,11 @@ pub async fn record_attempt(flash: &mut FlashStorage<'static>) -> Result<(), ()>
 /// Confirm the running firmware by setting status word to STATUS_CONFIRMED.
 ///
 /// Rewrite-not-mutate pattern: reads the 4KB otadata sector, sets status to confirmed,
-/// recomputes CRC over bytes [0..28], erases sector, and rewrites with 10ms pacing between chunks.
+/// recomputes the entry CRC via `entry_crc(seq)`, erases sector, and rewrites with 10ms pacing between chunks.
+/// The erase is mandatory — NOR flash can only clear bits via a sector erase, and the
+/// machinery is bench-proven on the write path.
 /// Idempotent: returns Ok(()) if already confirmed.
 pub async fn confirm(flash: &mut FlashStorage<'static>) -> Result<(), ()> {
-    use esp_hal::rom::crc::crc32_le;
     let boot_info = boot_check(flash).await;
     let slot_off = OTADATA_OFF + (boot_info.booted_slot as u32 * 0x1000);
 
@@ -516,7 +525,10 @@ pub async fn confirm(flash: &mut FlashStorage<'static>) -> Result<(), ()> {
     }
 
     sector_guard[8..12].copy_from_slice(&next);
-    let fresh_crc = crc32_le(0, &sector_guard[0..28]);
+    // Bootloader CRC spans only entry[0..4); recomputed from the buffer's seq so this
+    // path cannot drift from the pinned rule.
+    let seq = u32::from_le_bytes(sector_guard[0..4].try_into().map_err(|_| ())?);
+    let fresh_crc = ota_probation::entry_crc(seq);
     sector_guard[28..32].copy_from_slice(&fresh_crc.to_le_bytes());
 
     if flash.erase(slot_off, slot_off + 0x1000).is_err() {

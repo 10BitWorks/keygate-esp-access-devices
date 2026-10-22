@@ -8,18 +8,42 @@
 //! Marker layout spans bytes `[4..24)` within the 32-byte otadata entry's `seq_label` scratch field.
 //!
 //! # Bootloader otadata CRC Rule & Rewrite-not-Mutate Pattern
-//! The ESP-IDF second stage bootloader validates entries by computing `crc32_le(0, &entry[0..28])`
-//! and checking it against `entry[28..32]` (`crc`).
-//! Because `seq_label` [4..24) sits inside the 28-byte CRC span, any change to marker fields
-//! (attempt count or confirmation status) renders the previous CRC stale and invalidates the entry
-//! per the bootloader's rule.
 //!
-//! Therefore, all marker operations use a full rewrite-not-mutate pattern:
+//! The ESP-IDF second stage bootloader validates an otadata entry by CRC32-ing **only the 4-byte
+//! little-endian `seq` word** at `entry[0..4)` with an initial value of `0xFFFFFFFF`, and comparing
+//! the result against `entry[28..32]` (`crc`). In C:
+//!
+//! ```c
+//! bootloader_common_ota_select_crc = esp_rom_crc32_le(UINT32_MAX, &s->ota_seq, 4);
+//! ```
+//!
+//! The Rust crate `esp-bootloader-esp-idf` documents the same rule ("CRC32 of the `ota_seq` field
+//! only", `ota.rs:130`). An entry is valid iff `seq != 0xFFFFFFFF` **and**
+//! `entry[28..32] == entry_crc(seq)`.
+//!
+//! Use [`entry_crc`] for every site. Its CRC span is `entry[0..4)` only — the marker fields
+//! `[4..28)` (`seq_label`, `ota_state`) are **OUTSIDE** the CRC.
+//!
+//! ## Correction (task 9, bench-disproven)
+//! An earlier revision of this module (commit `327620e`) claimed the span was `entry[0..28)`.
+//! **That claim was WRONG.** It was a misdiagnosis: the bootloader-written factory entry
+//! (seq=1) is valid over `[0..4)` and invalid over `[0..28)`, so every 28-byte entry we wrote was
+//! silently rejected by the bootloader and it fell back to `ota_0`. `f115fcd` (span 4, seed 0) had
+//! the right span but the wrong seed; `327620e` had the wrong span *and* seed. Both were rejected.
+//! The two pinned vectors below are the contract.
+//!
+//! ## Why rewrite-not-mutate is still required
+//! Mutating the marker does **not** invalidate the CRC (the marker is outside the span), but NOR
+//! flash cannot clear the attempt-bitmap bits `1 -> 0` in place: a program operation can only flip
+//! bits `1 -> 0` without an erase. Confirming (`status [8..12)` -> `0x00000000`) and recording an
+//! attempt (clearing a bitmap byte in `[12..16)`) therefore still require a full sector cycle. The
+//! machinery is unchanged and bench-proven on the write path:
 //! 1. Read current 4KB otadata sector into RAM.
 //! 2. Mutate marker field(s) in the buffer.
-//! 3. Recompute CRC over `entry[0..28]` with `crc32_le_compat(0, &entry[0..28])`.
+//! 3. Recompute the CRC with [`entry_crc`] (constant here — `seq` is untouched — recomputed anyway
+//!    so no site can drift from the pinned rule).
 //! 4. Erase the 4KB otadata sector.
-//! 5. Rewrite the sector with fresh CRC.
+//! 5. Rewrite the sector.
 //!
 //! # Fail-Safe & Torn-Write Semantics
 //! - A torn rewrite (power loss during sector erase or rewrite) leaves an invalid or blank entry.
@@ -48,10 +72,14 @@ pub enum MarkerState {
     Absent,
 }
 
-/// Host-safe ROM crc32_le reimplementation matching ESP-IDF bootloader and esp_hal::rom::crc::crc32_le.
+/// Host-safe reflected CRC-32 (IEEE 802.3 polynomial `0xEDB88320`) with a raw initial register
+/// value and a `~0` final XOR — the zlib/PKZIP convention.
 ///
-/// Uses the IEEE 802.3 polynomial (reflected 0xEDB88320) with passed initial crc and ~0 final XOR.
-/// Pinned test vector: `crc32_le_compat(0, &[0x01, 0x00, 0x00, 0x00]) == 0x4743989A`.
+/// `crc32_le_compat(init, data)` == `zlib.crc32(data, init ^ 0xFFFF_FFFF)`, i.e. a raw
+/// initial value of `0xFFFF_FFFF` (the bootloader seed) is expressed as `init = 0` here.
+///
+/// Pinned test vectors: `crc32_le_compat(0, &[0x01, 0x00, 0x00, 0x00]) == 0x4743989A`,
+/// `crc32_le_compat(0, &[0x02, 0x00, 0x00, 0x00]) == 0x55F63774`.
 pub fn crc32_le_compat(crc: u32, data: &[u8]) -> u32 {
     let mut c = crc;
     for &b in data {
@@ -65,6 +93,31 @@ pub fn crc32_le_compat(crc: u32, data: &[u8]) -> u32 {
         }
     }
     c ^ 0xFFFF_FFFF
+}
+
+/// Bootloader-compatible CRC32 for a 32-byte otadata entry.
+///
+/// Reflected CRC-32 over the 4 little-endian `seq` bytes (`entry[0..4)`) seeded with `0xFFFFFFFF`.
+///
+/// This is the single source of truth for the entry CRC at `entry[28..32)`. Every construction site
+/// (`on_end`, [`rollback_entry_32`]) and every rewrite path (`confirm`, `record_attempt`) plus both
+/// validity decoders (`boot_check`, `current_seq`) MUST go through this helper so no site can drift
+/// from the bootloader's rule.
+///
+/// Equivalent to `zlib.crc32(struct.pack('<I', seq), 0xFFFFFFFF)` and to the C bootloader's
+/// `esp_rom_crc32_le(UINT32_MAX, &ota_seq, 4)`.
+///
+/// # Pinned vectors (bench-verified)
+///
+/// | `seq` | CRC32       | source                                    |
+/// |-------|-------------|-------------------------------------------|
+/// | `1`   | `0x4743989A`| bootloader-written factory otadata entry   |
+/// | `2`   | `0x55F63774`| python brute-force cross-check            |
+///
+/// A stored CRC that does not match this value (or a `seq` of `0xFFFFFFFF`) means the bootloader
+/// rejects the entry and falls back to the other otadata sector.
+pub fn entry_crc(seq: u32) -> u32 {
+    crc32_le_compat(0, &seq.to_le_bytes())
 }
 
 /// Count the number of consumed attempt slots in a 4-byte bitmap word.
@@ -137,18 +190,18 @@ pub fn deadline_expired(boot_ms: u64, now_ms: u64) -> bool {
 
 /// Construct a 32-byte otadata entry for rolling back to the previous firmware slot.
 ///
-/// - `seq` = current_max_seq + 2 (LE at [0..4])
+/// - `seq` = current_max_seq + 2 (LE at [0..4))
 /// - `seq_label` [4..24) ALL 0xFF (marker-free: prevents re-probating known-good old image)
 /// - `ota_state` [24..28) = 2u32 LE (VALID)
-/// - `crc` [28..32) = crc32_le_compat(0, entry[0..28]) LE
+/// - `crc` [28..32) = [`entry_crc`] of the `seq` word, LE — CRC span is [0..4) ONLY
 pub fn rollback_entry_32(current_max_seq: u32) -> [u8; 32] {
     let mut entry = [0xFFu8; 32];
     let next_seq = current_max_seq.wrapping_add(2);
     entry[0..4].copy_from_slice(&next_seq.to_le_bytes());
     // bytes [4..24) stay 0xFF (marker-free)
     entry[24..28].copy_from_slice(&2u32.to_le_bytes());
-    let entry_crc = crc32_le_compat(0, &entry[0..28]);
-    entry[28..32].copy_from_slice(&entry_crc.to_le_bytes());
+    let crc = entry_crc(next_seq);
+    entry[28..32].copy_from_slice(&crc.to_le_bytes());
     entry
 }
 
@@ -181,9 +234,95 @@ pub fn confirm_transition(status_word: [u8; 4]) -> [u8; 4] {
 mod tests {
     use super::*;
 
+    /// Pinned benchmark vectors for the bootloader entry CRC (task 9).
+    ///
+    /// seq=1 -> 0x4743989A is the bootloader-written factory otadata entry, captured from
+    /// live flash. seq=2 -> 0x55F63774 is the python brute-force cross-check.
+    /// Both must be reproduced by the single shared `entry_crc` helper.
     #[test]
-    fn test_pinned_crc_vector() {
-        assert_eq!(crc32_le_compat(0, &[0x01, 0x00, 0x00, 0x00]), 0x4743989A);
+    fn test_entry_crc_pinned_vectors() {
+        assert_eq!(
+            entry_crc(1),
+            0x4743_989A,
+            "seq=1 (bootloader-written factory entry)"
+        );
+        assert_eq!(entry_crc(2), 0x55F6_3774, "seq=2 (python cross-check)");
+    }
+
+    /// Pins the `crc32_le_compat` convention: a raw initial register value of 0 with a
+    /// `~0` final XOR, i.e. `zlib.crc32(data, 0xFFFFFFFF)`. The bootloader seed
+    /// (`0xFFFFFFFF`) is expressed as `init = 0` on this API.
+    #[test]
+    fn test_crc32_le_compat_init_convention() {
+        assert_eq!(crc32_le_compat(0, &[0x01, 0x00, 0x00, 0x00]), 0x4743_989A);
+        assert_eq!(crc32_le_compat(0, &[0x02, 0x00, 0x00, 0x00]), 0x55F6_3774);
+        // Seeding the raw register with 0xFFFFFFFF instead of 0 yields the complementary
+        // (wrong) value — this is exactly the bug that f115fcd shipped and 327620e repeated.
+        assert_ne!(
+            crc32_le_compat(0xFFFF_FFFF, &[0x01, 0x00, 0x00, 0x00]),
+            0x4743_989A
+        );
+    }
+
+    /// The entry CRC depends on the seq word alone — marker and state fields must not
+    /// perturb it. This is the span fix: the 28-byte rule was disproven on the bench.
+    #[test]
+    fn test_entry_crc_spans_only_seq_word() {
+        let mut entry = [0xFFu8; 32];
+        entry[0..4].copy_from_slice(&7u32.to_le_bytes());
+        let before = entry_crc(7);
+
+        stamp_pending_marker(&mut entry);
+        assert_eq!(
+            entry_crc(7),
+            before,
+            "marker stamp must not affect the entry CRC"
+        );
+
+        entry[24..28].copy_from_slice(&2u32.to_le_bytes()); // ota_state VALID
+        assert_eq!(
+            entry_crc(7),
+            before,
+            "ota_state must not affect the entry CRC (span is [0..4) only)"
+        );
+
+        entry[12..16].copy_from_slice(&next_bitmap([0xFF; 4]).unwrap()); // attempt 1
+        assert_eq!(
+            entry_crc(7),
+            before,
+            "attempt bitmap must not affect the entry CRC"
+        );
+    }
+
+    #[test]
+    fn test_entry_round_trip_validity_decode() {
+        // Build exactly the way `on_end` builds the new-slot entry.
+        let seq = 2u32;
+        let mut entry = [0xFFu8; 32];
+        entry[0..4].copy_from_slice(&seq.to_le_bytes());
+        stamp_pending_marker(&mut entry);
+        entry[24..28].copy_from_slice(&2u32.to_le_bytes()); // VALID
+        entry[28..32].copy_from_slice(&entry_crc(seq).to_le_bytes());
+
+        // Bootloader validity rule: seq != 0xFFFFFFFF && stored == entry_crc(seq).
+        let stored = u32::from_le_bytes(entry[28..32].try_into().unwrap());
+        let decoded_seq = u32::from_le_bytes(entry[0..4].try_into().unwrap());
+        assert_ne!(decoded_seq, 0xFFFF_FFFF);
+        assert_eq!(stored, entry_crc(decoded_seq));
+        assert_eq!(stored, 0x55F6_3774);
+
+        // Marker still decodes through the same entry.
+        assert_eq!(decode_marker(&entry), MarkerState::Pending { attempts: 0 });
+
+        // A 28-byte-span CRC (the 327620e bug) must NOT validate against this rule.
+        let mut wrong = entry;
+        wrong[28..32].copy_from_slice(&crc32_le_compat(0, &entry[0..28]).to_le_bytes());
+        let wrong_stored = u32::from_le_bytes(wrong[28..32].try_into().unwrap());
+        assert_ne!(
+            wrong_stored,
+            entry_crc(decoded_seq),
+            "28-byte CRC must not pass seq-only bootloader validity"
+        );
     }
 
     #[test]
@@ -193,8 +332,8 @@ mod tests {
         stamp_pending_marker(&mut entry);
         entry[12..16].copy_from_slice(&[0x00, 0xFF, 0xFF, 0xFF]);
         entry[24..28].copy_from_slice(&2u32.to_le_bytes());
-        let entry_crc = crc32_le_compat(0, &entry[0..4]);
-        entry[28..32].copy_from_slice(&entry_crc.to_le_bytes());
+        let crc = entry_crc(2);
+        entry[28..32].copy_from_slice(&crc.to_le_bytes());
 
         let decoded = decode_marker(&entry);
         assert_eq!(decoded, MarkerState::Pending { attempts: 1 });
@@ -315,7 +454,7 @@ mod tests {
         let ota_state = u32::from_le_bytes(entry[24..28].try_into().unwrap());
         assert_eq!(ota_state, 2);
         let crc = u32::from_le_bytes(entry[28..32].try_into().unwrap());
-        assert_eq!(crc, crc32_le_compat(0, &entry[0..28]));
+        assert_eq!(crc, entry_crc(seq));
 
         let seq0_entry = rollback_entry_32(0xFFFFFFFF);
         assert_eq!(
@@ -324,43 +463,52 @@ mod tests {
             "0xFFFFFFFF + 2 should wrap to 1"
         );
         let crc_seq1 = u32::from_le_bytes(seq0_entry[28..32].try_into().unwrap());
-        assert_eq!(crc_seq1, crc32_le_compat(0, &seq0_entry[0..28]));
+        assert_eq!(crc_seq1, entry_crc(1));
+        assert_eq!(crc_seq1, 0x4743_989A, "seq=1 pinned vector after wrap");
     }
 
+    /// Marker mutation sits OUTSIDE the CRC span, so it does not invalidate the entry —
+    /// the 28-byte-span premise this test used to encode was disproven on the bench.
+    /// The erase+rewrite cycle is still required (NOR cannot clear bitmap bits in place),
+    /// but the recomputed CRC is byte-identical to the stored one.
     #[test]
-    fn test_entry_with_28_byte_crc_passes_validation_and_mutation_requires_rewrite() {
+    fn test_seq_only_crc_survives_marker_mutation() {
+        let seq = 3u32;
         let mut entry = [0xFFu8; 32];
-        entry[0..4].copy_from_slice(&2u32.to_le_bytes());
+        entry[0..4].copy_from_slice(&seq.to_le_bytes());
         stamp_pending_marker(&mut entry);
         entry[24..28].copy_from_slice(&2u32.to_le_bytes());
-        let crc = crc32_le_compat(0, &entry[0..28]);
+        let crc = entry_crc(seq);
         entry[28..32].copy_from_slice(&crc.to_le_bytes());
 
-        // Valid per 28-byte rule
+        // Valid per the seq-only rule.
         assert_eq!(
             u32::from_le_bytes(entry[28..32].try_into().unwrap()),
-            crc32_le_compat(0, &entry[0..28])
+            entry_crc(seq)
         );
 
-        // In-place mutation (e.g. advance bitmap) makes previous CRC stale!
+        // Advance the attempt bitmap (in place, to model the buffer mutation).
         let bitmap_word: [u8; 4] = entry[12..16].try_into().unwrap();
-        let next_bm = next_bitmap(bitmap_word).unwrap();
-        entry[12..16].copy_from_slice(&next_bm);
+        entry[12..16].copy_from_slice(&next_bitmap(bitmap_word).unwrap());
 
-        // Previous CRC is now STALE / invalid per bootloader rule
+        // CRC is NOT stale: the marker lives outside the [0..4) span.
+        assert_eq!(
+            u32::from_le_bytes(entry[28..32].try_into().unwrap()),
+            entry_crc(seq)
+        );
+
+        // A 28-byte-span CRC WOULD go stale — that was the bug fixed here.
         assert_ne!(
             u32::from_le_bytes(entry[28..32].try_into().unwrap()),
             crc32_le_compat(0, &entry[0..28])
         );
 
-        // Full rewrite pattern recomputes CRC over [0..28]
-        let fresh_crc = crc32_le_compat(0, &entry[0..28]);
+        // The rewrite path recomputes from seq and lands on the same bytes.
+        let fresh_crc = entry_crc(u32::from_le_bytes(entry[0..4].try_into().unwrap()));
         entry[28..32].copy_from_slice(&fresh_crc.to_le_bytes());
-
-        // Now valid again
         assert_eq!(
             u32::from_le_bytes(entry[28..32].try_into().unwrap()),
-            crc32_le_compat(0, &entry[0..28])
+            entry_crc(seq)
         );
     }
 
