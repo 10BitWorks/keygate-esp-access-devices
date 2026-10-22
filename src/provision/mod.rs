@@ -101,8 +101,10 @@ impl From<NdefError> for ProvisionError {
 ///
 /// See the module docs for the step ordering and the chip rules that force
 /// it. `rnda` seeds the auth handshake (deterministic, host-testable). The
-/// transport `exchange` sends one APDU and returns `response ‖ SW1 SW2`.
-pub fn provision_tag<F>(
+/// transport `exchange` sends one APDU and returns `response ‖ SW1 SW2`; it
+/// is `AsyncFnMut` so the node can drive it over an IRQ-waiting NFC transport
+/// (on the default build the exchange closures never actually suspend).
+pub async fn provision_tag<F>(
     exchange: &mut F,
     rnda: &[u8; 16],
     job_key: &[u8; 16],
@@ -110,7 +112,7 @@ pub fn provision_tag<F>(
     out: &mut ProvisionReport,
 ) -> Result<(), ProvisionError>
 where
-    F: FnMut(&[u8], &mut [u8]) -> Result<usize, NdefError>,
+    F: AsyncFnMut(&[u8], &mut [u8]) -> Result<usize, NdefError>,
 {
     let mut file = [0u8; 258];
     let (file_len, offsets) = sdm::ndef_file_from_template(url_template, &mut file)?;
@@ -118,7 +120,7 @@ where
     // 1) Select NDEF application + file (unauthenticated).
     #[cfg(target_arch = "xtensa")]
     esp_println::println!("[prov-step] step 1: select_ndef");
-    select_ndef(exchange)?;
+    select_ndef(exchange).await?;
 
     // 2) Write the NDEF file — ISO UPDATE BINARY, offset addressing, plain,
     //    unauthenticated (AN12196 §5.8.1 publishes exactly this exchange).
@@ -126,7 +128,7 @@ where
     //    write=NoAccess, its content persists, and step 6 verifies it.
     #[cfg(target_arch = "xtensa")]
     esp_println::println!("[prov-step] step 2: ISO update_binary ({} bytes)", file_len);
-    match iso_update_binary(exchange, 0, &file[..file_len]) {
+    match iso_update_binary(exchange, 0, &file[..file_len]).await {
         Ok(()) => {}
         Err(ProvisionError::Status(0x69, 0x82)) => {
             #[cfg(target_arch = "xtensa")]
@@ -138,26 +140,27 @@ where
     // 3) Authenticate with the factory key 0 — NEVER change key 0.
     #[cfg(target_arch = "xtensa")]
     esp_println::println!("[prov-step] step 3: authenticate_ev2_first");
-    let mut session: Session = authenticate_ev2_first(&FACTORY_KEY, 0, rnda, exchange)?;
+    let mut session: Session = authenticate_ev2_first(&FACTORY_KEY, 0, rnda, exchange).await?;
 
     // 4) ChangeFileSettings on file 2: enable the SDM mirrors.
     #[cfg(target_arch = "xtensa")]
     esp_println::println!("[prov-step] step 4: change_file_settings");
     let settings = sdm::sdm_settings_bytes(&offsets);
-    change_file_settings(exchange, &mut session, 2, &settings)?;
+    change_file_settings(exchange, &mut session, 2, &settings).await?;
 
     // 5) ChangeKey 1 <- job key (fresh: old = factory zeros; retry after
     //    re-authentication with old = job key for previously provisioned
     //    cards — the verifier re-issues the same deterministic per-UID key).
     #[cfg(target_arch = "xtensa")]
     esp_println::println!("[prov-step] step 5: change_key");
-    match change_key(exchange, &mut session, 1, job_key, &[0u8; 16], 1) {
+    match change_key(exchange, &mut session, 1, job_key, &[0u8; 16], 1).await {
         Ok(()) => {}
         Err(ProvisionError::Status(0x91, 0x1E)) | Err(ProvisionError::Status(0x91, 0xAE)) => {
             #[cfg(target_arch = "xtensa")]
             esp_println::println!("[prov-step] key 1 not factory-zero — re-authenticating, retrying with old = job key");
-            let mut retry: Session = authenticate_ev2_first(&FACTORY_KEY, 0, rnda, exchange)?;
+            let mut retry: Session = authenticate_ev2_first(&FACTORY_KEY, 0, rnda, exchange).await?;
             change_key(exchange, &mut retry, 1, job_key, job_key, 1)
+                .await
                 .map_err(|_| ProvisionError::KeyMismatch)?;
         }
         Err(e) => return Err(e),
@@ -168,9 +171,9 @@ where
     //    message back through the live mirrors and verify the SUN CMAC.
     #[cfg(target_arch = "xtensa")]
     esp_println::println!("[prov-step] step 6: readback & verify");
-    select_ndef(exchange)?;
+    select_ndef(exchange).await?;
     let mut resp = [0u8; 258];
-    let nlen = read_file(exchange, &mut resp)?;
+    let nlen = read_file(exchange, &mut resp).await?;
     let uri = crate::ntag424::extract_ndef_uri(&resp[2..2 + nlen])?;
     let sun = crate::ntag424::parse_sun_url(uri).map_err(|_| ProvisionError::MacMismatch)?;
 
@@ -198,6 +201,7 @@ where
 mod tests {
     use super::mock::MockTag;
     use super::*;
+    use crate::test_util::block_on;
 
     fn h<const N: usize>(s: &str) -> [u8; N] {
         let b = s.as_bytes();
@@ -229,8 +233,14 @@ mod tests {
         let rnda: [u8; 16] = h(RNDA);
         let mut report = ProvisionReport { uid: [0; 7], counter: 0 };
         let res = {
-            let mut exchange = |apdu: &[u8], out: &mut [u8]| card.handle(apdu, out);
-            provision_tag(&mut exchange, &rnda, &job_key, TEMPLATE, &mut report)
+            let mut exchange = async |apdu: &[u8], out: &mut [u8]| card.handle(apdu, out);
+            block_on(provision_tag(
+                &mut exchange,
+                &rnda,
+                &job_key,
+                TEMPLATE,
+                &mut report,
+            ))
         };
         res.map(|_| report)
     }
@@ -341,8 +351,8 @@ mod tests {
     /// (factory key 0), leaving the card authenticated.
     fn full_auth(card: &mut MockTag) -> Session {
         let rnda: [u8; 16] = h(RNDA);
-        let mut exchange = |apdu: &[u8], out: &mut [u8]| card.handle(apdu, out);
-        authenticate_ev2_first(&[0u8; 16], 0, &rnda, &mut exchange).expect("auth handshake")
+        let mut exchange = async |apdu: &[u8], out: &mut [u8]| card.handle(apdu, out);
+        block_on(authenticate_ev2_first(&[0u8; 16], 0, &rnda, &mut exchange)).expect("auth handshake")
     }
 
     /// SFI addressing (`P1[7]=1`) answers `6A 82` — the exact failure that

@@ -134,7 +134,7 @@ async fn nfc_runner<I: pn532::Interface>(
                 static HEALTH_N: AtomicU32 = AtomicU32::new(0);
                 let it = HEALTH_N.fetch_add(1, Ordering::Relaxed);
                 if it % 50 == 0 {
-                    if let Err(e) = nfc::health_check(pn) {
+                    if let Err(e) = nfc::health_check(pn).await {
                         println!("[nfc] bus health check FAILED ({:?}) — pulsing RSTO", e);
                         if let Some(pin) = reader_reset.as_mut() {
                             pin.set_low();
@@ -142,7 +142,7 @@ async fn nfc_runner<I: pn532::Interface>(
                             pin.set_high();
                             Timer::after(Duration::from_millis(100)).await;
                         }
-                        let _ = nfc::soft_reinit(pn, 2500);
+                        let _ = nfc::soft_reinit(pn, 2500).await;
                     }
                 }
             }
@@ -171,16 +171,16 @@ async fn nfc_runner<I: pn532::Interface>(
             // is_target_present pings Target 1 with a 4-byte frame in <10ms, detecting
             // resting presence seamlessly and physical removal instantly.
             let tag_opt = if is_dna_active {
-                if nfc::is_target_present(pn, 1) {
+                if nfc::is_target_present(pn, 1).await {
                     last_dna_tag.clone()
                 } else {
                     is_dna_active = false;
                     last_dna_tag = None;
-                    nfc::release_target(pn, 0);
+                    nfc::release_target(pn, 0).await;
                     None
                 }
             } else {
-                let opt = nfc::poll_tag(pn);
+                let opt = nfc::poll_tag(pn).await;
                 if let Some(ref tag) = opt {
                     if tag.sak == 0x20 {
                         is_dna_active = true;
@@ -250,15 +250,16 @@ async fn nfc_runner<I: pn532::Interface>(
                                 execute_tag_provisioning(pn, &job_id, &key_hex).await;
                                 is_dna_active = false;
                                 last_dna_tag = None;
-                                nfc::release_target(pn, 0);
+                                nfc::release_target(pn, 0).await;
                             }
                         }
                         _ => {
                             // Standard authentication path: read NDEF message.
                                 let read_res = {
                                     let pn_ref: &mut _ = &mut *pn;
-                                    let mut exchange = move |apdu: &[u8], out: &mut [u8]| -> Result<usize, ntag424::NdefError> {
+                                    let mut exchange = async move |apdu: &[u8], out: &mut [u8]| -> Result<usize, ntag424::NdefError> {
                                         let resp = nfc::in_data_exchange(pn_ref, 1, apdu)
+                                            .await
                                             .map_err(|_| ntag424::NdefError::Transport)?;
                                         if out.len() < resp.len() {
                                             return Err(ntag424::NdefError::BufferTooSmall);
@@ -266,7 +267,7 @@ async fn nfc_runner<I: pn532::Interface>(
                                         out[..resp.len()].copy_from_slice(resp);
                                         Ok(resp.len())
                                     };
-                                    ntag424::read_ndef_message(&mut exchange, &mut ndef_buf)
+                                    ntag424::read_ndef_message(&mut exchange, &mut ndef_buf).await
                                 };
 
                                 match read_res {
@@ -359,9 +360,10 @@ async fn execute_tag_provisioning<I: pn532::Interface>(
     let mut key = [0u8; 16];
     let run = if decode_key16(key_hex, &mut key) {
         let mut report = provision::ProvisionReport { uid: [0; 7], counter: 0 };
-        let mut exchange = move |apdu: &[u8], out: &mut [u8]| -> Result<usize, ntag424::NdefError> {
+        let mut exchange = async move |apdu: &[u8], out: &mut [u8]| -> Result<usize, ntag424::NdefError> {
             println!("[apdu-tx] (len {}) {:02x?}", apdu.len(), apdu);
             let resp = nfc::in_data_exchange(pn, 1, apdu)
+                .await
                 .map_err(|e| {
                     println!("[exchange] in_data_exchange error: {:?}", e);
                     ntag424::NdefError::Transport
@@ -380,6 +382,7 @@ async fn execute_tag_provisioning<I: pn532::Interface>(
             config::PROVISION_URL_TEMPLATE,
             &mut report,
         )
+        .await
         .map(|_| report)
     } else {
         Err(provision::ProvisionError::BadTemplate)

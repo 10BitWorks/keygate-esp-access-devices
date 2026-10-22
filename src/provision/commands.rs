@@ -28,25 +28,29 @@ use crate::provision::{ProvisionError, CHANGE_FILE_SETTINGS_INS, CHANGE_KEY_INS,
 /// Max bytes per single ISO UPDATE BINARY APDU (`Lc` is one byte).
 const ISO_UPDATE_CHUNK: usize = 255;
 
-/// ISO 7816-4 exchange: send one APDU, return `response ‖ SW1 SW2` length.
-pub(crate) type Exchange<'a> = &'a mut dyn FnMut(&[u8], &mut [u8]) -> Result<usize, NdefError>;
-
 /// Select the NDEF application (DF name) and the NDEF file (file ID `E104`).
 ///
 /// Runs unauthenticated. Re-selecting the application also **terminates an
 /// active authenticated state** on the chip — callers rely on that to end
 /// the session before the final ISO read-back.
-pub(crate) fn select_ndef(exchange: Exchange<'_>) -> Result<(), ProvisionError> {
+///
+/// The transport is `AsyncFnMut` so the node can drive InDataExchange over an
+/// IRQ-waiting NFC transport; on the default build the exchange closures
+/// never actually suspend.
+pub(crate) async fn select_ndef<F>(exchange: &mut F) -> Result<(), ProvisionError>
+where
+    F: AsyncFnMut(&[u8], &mut [u8]) -> Result<usize, NdefError>,
+{
     let mut resp = [0u8; 258];
     #[cfg(target_arch = "xtensa")]
     esp_println::println!("[prov-step] 1a: select NDEF app");
-    let n = exchange(&SELECT_NDEF_APP_APDU, &mut resp)?;
+    let n = exchange(&SELECT_NDEF_APP_APDU, &mut resp).await?;
     #[cfg(target_arch = "xtensa")]
     esp_println::println!("[prov-step] 1a status: {:02x?}", &resp[..n]);
     check_status(&resp[..n], 0x90, 0x00)?;
     #[cfg(target_arch = "xtensa")]
     esp_println::println!("[prov-step] 1b: select NDEF file E104");
-    let n = exchange(&SELECT_NDEF_FILE_02_APDU, &mut resp)?;
+    let n = exchange(&SELECT_NDEF_FILE_02_APDU, &mut resp).await?;
     #[cfg(target_arch = "xtensa")]
     esp_println::println!("[prov-step] 1b status: {:02x?}", &resp[..n]);
     check_status(&resp[..n], 0x90, 0x00)?;
@@ -59,11 +63,14 @@ pub(crate) fn select_ndef(exchange: Exchange<'_>) -> Result<(), ProvisionError> 
 /// EV2 session is authenticated (§10.9.3), so this must run unauthenticated.
 /// Splits at 255 bytes per APDU (`Lc` is one byte). Requires the NDEF file to
 /// be selected and its write access to be free (factory default).
-pub(crate) fn iso_update_binary(
-    exchange: Exchange<'_>,
+pub(crate) async fn iso_update_binary<F>(
+    exchange: &mut F,
     offset: u16,
     data: &[u8],
-) -> Result<(), ProvisionError> {
+) -> Result<(), ProvisionError>
+where
+    F: AsyncFnMut(&[u8], &mut [u8]) -> Result<usize, NdefError>,
+{
     let mut resp = [0u8; 258];
     let mut written = 0;
     while written < data.len() {
@@ -79,7 +86,7 @@ pub(crate) fn iso_update_binary(
         apdu[3] = (abs & 0xFF) as u8;
         apdu[4] = chunk as u8;
         apdu[5..5 + chunk].copy_from_slice(&data[written..written + chunk]);
-        let rn = exchange(&apdu[..5 + chunk], &mut resp)?;
+        let rn = exchange(&apdu[..5 + chunk], &mut resp).await?;
         check_status(&resp[..rn], 0x90, 0x00)?;
         written += chunk;
     }
@@ -91,16 +98,16 @@ pub(crate) fn iso_update_binary(
 /// ISO READ BINARY with offset addressing on the selected EF — the same
 /// proven path the idle reader uses. Must run unauthenticated (`69 82`
 /// otherwise, §10.9.2).
-pub(crate) fn read_file(
-    exchange: Exchange<'_>,
+pub(crate) async fn read_file<F>(
+    exchange: &mut F,
     file: &mut [u8; 258],
-) -> Result<usize, ProvisionError> {
+) -> Result<usize, ProvisionError>
+where
+    F: AsyncFnMut(&[u8], &mut [u8]) -> Result<usize, NdefError>,
+{
     let mut resp = [0u8; 258];
     // 1) Read the 2-byte NLEN at file offset 0.
-    let n = exchange(
-        &[0x00, READ_BINARY_INS, 0x00, 0x00, 0x02],
-        &mut resp,
-    )?;
+    let n = exchange(&[0x00, READ_BINARY_INS, 0x00, 0x00, 0x02], &mut resp).await?;
     check_status(&resp[..n], 0x90, 0x00)?;
     if n < 4 {
         return Err(ProvisionError::ShortResponse);
@@ -111,7 +118,7 @@ pub(crate) fn read_file(
     }
     // 2) Read the NDEF message body at file offset 2.
     let apdu = [0x00, READ_BINARY_INS, 0x00, 0x02, nlen as u8];
-    let n = exchange(&apdu, &mut resp)?;
+    let n = exchange(&apdu, &mut resp).await?;
     check_status(&resp[..n], 0x90, 0x00)?;
     let data = n.checked_sub(2).ok_or(ProvisionError::ShortResponse)?;
     if data < nlen {
@@ -189,15 +196,18 @@ pub(crate) fn change_file_settings_frame(
 
 /// Send a prepared CommMode.Full frame, check `91 00`, verify the trailing
 /// response `MACt(8)` and advance `CmdCtr` (AN12196 §5.16.1 step 20).
-pub(crate) fn send_full_frame(
-    exchange: Exchange<'_>,
+pub(crate) async fn send_full_frame<F>(
+    exchange: &mut F,
     session: &mut Session,
     ins: u8,
     frame: &[u8],
-) -> Result<(), ProvisionError> {
+) -> Result<(), ProvisionError>
+where
+    F: AsyncFnMut(&[u8], &mut [u8]) -> Result<usize, NdefError>,
+{
     let (apdu, len) = wrap_apdu(ins, frame);
     let mut resp = [0u8; 258];
-    let rn = exchange(&apdu[..len], &mut resp)?;
+    let rn = exchange(&apdu[..len], &mut resp).await?;
     check_status(&resp[..rn], 0x91, 0x00)?;
     // Response = MACt(8) ‖ SW1SW2 (no response data for ChangeKey Case 1 /
     // ChangeFileSettings).
@@ -207,35 +217,42 @@ pub(crate) fn send_full_frame(
 
 /// `ChangeKey` end-to-end: build, send, verify response. Advances the
 /// session counter only after the response MACt verifies.
-pub(crate) fn change_key(
-    exchange: Exchange<'_>,
+pub(crate) async fn change_key<F>(
+    exchange: &mut F,
     session: &mut Session,
     key_nr: u8,
     new_key: &[u8; 16],
     old_key: &[u8; 16],
     version: u8,
-) -> Result<(), ProvisionError> {
+) -> Result<(), ProvisionError>
+where
+    F: AsyncFnMut(&[u8], &mut [u8]) -> Result<usize, NdefError>,
+{
     let mut frame = [0u8; 64];
     let n = change_key_frame(session, key_nr, new_key, old_key, version, &mut frame)?;
-    send_full_frame(exchange, session, CHANGE_KEY_INS, &frame[..n])
+    send_full_frame(exchange, session, CHANGE_KEY_INS, &frame[..n]).await
 }
 
 /// `ChangeFileSettings` end-to-end: build, send, verify response. Advances
 /// the session counter only after the response MACt verifies.
-pub(crate) fn change_file_settings(
-    exchange: Exchange<'_>,
+pub(crate) async fn change_file_settings<F>(
+    exchange: &mut F,
     session: &mut Session,
     file_nr: u8,
     settings: &[u8],
-) -> Result<(), ProvisionError> {
+) -> Result<(), ProvisionError>
+where
+    F: AsyncFnMut(&[u8], &mut [u8]) -> Result<usize, NdefError>,
+{
     let mut frame = [0u8; 64];
     let n = change_file_settings_frame(session, file_nr, settings, &mut frame)?;
-    send_full_frame(exchange, session, CHANGE_FILE_SETTINGS_INS, &frame[..n])
+    send_full_frame(exchange, session, CHANGE_FILE_SETTINGS_INS, &frame[..n]).await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_util::block_on;
 
     fn h<const N: usize>(s: &str) -> [u8; N] {
         let b = s.as_bytes();
@@ -330,7 +347,7 @@ mod tests {
         input[3..7].copy_from_slice(&session.ti);
         let mact = truncate_cmac(&aes_cmac(&session.k_mac, &input));
 
-        let mut good = |apdu: &[u8], out: &mut [u8]| -> Result<usize, NdefError> {
+        let mut good = async |apdu: &[u8], out: &mut [u8]| -> Result<usize, NdefError> {
             // 90 <INS> 00 00 29 <frame...> 00 — the frame's own hdr byte leads.
             assert_eq!(&apdu[..5], &[0x90, CHANGE_KEY_INS, 0x00, 0x00, 0x29]);
             assert_eq!(apdu[5], frame[0]);
@@ -339,18 +356,29 @@ mod tests {
             out[9] = 0x00;
             Ok(10)
         };
-        send_full_frame(&mut good, &mut session, CHANGE_KEY_INS, &frame).expect("verified");
+        block_on(send_full_frame(
+            &mut good,
+            &mut session,
+            CHANGE_KEY_INS,
+            &frame,
+        ))
+        .expect("verified");
         assert_eq!(session.cmdctr, 1);
 
         // Bare 9100 (no MACt) is rejected.
-        let mut bare = |_apdu: &[u8], out: &mut [u8]| -> Result<usize, NdefError> {
+        let mut bare = async |_apdu: &[u8], out: &mut [u8]| -> Result<usize, NdefError> {
             out[0] = 0x91;
             out[1] = 0x00;
             Ok(2)
         };
         let mut session2 = golden_session();
         assert_eq!(
-            send_full_frame(&mut bare, &mut session2, CHANGE_KEY_INS, &frame),
+            block_on(send_full_frame(
+                &mut bare,
+                &mut session2,
+                CHANGE_KEY_INS,
+                &frame
+            )),
             Err(ProvisionError::ShortResponse)
         );
         assert_eq!(session2.cmdctr, 0);
@@ -362,19 +390,19 @@ mod tests {
     fn test_iso_update_binary_offset_addressing_and_chunking() {
         // 83-byte NDEF payload -> exactly the AN12196 example APDU.
         let data: [u8; 83] = core::array::from_fn(|i| i as u8);
-        let mut first = |apdu: &[u8], out: &mut [u8]| -> Result<usize, NdefError> {
+        let mut first = async |apdu: &[u8], out: &mut [u8]| -> Result<usize, NdefError> {
             assert_eq!(apdu[..5], [0x00, UPDATE_BINARY_INS, 0x00, 0x00, 83]);
             assert_eq!(&apdu[5..], &data[..]);
             out[0] = 0x90;
             out[1] = 0x00;
             Ok(2)
         };
-        iso_update_binary(&mut first, 0, &data).expect("update ok");
+        block_on(iso_update_binary(&mut first, 0, &data)).expect("update ok");
 
         // 300 bytes -> chunks of 255 + 45 at offsets 0 and 255.
         let data: [u8; 300] = core::array::from_fn(|i| i as u8);
         let mut calls = 0usize;
-        let mut chunked = |apdu: &[u8], out: &mut [u8]| -> Result<usize, NdefError> {
+        let mut chunked = async |apdu: &[u8], out: &mut [u8]| -> Result<usize, NdefError> {
             let (off, len) = match calls {
                 0 => (0usize, 255usize),
                 1 => (255usize, 45usize),
@@ -387,7 +415,7 @@ mod tests {
             out[1] = 0x00;
             Ok(2)
         };
-        iso_update_binary(&mut chunked, 0, &data).expect("chunked update ok");
+        block_on(iso_update_binary(&mut chunked, 0, &data)).expect("chunked update ok");
         assert_eq!(calls, 2);
     }
 }

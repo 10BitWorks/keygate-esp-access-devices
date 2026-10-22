@@ -48,21 +48,23 @@ pub(crate) fn verify_response_mac(session: &mut Session, body: &[u8]) -> Result<
 ///
 /// `rnda` is the 16-byte PCD nonce (the node supplies it from its RNG); it is a
 /// parameter so the handshake is deterministic and host-testable. `exchange`
-/// sends one APDU and returns `response ‖ SW1 SW2`.
-pub(crate) fn authenticate_ev2_first<F>(
+/// sends one APDU and returns `response ‖ SW1 SW2`. The transport is
+/// `AsyncFnMut` so the node can drive it over an IRQ-waiting NFC transport;
+/// on the default build the exchange closures never actually suspend.
+pub(crate) async fn authenticate_ev2_first<F>(
     key: &[u8; 16],
     key_nr: u8,
     rnda: &[u8; 16],
     exchange: &mut F,
 ) -> Result<Session, ProvisionError>
 where
-    F: FnMut(&[u8], &mut [u8]) -> Result<usize, NdefError>,
+    F: AsyncFnMut(&[u8], &mut [u8]) -> Result<usize, NdefError>,
 {
     // --- Part 1: send key number (u16 LE), expect SW 91AF + E(RndB). ---
     let key_nr_le = (key_nr as u16).to_le_bytes();
     let (apdu, n) = wrap_apdu(AUTH_EV2_FIRST_INS, &key_nr_le);
     let mut resp = [0u8; 258];
-    let rlen = exchange(&apdu[..n], &mut resp)?;
+    let rlen = exchange(&apdu[..n], &mut resp).await?;
     check_status(&resp[..rlen], 0x91, 0xAF)?;
     if rlen < 2 + 16 {
         return Err(ProvisionError::ShortResponse);
@@ -79,7 +81,7 @@ where
     cbc_encrypt_inplace(key, &NULL_IV, &mut plain);
 
     let (apdu, n) = wrap_apdu(ADDITIONAL_FRAME_INS, &plain);
-    let rlen = exchange(&apdu[..n], &mut resp)?;
+    let rlen = exchange(&apdu[..n], &mut resp).await?;
     check_status(&resp[..rlen], 0x91, 0x00)?;
     if rlen < 2 + 32 {
         return Err(ProvisionError::ShortResponse);
@@ -110,6 +112,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_util::block_on;
 
     fn h<const N: usize>(s: &str) -> [u8; N] {
         let b = s.as_bytes();
@@ -178,7 +181,9 @@ mod tests {
     fn test_authenticate_ev2_first_session_keys() {
         let key = h(KEY);
         let rnda = h(RNDA);
-        let session = authenticate_ev2_first(&key, 0, &rnda, &mut card).expect("auth");
+        let mut ex =
+            async |apdu: &[u8], out: &mut [u8]| -> Result<usize, NdefError> { card(apdu, out) };
+        let session = block_on(authenticate_ev2_first(&key, 0, &rnda, &mut ex)).expect("auth");
         assert_eq!(session.ti, h::<4>(TI));
         assert_eq!(session.k_enc, h::<16>(K_ENC));
         assert_eq!(session.k_mac, h::<16>(K_MAC));
@@ -190,14 +195,14 @@ mod tests {
         let key = h(KEY);
         let rnda = h(RNDA);
         let mut part2 = [0u8; 32];
-        let mut mock = |apdu: &[u8], out: &mut [u8]| -> Result<usize, NdefError> {
+        let mut mock = async |apdu: &[u8], out: &mut [u8]| -> Result<usize, NdefError> {
             if apdu[1] == ADDITIONAL_FRAME_INS {
                 let lc = apdu[4] as usize;
                 part2.copy_from_slice(&apdu[5..5 + lc]);
             }
             card(apdu, out)
         };
-        let _ = authenticate_ev2_first(&key, 0, &rnda, &mut mock).expect("auth");
+        let _ = block_on(authenticate_ev2_first(&key, 0, &rnda, &mut mock)).expect("auth");
         drop(mock);
         assert_eq!(part2, h::<32>(PART2));
     }

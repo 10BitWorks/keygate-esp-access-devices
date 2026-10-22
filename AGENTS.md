@@ -51,24 +51,31 @@
   diagnostics: a missing heartbeat in a capture localizes starvation to the
   exact task.
 - PN532 readiness is SPI STATREAD polling (`SPIInterface`), bounded by the
-  driver's timeouts.
-- **The "IRQ" harness wire (GPIO4) must stay DISCONNECTED — live A/B proven
-  (2026-10-14, user at bench):** with the wire out the node boots clean and
-  the reader works; re-inserting the wire mid-boot on a build that never
-  configures GPIO4 kills the PN532 instantly (failure tone). The slot is
-  not a benign IRQ output — suspect RSTPDN or a mode pin mislanded by the
-  slid 8-pin harness. Before ANY future IRQ usage: continuity-check the
-  wire to the actual PN532 IRQ pad with a meter. Never use an unbounded or
-  edge-only wait.
-- **PN532 `SAMConfig failed (TimeoutAck)`: check the IRQ wire first.** With
-  the GPIO4 harness wire connected the module never ACKs (mislanded line —
-  see above); disconnect it and the reader comes back. `init_pn532` retries
-  3x (ACK-abort resync + 200 ms settle) to self-heal genuine transients.
-  Persistent failure across retries with the wire OUT = module wedge (its
-  interface mode latches at power-on and the 5 V rail never cycles across
-  ESP32 reflashes): pull the module's VIN ~5 s, then reboot. Corroborate
-  with the broker log: `pn532 init failed` in `access/<id>/log`, and the
-  NfcDown alarm beeps while the reader is down.
+  driver's timeouts. A non-default `pn532-irq` feature (door board only)
+  replaces every command ready-wait with a GPIO4 level-wait + one-STATREAD
+  confirm, embassy-bounded — see docs/PN532-SPI-NOTES.md §6 and the E1-E4
+  bench matrix before enabling it anywhere.
+- **GPIO4 (PN532 P70_IRQ) — meter-verified 2026-10-22 (user at bench).**
+  The 2026-10-14 "wire kills the reader" finding was the mislanded slot of
+  the slid 8-pin harness, not the IRQ line itself; after re-seating, the
+  wire ohms out to the genuine PN532 IRQ pad. The wire may stay connected
+  in ALL builds: default builds never configure GPIO4 (an unconfigured
+  input is harmless), and only the non-default `pn532-irq` feature drives
+  it. **Never use an unbounded or edge-only wait** on it — level-wait
+  (`wait_for_low`) with an absolute deadline plus the mandatory one-STATREAD
+  confirm (a stale LOW after our own reads is the expected spurious source;
+  the PN532 releases IRQ on SPI DW/DR detection).
+- **PN532 `SAMConfig failed (TimeoutAck)` with the IRQ wire connected and
+  `pn532-irq` ON:** first suspect the IRQ ack semantics on this clone (the
+  30 ms ack budget and the IRQ-enable gate are the new variables — see
+  PN532-SPI-NOTES.md §6/E1); fall back to a default build to isolate. With
+  the wire OUT (or on default builds), the old guidance holds: `init_pn532`
+  retries 3x (ACK-abort resync + 200 ms settle) to self-heal genuine
+  transients. Persistent failure across retries with the wire OUT = module
+  wedge (its interface mode latches at power-on and the 5 V rail never
+  cycles across ESP32 reflashes): pull the module's VIN ~5 s, then reboot.
+  Corroborate with the broker log: `pn532 init failed` in `access/<id>/log`,
+  and the NfcDown alarm beeps while the reader is down.
 
 ## Expected timing (regression baselines — measured 2026-10-14)
 

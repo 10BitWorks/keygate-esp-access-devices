@@ -531,13 +531,14 @@ pub type DoorNfcIface = pn532::spi::SPIInterface<DoorSoftSpiDevice>;
 /// If per-command latency is ever needed again, measure it in `wait_ready`
 /// only — never touch a clock in `write()`.
 ///
-/// GPIO4 ("IRQ" harness slot) stays physically disconnected AND
-/// unconfigured: live A/B (user at bench) showed wire-in kills the reader
-/// on builds that never touch the pin — mislanded harness line. Meter it
-/// before ever trusting it.
+/// GPIO4 (PN532 P70_IRQ) is meter-verified (2026-10-22) and driven ONLY by
+/// the `pn532-irq` feature (nfc.rs: level-wait + one-STATREAD confirm, all
+/// deadlines bounded). Default builds never configure the pin; the wire may
+/// stay connected. The 2026-10-14 disconnect rule was about the mislanded
+/// harness slot, since re-seated and verified.
 
 #[cfg(feature = "board-xiao-c6")]
-pub fn setup(
+pub async fn setup(
     peripherals: esp_hal::peripherals::Peripherals,
 ) -> Setup<XiaoNfcIface, LedcTone> {
     // 3. Initialize the RTOS scheduler.
@@ -619,7 +620,7 @@ pub fn setup(
     println!("I2C initialized on GPIO2 (SDA) / GPIO3 (SCL)");
 
     // PN532 init is non-fatal: Wi-Fi/MQTT proceed regardless.
-    let pn532 = match nfc::init_pn532(pn532::i2c::I2CInterface { i2c }) {
+    let pn532 = match nfc::init_pn532(pn532::i2c::I2CInterface { i2c }).await {
         Ok(p) => {
             println!("PN532 initialized successfully!");
             Some(p)
@@ -649,7 +650,7 @@ pub fn setup(
 }
 
 #[cfg(feature = "board-esp32-devkit-door")]
-pub fn setup(
+pub async fn setup(
     peripherals: esp_hal::peripherals::Peripherals,
 ) -> Setup<DoorNfcIface, LedcTone> {
     // 3. Initialize the RTOS scheduler (arch-uniform with xiao-c6).
@@ -753,12 +754,28 @@ pub fn setup(
     // Wake the PN532 core from low-power standby before wrapping spi_device in SPIInterface.
     spi_device.wake();
 
-    // GPIO4 ("IRQ" harness slot) intentionally left UNCONFIGURED and the
-    // wire stays physically disconnected — see the DoorNfcIface history note.
+    // GPIO4 (PN532 P70_IRQ) — METER-VERIFIED as the genuine IRQ line
+    // 2026-10-22 (user at bench; the 2026-10-14 "wire kills the reader"
+    // finding was the mislanded harness slot, since re-seated and proven).
+    // Default builds leave the pin unconfigured and readiness stays on SPI
+    // STATREAD polling. The `pn532-irq` feature installs the input here and
+    // nfc.rs switches every command ready-wait to a bounded level-wait +
+    // one-STATREAD confirm. The wire may stay connected in default builds —
+    // an unconfigured input is harmless.
+    #[cfg(feature = "pn532-irq")]
+    {
+        let irq = Input::new(
+            peripherals.GPIO4,
+            InputConfig::default().with_pull(Pull::Up),
+        );
+        *nfc::IRQ_PIN.lock().await = Some(irq);
+        println!("door build: pn532 IRQ readiness (gpio4, meter-verified)");
+    }
+
     let iface = pn532::spi::SPIInterface { spi: spi_device };
 
     // PN532 init is non-fatal: Wi-Fi/MQTT proceed regardless.
-    let pn532 = match nfc::init_pn532(iface) {
+    let pn532 = match nfc::init_pn532(iface).await {
         Ok(p) => {
             println!("PN532 initialized successfully!");
             crate::blog!("pn532 init ok");

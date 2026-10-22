@@ -359,26 +359,29 @@ fn check_status(resp: &[u8]) -> Result<(), NdefError> {
 ///
 /// `exchange` sends one APDU and writes the card response (data plus the
 /// trailing SW1/SW2) into the supplied output slice, returning its length.
-/// Keeping transport out of this routine makes it host-testable.
+/// Keeping transport out of this routine makes it host-testable. It is async
+/// (and the transport `AsyncFnMut`) so the caller can drive InDataExchange
+/// over an IRQ-waiting NFC transport without a blocking bridge; on the
+/// default build the exchange closures never actually suspend.
 ///
 /// The decoded NDEF message is written into `buf`; the number of bytes written
 /// is returned.
-pub fn read_ndef_message<F>(exchange: &mut F, buf: &mut [u8]) -> Result<usize, NdefError>
+pub async fn read_ndef_message<F>(exchange: &mut F, buf: &mut [u8]) -> Result<usize, NdefError>
 where
-    F: FnMut(&[u8], &mut [u8]) -> Result<usize, NdefError>,
+    F: AsyncFnMut(&[u8], &mut [u8]) -> Result<usize, NdefError>,
 {
     let mut resp = [0u8; 258];
 
     // 1) Select the NDEF application.
-    let n = exchange(&SELECT_NDEF_APP_APDU, &mut resp)?;
+    let n = exchange(&SELECT_NDEF_APP_APDU, &mut resp).await?;
     check_status(&resp[..n])?;
 
     // 2) Select NDEF File 02.
-    let n = exchange(&SELECT_NDEF_FILE_02_APDU, &mut resp)?;
+    let n = exchange(&SELECT_NDEF_FILE_02_APDU, &mut resp).await?;
     check_status(&resp[..n])?;
 
     // 3) Read the 2-byte NLEN at file offset 0.
-    let n = exchange(&[0x00, READ_BINARY_INS, 0x00, 0x00, 0x02], &mut resp)?;
+    let n = exchange(&[0x00, READ_BINARY_INS, 0x00, 0x00, 0x02], &mut resp).await?;
     check_status(&resp[..n])?;
     let nlen_frame = n.checked_sub(2).ok_or(NdefError::ShortRead)?;
     if nlen_frame < 2 {
@@ -404,7 +407,7 @@ where
             (offset & 0xFF) as u8,
             chunk as u8,
         ];
-        let n = exchange(&apdu, &mut resp)?;
+        let n = exchange(&apdu, &mut resp).await?;
         check_status(&resp[..n])?;
         let data_len = n.checked_sub(2).ok_or(NdefError::ShortRead)?;
         if data_len < chunk {
@@ -471,6 +474,7 @@ pub fn extract_ndef_uri(ndef: &[u8]) -> Result<&str, NdefError> {
 #[cfg(test)]
 mod ndef_tests {
     use super::*;
+    use crate::test_util::block_on;
 
     /// Canonical SUN URI matching the T1 pylibsdm golden (uid 04112233445566,
     /// ctr 000008 -> cmac 8A4E1B1A46979F04).
@@ -495,7 +499,7 @@ mod ndef_tests {
     fn test_read_ndef_message_and_extract_uri() {
         let file = build_ndef_file(URI);
 
-        let mut mock = |apdu: &[u8], out: &mut [u8]| -> Result<usize, NdefError> {
+        let mut mock = async |apdu: &[u8], out: &mut [u8]| -> Result<usize, NdefError> {
             if apdu == &SELECT_NDEF_APP_APDU[..] || apdu == &SELECT_NDEF_FILE_02_APDU[..] {
                 out[0] = 0x90;
                 out[1] = 0x00;
@@ -520,7 +524,7 @@ mod ndef_tests {
         };
 
         let mut buf = [0u8; 256];
-        let n = read_ndef_message(&mut mock, &mut buf).expect("read NDEF");
+        let n = block_on(read_ndef_message(&mut mock, &mut buf)).expect("read NDEF");
         let uri = extract_ndef_uri(&buf[..n]).expect("extract URI");
         assert_eq!(uri, core::str::from_utf8(URI).unwrap());
 
@@ -533,14 +537,14 @@ mod ndef_tests {
 
     #[test]
     fn test_read_ndef_message_rejects_bad_status() {
-        let mut mock = |_apdu: &[u8], out: &mut [u8]| -> Result<usize, NdefError> {
+        let mut mock = async |_apdu: &[u8], out: &mut [u8]| -> Result<usize, NdefError> {
             out[0] = 0x6A;
             out[1] = 0x82;
             Ok(2)
         };
         let mut buf = [0u8; 64];
         assert_eq!(
-            read_ndef_message(&mut mock, &mut buf),
+            block_on(read_ndef_message(&mut mock, &mut buf)),
             Err(NdefError::Status(0x6A, 0x82))
         );
     }

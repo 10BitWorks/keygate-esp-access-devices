@@ -165,7 +165,7 @@ async fn main(spawner: Spawner) -> ! {
     rwdt_diag("after-arm(pre-board-setup)");
 
     // 5. Initialize board and platform seams.
-    let setup = board::setup(peripherals);
+    let setup = board::setup(peripherals).await;
     ota::init_flash(setup.flash).await;
 
     #[cfg(feature = "bench-wedge")]

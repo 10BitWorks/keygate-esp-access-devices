@@ -51,6 +51,13 @@ nfc-spy = []
 # via {"wedge":true}) used to prove the dedicated RTC WDT feeder contract. Not in
 # `default`; never built into a shipped/OTA image. See plan ota-stability.md task 8.
 bench-wedge = []
+# IRQ-driven PN532 readiness (door board ONLY: chip-esp32 + board-esp32-devkit-door).
+# GPIO4 (P70_IRQ, meter-verified 2026-10-22) level-waits replace the pn532 crate's
+# SPI STATREAD busy loops for every command ready-wait, embassy-bounded, with a
+# mandatory one-STATREAD confirm per IRQ low (stale lows are expected — the PN532
+# releases IRQ on SPI DW/DR). Default OFF: the default build's STATREAD path is
+# untouched. Enabling is gated on bench matrix E1-E4 (docs/PN532-SPI-NOTES.md §6).
+pn532-irq = []
 
 [target.'cfg(any(target_arch = "riscv32", target_arch = "xtensa"))'.dependencies]
 # ESP32 HAL and runtime

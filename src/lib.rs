@@ -1,5 +1,17 @@
 #![no_std]
 
+// The IRQ readiness path drives the door board's GPIO4 (PN532 P70_IRQ) and is
+// wired into the classic-ESP32 door setup only. Fail fast with a clear
+// message instead of opaque cfg errors if the feature is enabled elsewhere.
+#[cfg(all(
+    feature = "pn532-irq",
+    not(all(target_arch = "xtensa", feature = "board-esp32-devkit-door"))
+))]
+compile_error!(
+    "feature `pn532-irq` requires the classic-ESP32 door board: build with \
+     --no-default-features --features chip-esp32,board-esp32-devkit-door,pn532-irq"
+);
+
 pub mod ntag424;
 pub mod diag;
 pub mod cmd;
@@ -13,6 +25,41 @@ pub mod ota_probation;
 /// OTA firmware updates over MQTT (target-only: needs the flash driver).
 #[cfg(any(target_arch = "riscv32", target_arch = "xtensa"))]
 pub mod ota;
+
+/// Host-test-only future driver. The async APDU-exchange stack
+/// (`ntag424::read_ndef_message`, `provision::*`) is exercised on the host
+/// with mock exchanges that never suspend, so a noop-waker poll returns the
+/// output on the first call and the loop below is a formality, not a spin.
+#[cfg(test)]
+pub(crate) mod test_util {
+    use core::future::Future;
+    use core::pin::pin;
+    use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+
+    fn noop_raw_waker() -> RawWaker {
+        fn clone(_: *const ()) -> RawWaker {
+            noop_raw_waker()
+        }
+        fn noop(_: *const ()) {}
+        static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, noop, noop, noop);
+        RawWaker::new(core::ptr::null(), &VTABLE)
+    }
+
+    pub(crate) fn block_on<F: Future>(fut: F) -> F::Output {
+        // SAFETY: the waker is built from a noop vtable whose functions are
+        // all sound no-ops; waking it does nothing, which is fine for
+        // immediately-ready futures.
+        let waker = unsafe { Waker::from_raw(noop_raw_waker()) };
+        let mut cx = Context::from_waker(&waker);
+        let mut fut = pin!(fut);
+        loop {
+            match fut.as_mut().poll(&mut cx) {
+                Poll::Ready(out) => return out,
+                Poll::Pending => core::hint::spin_loop(),
+            }
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {

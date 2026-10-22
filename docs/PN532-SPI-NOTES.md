@@ -114,8 +114,12 @@ started the outage. Four independent causes, each masking the next:
   and 3V3-tied legs both failed identically).
 - **"RF burst brownout at 3.3 V"** — moving VCC to 5 V changed nothing (either direction).
   The module has a regulator; RF responses were slow at both rails.
-- **`SPIInterfaceWithIrq`** (IRQ pin as readiness signal) — init times out; IRQ signaling
-  on this rig is unreliable. STATUS polling works.
+- **`SPIInterfaceWithIrq`** (the crate's built-in IRQ polling, architecture
+  A) — init times out; IRQ signaling on this rig is unreliable *through that
+  path* (it is a non-blocking `is_low()` read inside the crate's tight
+  `while` loop — no confirm step, no sleeping). STATUS polling works. See
+  §6 for the 2026-10-22 meter verification and the architecture-C
+  implementation that supersedes this entry.
 - **DIP `ON,OFF` as SPI** — that's I2C on this module family. SPI is `OFF,ON`.
 - **EN-press after DIP change as a "relatch"** — does nothing (see latching above).
 - **VCC-jumper pull as a "power cycle"** — invalid on a wired bench (back-feed).
@@ -365,19 +369,93 @@ Rules:
 - The same applies to NFC waits: never spin-wait without the driver's
   timeout bound, and prefer the IRQ fast path below.
 
-### 6. IRQ (GPIO4) — tried, broke init instantly, UNTRUSTED
+### 6. IRQ (GPIO4) — wire METER-VERIFIED 2026-10-22; arch-C implementation shipped behind `pn532-irq` (default OFF, pending bench E1-E4)
 
-The PN532 IRQ line idles high and pulls low when a response is ready. Theory:
-sample the pin level in `wait_ready` (one GPIO read) with the SPI STATREAD
-poll as fallback for the high case.
+**Wire status:** the 2026-10-14 "untrusted" verdict was the mislanded slot of
+the slid 8-pin harness, not the IRQ line. On 2026-10-22 the user ohmed the
+GPIO4 harness wire out to the genuine PN532 IRQ pad at the bench. The wire may
+stay connected in all builds — default builds never configure GPIO4.
 
-Result (commit 5f42f35, reverted same day): the pin read LOW spuriously on
-this harness — `wait_ready` returned Ready before any response existed, every
-command failed, and `init_pn532` errored on the first boot. The fallback only
-guards the stuck-HIGH case; a false LOW is indistinguishable from "response
-ready" without doing the SPI read anyway.
+**Electrical/protocol truth (UM0701-02):** P70_IRQ idles HIGH, asserts LOW
+when a frame is ready — once for the ACK, once for the response (§6.2.5.2
+Fig. 35, p. 48 — "the host controller … has no more need to read the status
+byte"). SAMConfig's IRQ byte gates the driving; ours already sends 0x01
+(Adafruit `01 14 01` parity; absent-parameter default is also 0x01, §7.2.10).
+The PN532 releases IRQ on SPI DW/DR detection, so a stale LOW right after our
+own reads is the EXPECTED spurious source — the 5f42f35 failure mode
+(phantom LOW read as Ready) and the crate's send/ack race (WMT-GmbH/pn532#4)
+are both absorbed by confirming every IRQ low with one STATREAD.
 
-Status: **GPIO4 is untrusted until verified with a meter/scope.** Readiness
-stays on the proven SPI STATREAD poll; the driver's own timeout bound is what
-keeps those spins finite. Do not reintroduce IRQ sampling without first
-measuring the pin's idle level on the wired harness.
+**Implementation (architecture C — `pn532-irq` feature, door only).** No
+custom `Interface` (a blocking `wait_ready` inside the crate's sync loop
+would park the embassy executor), no `process_async` (its `WaitReadyFuture`
+self-wakes on Pending — a spin, WMT-GmbH/pn532#11). Instead nfc.rs drives the
+crate's public fine-grained API (`send` / `receive_ack` / `receive_response`
+/ `abort` + the public `interface` field) directly:
+
+```
+send(request)
+→ wait_for_low() bounded by ack deadline (≤30 ms)
+→ ONE STATREAD confirm via pn532.interface.wait_ready()
+    Pending = stale/spurious low → re-wait (deadline-bounded; each
+    STATREAD self-paces ~1 ms via the soft-SPI inter-transaction delay)
+→ receive_ack()
+→ wait_for_low() bounded by response deadline
+→ STATREAD confirm (same loop)
+→ receive_response()
+on any ready-wait failure: pn532.abort() (host ACK forces resync)
+```
+
+Mechanics: `esp_hal::gpio::Input` on GPIO4, pull-up, level-triggered
+`wait_for_low()` (stable API; catches an already-low pin — edge variants are
+forbidden and would miss it; esp-hal binds the default GPIO interrupt handler
+inside `esp_hal::init()`, so nothing else may register a GPIO handler — a
+direct-bound handler breaks the async GPIO API entirely). The `Input` lives
+in `nfc::IRQ_PIN` (embassy `Mutex<CriticalSectionRawMutex, Option<_>>`),
+installed by `board::setup` before `init_pn532`. Every wait carries an
+absolute deadline; budgets: ack 30 ms, SAMConfig/GetFirmwareVersion 500 ms,
+InListPassiveTarget 600 ms (total — identical wall-clock bound to the
+blocking path, so poll cadence/debounce/melody timing are unchanged),
+InDataExchange 100 ms (task-spec'd; **watch E3** — the blocking path's 500 ms
+was chosen for this module's high RF latencies; bump if Transport errors
+appear), presence 150 ms, InRelease/RFConfiguration 100 ms.
+
+Build:
+
+```bash
+KEYGATE_CHIP=esp32 ./run-in-rust-container.sh cargo build --release \
+    --no-default-features --features chip-esp32,board-esp32-devkit-door,pn532-irq
+```
+
+(enabling it anywhere else fails a `compile_error!` guard in lib.rs). The
+boot banner prints `door build: pn532 IRQ readiness (gpio4, meter-verified)`.
+
+**Why this is not enabled by default — the E1-E4 bench gate** (all four must
+pass on hardware before the feature is considered validated; the wire must be
+IN for E1-E3):
+
+- **E1 — boot/init:** wire IN, feature ON: `pn532 init ok` on the first or
+  retry attempt, boot→bugle ≈5.5 s (AGENTS.md baseline), no `SAMConfig (irq)
+  failed` storm. *This is the drill that answers whether this clone's P70_IRQ
+  actually asserts on the 30 ms ack budget.*
+- **E2 — idle behavior:** feature ON, 10+ min no tag: `[pump hb]` every 30 s,
+  zero broker `keepalive_timeout`, poll heartbeat cadence unchanged vs the
+  baseline capture. *Proves the level-wait parks the task instead of
+  busy-spinning (the entire point of the feature).*
+- **E3 — tap drills:** feature ON, 10 taps on a provisioned NTAG 424:
+  detection latency ≤ baseline, SUN auth round-trip completes (GRANT),
+  provisioning drill green; watch specifically for `in_data_exchange`
+  Transport errors (the 100 ms budget vs the module's known-slow RF).
+- **E4 — A/B regression:** feature OFF (default build) with the wire IN:
+  behavior byte-identical to the pre-change baseline (the pin stays
+  unconfigured; proves wire presence is harmless and the default path is
+  untouched).
+
+Until E1-E4 pass: readiness stays on the proven SPI STATREAD path in
+default builds, exactly as before.
+
+**History (5f42f35, reverted same day):** the first attempt sampled the pin
+in `wait_ready` with the STATREAD poll as a *fallback for the stuck-HIGH
+case* — a false LOW was indistinguishable from "response ready" because the
+confirm step was missing. The arch-C design makes the STATREAD confirm
+mandatory on every IRQ low, which is precisely the gap that killed 5f42f35.
