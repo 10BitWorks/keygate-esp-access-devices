@@ -190,13 +190,37 @@ pub fn deadline_expired(boot_ms: u64, now_ms: u64) -> bool {
 
 /// Construct a 32-byte otadata entry for rolling back to the previous firmware slot.
 ///
-/// - `seq` = current_max_seq + 2 (LE at [0..4))
+/// The ESP-IDF bootloader picks the slot from the entry sequence number alone:
+/// `boot_index = (ota_seq - 1) % app_count`, and `app_count` is 2. **Which sector the entry lives
+/// in is irrelevant** — the bootloader scans both otadata sectors, keeps the highest valid `seq`,
+/// and derives the slot from that. A rollback therefore only works if the new `seq` lands on the
+/// *opposite* parity from the one currently running:
+///
+/// ```text
+/// seq = max + 1  ->  (seq - 1) % 2 =  max % 2  !=  (max - 1) % 2  = running slot
+/// ```
+///
+/// A `+2` bump preserves parity and is therefore a NO-OP rollback.
+///
+/// # Why +2 was wrong (bench-proven, task-7 drill)
+///
+/// The old `max_seq + 2` preserved parity, so the "rollback" entry resolved to the same slot as
+/// the broken image. Measured on the door board: after 3 probation attempts, `write_rollback`
+/// wrote `seq = 6` (from `max_seq = 4`); `boot_index = (6 - 1) % 2 = 1` → `ota_1` — the same
+/// `ota_1` that had just failed three times. The board re-booted the broken build marker-free, so
+/// it came up as a plain Normal boot with no probation left to rescue it, and stayed permanently
+/// offline. `+1` also matches ESP-IDF's own convention: `ota_seq` increments by exactly 1 per
+/// otadata update.
+///
+/// - `seq` = current_max_seq + 1 (LE at [0..4)) — parity-flipping, see above
 /// - `seq_label` [4..24) ALL 0xFF (marker-free: prevents re-probating known-good old image)
 /// - `ota_state` [24..28) = 2u32 LE (VALID)
 /// - `crc` [28..32) = [`entry_crc`] of the `seq` word, LE — CRC span is [0..4) ONLY
 pub fn rollback_entry_32(current_max_seq: u32) -> [u8; 32] {
     let mut entry = [0xFFu8; 32];
-    let next_seq = current_max_seq.wrapping_add(2);
+    // +1 (never +2): the bootloader maps seq -> slot as (seq - 1) % 2, so an odd step flips the
+    // slot and an even step re-selects the running one. See the doc comment for the bench proof.
+    let next_seq = current_max_seq.wrapping_add(1);
     entry[0..4].copy_from_slice(&next_seq.to_le_bytes());
     // bytes [4..24) stay 0xFF (marker-free)
     entry[24..28].copy_from_slice(&2u32.to_le_bytes());
@@ -448,7 +472,7 @@ mod tests {
     fn test_rollback_entry_marker_free_and_crc_match() {
         let entry = rollback_entry_32(1);
         let seq = u32::from_le_bytes(entry[0..4].try_into().unwrap());
-        assert_eq!(seq, 3);
+        assert_eq!(seq, 2, "seq is max+1 so the slot parity flips");
         assert_eq!(&entry[4..24], &[0xFFu8; 20]);
         assert_eq!(decode_marker(&entry), MarkerState::Absent);
         let ota_state = u32::from_le_bytes(entry[24..28].try_into().unwrap());
@@ -456,15 +480,70 @@ mod tests {
         let crc = u32::from_le_bytes(entry[28..32].try_into().unwrap());
         assert_eq!(crc, entry_crc(seq));
 
-        let seq0_entry = rollback_entry_32(0xFFFFFFFF);
+        // The CRC must be derived from the WRAPPED seq, never from the pre-wrap input.
+        let sentinel_entry = rollback_entry_32(0xFFFF_FFFE);
         assert_eq!(
-            &seq0_entry[0..4],
-            &1u32.to_le_bytes(),
-            "0xFFFFFFFF + 2 should wrap to 1"
+            &sentinel_entry[0..4],
+            &0xFFFF_FFFFu32.to_le_bytes(),
+            "0xFFFFFFFE + 1 should wrap to the 0xFFFFFFFF sentinel"
         );
-        let crc_seq1 = u32::from_le_bytes(seq0_entry[28..32].try_into().unwrap());
-        assert_eq!(crc_seq1, entry_crc(1));
-        assert_eq!(crc_seq1, 0x4743_989A, "seq=1 pinned vector after wrap");
+        let crc_sentinel = u32::from_le_bytes(sentinel_entry[28..32].try_into().unwrap());
+        assert_eq!(crc_sentinel, entry_crc(0xFFFF_FFFF));
+
+        // 0xFFFFFFFF is not a reachable input (validity requires seq != 0xFFFFFFFF), but the
+        // helper must stay total and self-consistent across the wrap regardless.
+        let wrap_entry = rollback_entry_32(0xFFFF_FFFF);
+        assert_eq!(&wrap_entry[0..4], &0u32.to_le_bytes());
+        let crc_wrap = u32::from_le_bytes(wrap_entry[28..32].try_into().unwrap());
+        assert_eq!(crc_wrap, entry_crc(0), "CRC tracks the wrapped seq");
+    }
+
+    /// The whole point of `+1`: the bootloader maps `seq -> slot` as `(seq - 1) % 2`, so a
+    /// rollback entry MUST land on the opposite parity from the slot that just failed.
+    ///
+    /// The old `+2` produced the SAME parity and therefore re-booted the broken image
+    /// (bench-proven in the task-7 drill: `max_seq = 4` -> `seq = 6` -> `boot_index = 1` ->
+    /// `ota_1`, the same broken slot, marker-free, permanently offline).
+    #[test]
+    fn test_rollback_entry_flips_slot_parity() {
+        // Concrete vectors from the task-7 bench failure, plus the mirrored pair.
+        for (max_seq, want_seq, want_slot) in [(4u32, 5u32, 0u32), (3u32, 4u32, 1u32)] {
+            let entry = rollback_entry_32(max_seq);
+            let seq = u32::from_le_bytes(entry[0..4].try_into().unwrap());
+            assert_eq!(seq, want_seq, "max_seq={max_seq} must produce seq={want_seq}");
+
+            // The rule the bootloader actually applies: boot_index = (ota_seq - 1) % 2.
+            let boot_index = (seq - 1) % 2;
+            let running_slot = (max_seq - 1) % 2;
+            assert_eq!(boot_index, want_slot, "max_seq={max_seq} -> ota_{want_slot}");
+            assert_ne!(
+                boot_index,
+                running_slot,
+                "max_seq={max_seq}: rollback entry must select the OTHER slot"
+            );
+
+            // The old +2 behaviour must be impossible: it preserves parity.
+            assert_eq!((max_seq.wrapping_add(2) - 1) % 2, running_slot);
+        }
+
+        // Sweep a wider range: the parity invariant holds for every reachable seq, not just
+        // the two pinned vectors.
+        for max_seq in 1u32..64 {
+            let entry = rollback_entry_32(max_seq);
+            let seq = u32::from_le_bytes(entry[0..4].try_into().unwrap());
+            assert_ne!(
+                (seq - 1) % 2,
+                (max_seq - 1) % 2,
+                "max_seq={max_seq} did not flip the slot parity"
+            );
+            // ...and the entry still satisfies bootloader validity, or it would be skipped.
+            assert_ne!(seq, 0xFFFF_FFFF);
+            assert_eq!(
+                u32::from_le_bytes(entry[28..32].try_into().unwrap()),
+                entry_crc(seq),
+                "max_seq={max_seq}: CRC must cover the new seq so the bootloader accepts it"
+            );
+        }
     }
 
     /// Marker mutation sits OUTSIDE the CRC span, so it does not invalidate the entry —
