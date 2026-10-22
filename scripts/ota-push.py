@@ -23,7 +23,6 @@ reboots into the new slot, and re-publishes its boot banner (with the new
 git sha) to access/<id>/log — this script prints those lines as proof.
 """
 import argparse
-import hashlib
 import json
 import re
 import ssl

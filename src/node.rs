@@ -884,7 +884,7 @@ async fn mqtt_runner(
                                 ota::on_end().await;
                             } else if topic == cmd_topic.as_str() {
                                 // Bench-only executor-starvation injection (plan task 8).
-                                // A non-yielding spin here starves the dedicated TIMG1
+                                // A non-yielding spin here starves the dedicated RWDT
                                 // feeder -> hardware WDT reset, proving the
                                 // feeder/starvation contract. Gated behind a NON-DEFAULT
                                 // feature: never present in production binaries or OTA

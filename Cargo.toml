@@ -48,7 +48,7 @@ board-esp32-devkit-door = []
 # poll heartbeat) on the door soft-SPI driver. See docs/PN532-SPI-NOTES.md. Not default.
 nfc-spy = []
 # Bench-only: executor-starvation injection (non-yielding spin in the cmd handler
-# via {"wedge":true}) used to prove the dedicated TIMG1 WDT-feeder contract. Not in
+# via {"wedge":true}) used to prove the dedicated RTC WDT feeder contract. Not in
 # `default`; never built into a shipped/OTA image. See plan ota-stability.md task 8.
 bench-wedge = []
 
