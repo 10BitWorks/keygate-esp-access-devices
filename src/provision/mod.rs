@@ -224,7 +224,7 @@ mod tests {
 
     /// Mirrors `config::PROVISION_URL_TEMPLATE` (config is main-only: its
     /// `env!()` credentials cannot compile on the host test target).
-    const TEMPLATE: &str = "https://10bitworks.org/k?uid=&c=&cmac=";
+    const TEMPLATE: &str = "https://keys.10bitworks.org/?uid=&c=&cmac=";
 
     const MOCK_UID_HEX: &str = "046522CABC5D80";
     const MOCK_JOB_KEY_HEX: &str = "aabbccddeeff00112233445566778899";
@@ -279,11 +279,11 @@ mod tests {
         assert_eq!(card.sdm, Some(offsets));
 
         // The written NDEF contains the expanded dummy placeholders.
-        let written = &card.file[..73];
+        let written = &card.file[..77];
         let body = core::str::from_utf8(&written[7..]).expect("ascii");
         assert_eq!(
             body,
-            "10bitworks.org/k?uid=00000000000000&c=000000&cmac=0000000000000000"
+            "keys.10bitworks.org/?uid=00000000000000&c=000000&cmac=0000000000000000"
         );
     }
 

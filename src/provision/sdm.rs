@@ -243,30 +243,30 @@ mod tests {
 
     /// Mirrors `TEMPLATE` (config is main-only: its `env!()` credentials cannot
     /// compile on the host test target).
-    const TEMPLATE: &str = "https://10bitworks.org/k?uid=&c=&cmac=";
+    const TEMPLATE: &str = "https://keys.10bitworks.org/?uid=&c=&cmac=";
 
     #[test]
     fn test_template_offsets_and_ndef_image() {
         let mut file = [0u8; 258];
         let (len, o) = ndef_file_from_template(TEMPLATE, &mut file).expect("template parses");
-        // Expanded body = 30 static + 36 mirror = 66 chars -> file 73 bytes.
-        assert_eq!(len, 73);
-        assert_eq!(o.uid, 28); // 7 + "?uid=" end in body (21)
+        // Expanded body = 34 static + 36 mirror = 70 chars -> file 77 bytes.
+        assert_eq!(len, 77);
+        assert_eq!(o.uid, 32); // 7 + "?uid=" end in body (25)
         assert_eq!(o.read_ctr, o.uid + 14 + 3); // 14-char mirror + "&c="
         assert_eq!(o.mac, o.read_ctr + 6 + 6); // 6-char mirror + "&cmac="
         assert_eq!(o.mac_input, o.uid);
         assert_eq!(o.mac + 16, len); // CMAC mirror ends at EOF
         // Record image sanity.
         assert_eq!(file[0], 0x00);
-        assert_eq!(file[1], 71); // NLEN = 4 hdr + 1 prefix + 66 body
-        assert_eq!(&file[2..7], &[0xD1, 0x01, 67, b'U', 0x04]);
-        assert_eq!(&file[7..12], b"10bit");
-        assert_eq!(&file[24..28], b"uid=");
-        assert_eq!(&file[28..42], b"00000000000000"); // uid dummy
-        assert_eq!(&file[42..45], b"&c=");
-        assert_eq!(&file[45..51], b"000000"); // counter dummy
-        assert_eq!(&file[51..57], b"&cmac=");
-        assert_eq!(&file[57..73], b"0000000000000000"); // cmac dummy
+        assert_eq!(file[1], 75); // NLEN = 4 hdr + 1 prefix + 70 body
+        assert_eq!(&file[2..7], &[0xD1, 0x01, 71, b'U', 0x04]);
+        assert_eq!(&file[7..12], b"keys.");
+        assert_eq!(&file[28..32], b"uid=");
+        assert_eq!(&file[32..46], b"00000000000000"); // uid dummy
+        assert_eq!(&file[46..49], b"&c=");
+        assert_eq!(&file[49..55], b"000000"); // counter dummy
+        assert_eq!(&file[55..61], b"&cmac=");
+        assert_eq!(&file[61..77], b"0000000000000000"); // cmac dummy
     }
 
     #[test]

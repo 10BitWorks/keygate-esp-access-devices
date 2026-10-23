@@ -54,7 +54,7 @@ pub const RELAY_HOLD_MS: u32 = 3000;
 /// SDM mirrors land; `provision::provision_tag` computes the mirror file
 /// offsets from this template. MUST start with `https://` (NDEF URI prefix
 /// code 0x04) and contain `uid=`, `c=` and `cmac=` in that order.
-pub const PROVISION_URL_TEMPLATE: &str = "https://10bitworks.org/k?uid=&c=&cmac=";
+pub const PROVISION_URL_TEMPLATE: &str = "https://keys.10bitworks.org/?uid=&c=&cmac=";
 
 /// Provisioning window (T7): how long an armed job stays tap-able before it
 /// silently lapses (the server-side TTL lapses on its own).
