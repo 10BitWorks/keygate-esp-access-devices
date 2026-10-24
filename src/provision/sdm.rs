@@ -158,9 +158,9 @@ pub(crate) fn ndef_file_from_template(
 }
 
 /// Access nibbles (NT4H2421Gx Table 66).
-const ACCESS_KEY0: u8 = 0x0;
-const ACCESS_FREE: u8 = 0xE;
-const ACCESS_NO_ACCESS: u8 = 0xF;
+pub(crate) const ACCESS_KEY0: u8 = 0x0;
+pub(crate) const ACCESS_FREE: u8 = 0xE;
+pub(crate) const ACCESS_NO_ACCESS: u8 = 0xF;
 
 /// Serialize the 18-byte SDM `ChangeFileSettings` block.
 ///
@@ -168,11 +168,16 @@ const ACCESS_NO_ACCESS: u8 = 0xF;
 /// `AccessRights(2)`, `SDMOptions`, `SDMAccessRights(2)`, then the enabled
 /// 3-byte-LE offsets in the fixed order uid, read_ctr, mac_input, mac.
 pub(crate) fn sdm_settings_bytes(o: &SunOffsets) -> [u8; 18] {
+    sdm_settings_bytes_with_write(o, ACCESS_NO_ACCESS)
+}
+
+/// Serialize the 18-byte SDM `ChangeFileSettings` block with custom write access.
+pub(crate) fn sdm_settings_bytes_with_write(o: &SunOffsets, write_access: u8) -> [u8; 18] {
     let mut s = [0u8; 18];
     s[0] = 0x40; // FileOption: SDM enabled (bit 6) | CommMode.PLAIN (bits 1..0)
     // AccessRights: byte0 = (read_write << 4) | change, byte1 = (read << 4) | write.
     s[1] = (ACCESS_KEY0 << 4) | ACCESS_KEY0; // read_write=Key0, change=Key0
-    s[2] = (ACCESS_FREE << 4) | ACCESS_NO_ACCESS; // read=Free, write=NoAccess
+    s[2] = (ACCESS_FREE << 4) | (write_access & 0x0F);
     s[3] = 0xC1; // SDMOptions: uid mirror (0x80) | read_ctr mirror (0x40) | ASCII (0x01)
     // SDMAccessRights: byte0 = RFU(0xF0) | ctr_ret, byte1 = (meta_read << 4) | file_read.
     s[4] = 0xF0 | ACCESS_FREE; // ctr_ret=free

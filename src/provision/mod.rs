@@ -125,17 +125,20 @@ where
 
     // 2) Write the NDEF file — ISO UPDATE BINARY, offset addressing, plain,
     //    unauthenticated (AN12196 §5.8.1 publishes exactly this exchange).
-    //    `69 82` is tolerated: an already-provisioned card's NDEF file has
-    //    write=NoAccess, its content persists, and step 6 verifies it.
+    //    If the card was already provisioned, write=NoAccess will return `69 82`.
+    //    In that case, we will unlock write=Free under authenticated Key0 session,
+    //    write the updated NDEF payload, and re-lock.
     #[cfg(target_arch = "xtensa")]
     esp_println::println!("[prov-step] step 2: ISO update_binary ({} bytes)", file_len);
     crate::blog!("[prov-step] step 2: update_binary ({} bytes)", file_len);
+    let mut rewrite_needed = false;
     match iso_update_binary(exchange, 0, &file[..file_len]).await {
         Ok(()) => {}
         Err(ProvisionError::Status(0x69, 0x82)) => {
             #[cfg(target_arch = "xtensa")]
-            esp_println::println!("[prov-step] write refused (69 82) — already provisioned, skipping rewrite");
-            crate::blog!("[prov-step] write refused (69 82) — already provisioned");
+            esp_println::println!("[prov-step] write refused (69 82) — already provisioned, will unlock and rewrite");
+            crate::blog!("[prov-step] write refused (69 82) — already provisioned, will unlock and rewrite");
+            rewrite_needed = true;
         }
         Err(e) => return Err(e),
     }
@@ -146,7 +149,31 @@ where
     crate::blog!("[prov-step] step 3: authenticate_ev2_first");
     let mut session: Session = authenticate_ev2_first(&FACTORY_KEY, 0, rnda, exchange).await?;
 
-    // 4) ChangeFileSettings on file 2: enable the SDM mirrors.
+    // If an existing card had write=NoAccess, unlock it temporarily to Free write access,
+    // write the new NDEF payload, and re-authenticate.
+    if rewrite_needed {
+        #[cfg(target_arch = "xtensa")]
+        esp_println::println!("[prov-step] step 3b: unlock write access for rewrite");
+        crate::blog!("[prov-step] step 3b: unlock write access for rewrite");
+        let unlock_settings = sdm::sdm_settings_bytes_with_write(&offsets, sdm::ACCESS_FREE);
+        change_file_settings(exchange, &mut session, 2, &unlock_settings).await?;
+
+        // Deselect authenticated state by selecting NDEF application again
+        select_ndef(exchange).await?;
+        match iso_update_binary(exchange, 0, &file[..file_len]).await {
+            Ok(()) => {
+                #[cfg(target_arch = "xtensa")]
+                esp_println::println!("[prov-step] step 3c: rewritten unlocked NDEF ({} bytes)", file_len);
+                crate::blog!("[prov-step] step 3c: rewritten unlocked NDEF ({} bytes)", file_len);
+            }
+            Err(e) => return Err(e),
+        }
+
+        // Re-authenticate with Key0 to proceed with locking and re-keying
+        session = authenticate_ev2_first(&FACTORY_KEY, 0, rnda, exchange).await?;
+    }
+
+    // 4) ChangeFileSettings on file 2: enable the SDM mirrors and lock write=NoAccess.
     #[cfg(target_arch = "xtensa")]
     esp_println::println!("[prov-step] step 4: change_file_settings");
     crate::blog!("[prov-step] step 4: change_file_settings");
@@ -300,14 +327,17 @@ mod tests {
         let (file_len, offsets) = sdm::ndef_file_from_template(TEMPLATE, &mut file).expect("template");
 
         let mut card = fresh_card();
-        card.pre_provisioned(&job_key, &offsets, &file[..file_len]);
+        // Simulate card pre-provisioned with old legacy payload
+        card.pre_provisioned(&job_key, &offsets, b"old-content-that-was-locked");
 
         let report = provision(&mut card).expect("re-provisioning succeeds");
         assert_eq!(report.uid, h(MOCK_UID_HEX));
         // Key 1 re-set to the same (deterministic) job key.
         assert_eq!(card.key1, job_key);
-        // File untouched: the refused rewrite was tolerated.
+        // File successfully rewritten to new template!
         assert_eq!(&card.file[..file_len], &file[..file_len]);
+        // And relocked to write=NoAccess
+        assert_eq!(card.recorded_ar, Some((0xE, 0xF, 0x0, 0x0)));
     }
 
     // -----------------------------------------------------------------------
